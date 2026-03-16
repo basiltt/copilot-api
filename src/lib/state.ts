@@ -18,6 +18,7 @@ export interface State {
 
   // Web search configuration
   braveApiKey?: string
+  tavilyApiKey?: string
 }
 
 export const state: State = {
@@ -28,5 +29,5 @@ export const state: State = {
 }
 
 export function isWebSearchEnabled(): boolean {
-  return Boolean(state.braveApiKey)
+  return Boolean(state.braveApiKey) || Boolean(state.tavilyApiKey)
 }

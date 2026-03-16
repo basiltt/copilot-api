@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import {
   describe,
   test,
@@ -30,11 +31,12 @@ import {
   webSearchInterceptor,
   prepareWebSearchPayload,
 } from "~/services/web-search/interceptor"
+import * as tavilyModule from "~/services/web-search/tavily"
 import {
   WEB_SEARCH_TOOL_NAMES,
   WEB_SEARCH_FUNCTION_TOOL,
 } from "~/services/web-search/tool-definition"
-import { BraveSearchError } from "~/services/web-search/types"
+import { BraveSearchError, WebSearchError } from "~/services/web-search/types"
 
 describe("WEB_SEARCH_TOOL_NAMES", () => {
   test("contains web_search", () => {
@@ -233,7 +235,7 @@ describe("searchBrave — error handling", () => {
       threw = e
     }
     expect(threw).toBeInstanceOf(BraveSearchError)
-    expect((threw as BraveSearchError).reason).toContain("403")
+    expect((threw as InstanceType<typeof BraveSearchError>).reason).toContain("403")
   })
 
   test("throws BraveSearchError on network failure", async () => {
@@ -797,6 +799,268 @@ describe("isWebSearchEnabled", () => {
       expect(stateModule.isWebSearchEnabled()).toBe(true)
     } finally {
       stateModule.state.braveApiKey = originalKey
+    }
+  })
+})
+
+describe("searchTavily — result formatting", () => {
+  afterEach(() => {
+    mock.restore()
+  })
+
+  test("formats results mapping content to description", async () => {
+    const mockResponse = {
+      results: [
+        { title: "T1", url: "https://t.com/1", content: "C1" },
+        { title: "T2", url: "https://t.com/2", content: "C2" },
+      ],
+    }
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), { status: 200 }),
+    )
+
+    const results = await tavilyModule.searchTavily("test query", "fake-key")
+    expect(results).toHaveLength(2)
+    expect(results[0]).toEqual({
+      title: "T1",
+      url: "https://t.com/1",
+      description: "C1",
+    })
+    expect(results[1]?.url).toBe("https://t.com/2")
+  })
+
+  test("returns empty array when results is empty", async () => {
+    const mockResponse = { results: [] }
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), { status: 200 }),
+    )
+
+    const results = await tavilyModule.searchTavily("nothing here", "fake-key")
+    expect(results).toHaveLength(0)
+  })
+
+  test("returns empty array when results key is absent", async () => {
+    const mockResponse = {}
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), { status: 200 }),
+    )
+
+    const results = await tavilyModule.searchTavily("nothing", "fake-key")
+    expect(results).toHaveLength(0)
+  })
+
+  test("sends Authorization: Bearer header", async () => {
+    const fetchSpy = spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ results: [] }), { status: 200 }),
+    )
+
+    await tavilyModule.searchTavily("q", "my-secret-key")
+
+    expect(fetchSpy).toHaveBeenCalled()
+    // Take the most recent call — it's the one our searchTavily just made
+    const lastCall = fetchSpy.mock.calls.at(-1)
+    expect(lastCall).toBeDefined()
+    const headers = lastCall?.[1]?.headers as Record<string, string>
+    expect(headers["Authorization"]).toBe("Bearer my-secret-key")
+  })
+})
+
+describe("searchTavily — error handling", () => {
+  afterEach(() => {
+    mock.restore()
+  })
+
+  test("throws WebSearchError on non-200 response", async () => {
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("Unauthorized", { status: 401 }),
+    )
+
+    let threw: unknown
+    try {
+      await tavilyModule.searchTavily("q", "bad-key")
+    } catch (e) {
+      threw = e
+    }
+    expect(threw).toBeInstanceOf(WebSearchError)
+  })
+
+  test("WebSearchError reason includes status code on non-200", async () => {
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("Unauthorized", { status: 401 }),
+    )
+
+    let threw: unknown
+    try {
+      await tavilyModule.searchTavily("q", "bad-key")
+    } catch (e) {
+      threw = e
+    }
+    expect(threw).toBeInstanceOf(WebSearchError)
+    expect((threw as WebSearchError).reason).toContain("401")
+  })
+
+  test("throws WebSearchError on network failure", async () => {
+    spyOn(globalThis, "fetch").mockRejectedValue(new Error("network error"))
+
+    let threw: unknown
+    try {
+      await tavilyModule.searchTavily("q", "key")
+    } catch (e) {
+      threw = e
+    }
+    expect(threw).toBeInstanceOf(WebSearchError)
+  })
+
+  test("throws WebSearchError with 'request timed out' reason on AbortError", async () => {
+    spyOn(globalThis, "fetch").mockRejectedValue(
+      Object.assign(new Error("aborted"), { name: "AbortError" }),
+    )
+
+    let threw: unknown
+    try {
+      await tavilyModule.searchTavily("q", "key")
+    } catch (e) {
+      threw = e
+    }
+    expect(threw).toBeInstanceOf(WebSearchError)
+    expect((threw as WebSearchError).reason).toBe("request timed out")
+  })
+})
+
+describe("webSearchInterceptor — Tavily search path", () => {
+  beforeEach(() => {
+    state.tavilyApiKey = "tavily-test-key"
+    state.braveApiKey = undefined
+  })
+
+  afterEach(() => {
+    state.tavilyApiKey = undefined
+    state.braveApiKey = undefined
+    mock.restore()
+  })
+
+  test("calls Tavily and makes a second Copilot call when web_search is triggered", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      {
+        id: "tc-ws",
+        name: "web_search",
+        arguments: '{"query":"latest AI news"}',
+      },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+    const tavilyResults = [
+      {
+        title: "AI News",
+        url: "https://ainews.com",
+        description: "Latest AI developments",
+      },
+    ]
+
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(tavilyModule, "searchTavily").mockResolvedValue(tavilyResults)
+
+    const result = await webSearchInterceptor(makePayload())
+
+    expect(createSpy).toHaveBeenCalledTimes(2)
+    expect(result).toEqual(finalResponse)
+    expect(createSpy.mock.calls[0]?.[0]?.stream).toBe(false)
+  })
+
+  test("prefers Tavily over Brave when both keys are set", async () => {
+    state.tavilyApiKey = "tavily-key"
+    state.braveApiKey = "brave-key"
+
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      {
+        id: "tc-ws",
+        name: "web_search",
+        arguments: '{"query":"latest news"}',
+      },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    const tavilySpy = spyOn(tavilyModule, "searchTavily").mockResolvedValue([])
+    const braveSpy = spyOn(braveModule, "searchBrave").mockResolvedValue([])
+
+    await webSearchInterceptor(makePayload())
+
+    expect(tavilySpy).toHaveBeenCalled()
+    expect(braveSpy).not.toHaveBeenCalled()
+
+    state.braveApiKey = undefined
+  })
+
+  test("injects failure message when Tavily throws WebSearchError", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: '{"query":"q"}' },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(tavilyModule, "searchTavily").mockRejectedValue(
+      new WebSearchError("HTTP 429"),
+    )
+
+    await webSearchInterceptor(makePayload())
+
+    expect(createSpy).toHaveBeenCalledTimes(2)
+    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages
+    const toolMsg = secondCallMessages.find((m) => m.role === "tool")
+    expect(toolMsg?.content).toContain("Web search failed")
+    expect(toolMsg?.content).toContain("training data")
+  })
+})
+
+describe("isWebSearchEnabled — Tavily", () => {
+  test("returns false when neither key is set", () => {
+    const originalBrave = stateModule.state.braveApiKey
+    const originalTavily = stateModule.state.tavilyApiKey
+    stateModule.state.braveApiKey = undefined
+    stateModule.state.tavilyApiKey = undefined
+    try {
+      expect(stateModule.isWebSearchEnabled()).toBe(false)
+    } finally {
+      stateModule.state.braveApiKey = originalBrave
+      stateModule.state.tavilyApiKey = originalTavily
+    }
+  })
+
+  test("returns true when tavilyApiKey is set", () => {
+    const originalBrave = stateModule.state.braveApiKey
+    const originalTavily = stateModule.state.tavilyApiKey
+    stateModule.state.braveApiKey = undefined
+    stateModule.state.tavilyApiKey = "test-key"
+    try {
+      expect(stateModule.isWebSearchEnabled()).toBe(true)
+    } finally {
+      stateModule.state.braveApiKey = originalBrave
+      stateModule.state.tavilyApiKey = originalTavily
+    }
+  })
+
+  test("returns true when both keys are set", () => {
+    const originalBrave = stateModule.state.braveApiKey
+    const originalTavily = stateModule.state.tavilyApiKey
+    stateModule.state.braveApiKey = "brave-key"
+    stateModule.state.tavilyApiKey = "tavily-key"
+    try {
+      expect(stateModule.isWebSearchEnabled()).toBe(true)
+    } finally {
+      stateModule.state.braveApiKey = originalBrave
+      stateModule.state.tavilyApiKey = originalTavily
     }
   })
 })

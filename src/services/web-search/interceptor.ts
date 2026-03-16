@@ -9,8 +9,9 @@ import {
 } from "~/services/copilot/create-chat-completions"
 
 import { searchBrave } from "./brave"
+import { searchTavily } from "./tavily"
 import { WEB_SEARCH_FUNCTION_TOOL } from "./tool-definition"
-import { BraveSearchError, type BraveSearchResult } from "./types"
+import { WebSearchError, type WebSearchResult } from "./types"
 
 // The name of the tool we inject — use the constant as the single source of truth
 // so interceptor and handler stay in sync if the name ever changes.
@@ -71,11 +72,9 @@ export async function webSearchInterceptor(
     const query = args.query
 
     try {
-      if (!state.braveApiKey) throw new BraveSearchError("BRAVE_API_KEY not set")
-      const results = await searchBrave(query, state.braveApiKey)
-      toolResultContent = formatSearchResults(query, results)
+      toolResultContent = await executeWebSearch(query)
     } catch (error: unknown) {
-      const reason = error instanceof BraveSearchError ? error.reason : String(error)
+      const reason = error instanceof WebSearchError ? error.reason : String(error)
       consola.warn(`Web search failed: ${reason}`)
       toolResultContent = `Web search failed: ${reason}\nPlease answer based on your training data and let the user know that web search is currently unavailable.`
     }
@@ -100,6 +99,25 @@ export function prepareWebSearchPayload(
     ...payload,
     tools: [...(payload.tools ?? []), WEB_SEARCH_FUNCTION_TOOL],
   }
+}
+
+/**
+ * Routes a web search query to the appropriate provider based on which API
+ * key is configured in state. Tavily takes priority over Brave when both keys
+ * are set.
+ */
+async function executeWebSearch(query: string): Promise<string> {
+  if (state.tavilyApiKey) {
+    const results = await searchTavily(query, state.tavilyApiKey)
+    return formatSearchResults(query, results)
+  }
+
+  if (state.braveApiKey) {
+    const results = await searchBrave(query, state.braveApiKey)
+    return formatSearchResults(query, results)
+  }
+
+  throw new WebSearchError("no web search API key configured")
 }
 
 function buildSecondPass({
@@ -144,7 +162,7 @@ function buildSecondPass({
   return createChatCompletions(secondPassPayload)
 }
 
-function formatSearchResults(query: string, results: Array<BraveSearchResult>): string {
+function formatSearchResults(query: string, results: Array<WebSearchResult>): string {
   if (results.length === 0) {
     return `No results found for: "${query}"`
   }
