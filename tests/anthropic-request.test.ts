@@ -330,6 +330,48 @@ describe("strict field forwarding (Task 3)", () => {
   })
 })
 
+function getTranslatedModel(model: string): string {
+  const result = translateToOpenAI({
+    model,
+    messages: [{ role: "user", content: "Hi" }],
+    max_tokens: 10,
+  })
+  return result.model
+}
+
+describe("translateModelName normalization", () => {
+  test("normalizes claude-sonnet-4-6 to claude-sonnet-4", () => {
+    expect(getTranslatedModel("claude-sonnet-4-6")).toBe("claude-sonnet-4")
+  })
+
+  test("normalizes claude-haiku-4-5 to claude-haiku-4 (was missing before)", () => {
+    expect(getTranslatedModel("claude-haiku-4-5")).toBe("claude-haiku-4")
+  })
+
+  test("normalizes claude-opus-4-6 to claude-opus-4", () => {
+    expect(getTranslatedModel("claude-opus-4-6")).toBe("claude-opus-4")
+  })
+
+  test("does NOT change claude-sonnet-3-5 (stable 3.x name)", () => {
+    expect(getTranslatedModel("claude-sonnet-3-5")).toBe("claude-sonnet-3-5")
+  })
+
+  test("does NOT change claude-haiku-3-5 (stable 3.x name)", () => {
+    expect(getTranslatedModel("claude-haiku-3-5")).toBe("claude-haiku-3-5")
+  })
+
+  test("normalizes long versioned names like claude-sonnet-4-6-20251231", () => {
+    expect(getTranslatedModel("claude-sonnet-4-6-20251231")).toBe(
+      "claude-sonnet-4",
+    )
+  })
+
+  test("does NOT change non-claude models", () => {
+    expect(getTranslatedModel("gpt-4o")).toBe("gpt-4o")
+    expect(getTranslatedModel("grok-2")).toBe("grok-2")
+  })
+})
+
 describe("OpenAI Chat Completion v1 Request Payload Validation with Zod", () => {
   test("should return true for a minimal valid request payload", () => {
     const validPayload = {

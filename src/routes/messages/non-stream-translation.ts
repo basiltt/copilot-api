@@ -52,13 +52,10 @@ export function translateToOpenAI(
 }
 
 function translateModelName(model: string): string {
-  // Subagent requests use a specific model number which Copilot doesn't support
-  if (model.startsWith("claude-sonnet-4-")) {
-    return model.replace(/^claude-sonnet-4-.*/, "claude-sonnet-4")
-  } else if (model.startsWith("claude-opus-")) {
-    return model.replace(/^claude-opus-4-.*/, "claude-opus-4")
-  }
-  return model
+  // Normalize claude-{family}-4-{minor}[-extra] → claude-{family}-4
+  // Only applies to generation 4+ where minor version numbers are subagent-build-specific.
+  // eslint-disable-next-line regexp/no-super-linear-backtracking, regexp/optimal-quantifier-concatenation
+  return model.replace(/^(claude-[a-z]+-4)-\d+.*$/, "$1")
 }
 
 function translateAnthropicMessagesToOpenAI(
