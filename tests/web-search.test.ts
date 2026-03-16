@@ -546,3 +546,27 @@ describe("detectWebSearchIntent — Path 2 (natural language preflight)", () => 
     expect(result).toBe(false)
   })
 })
+
+import * as stateModule from "~/lib/state"
+
+describe("isWebSearchEnabled", () => {
+  test("returns false when braveApiKey is not set", () => {
+    const originalKey = stateModule.state.braveApiKey
+    stateModule.state.braveApiKey = undefined
+    try {
+      expect(stateModule.isWebSearchEnabled()).toBe(false)
+    } finally {
+      stateModule.state.braveApiKey = originalKey
+    }
+  })
+
+  test("returns true when braveApiKey is set", () => {
+    const originalKey = stateModule.state.braveApiKey
+    stateModule.state.braveApiKey = "test-key"
+    try {
+      expect(stateModule.isWebSearchEnabled()).toBe(true)
+    } finally {
+      stateModule.state.braveApiKey = originalKey
+    }
+  })
+})
