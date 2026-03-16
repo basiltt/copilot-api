@@ -1,20 +1,40 @@
 @echo off
+TITLE Copilot API Proxy
+
 echo ================================================
-echo GitHub Copilot API Server with Usage Viewer
+echo  GitHub Copilot API Proxy
 echo ================================================
 echo.
 
-if not exist node_modules (
-    echo Installing dependencies...
-    bun install
+:: Load environment variables from .env if it exists
+if exist .env (
+    echo Loading environment from .env...
+    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
+        if not "%%A"=="" if not "%%A:~0,1%"=="#" (
+            set "%%A=%%B"
+        )
+    )
     echo.
 )
 
+:: Build if dist/ doesn't exist
+if not exist dist (
+    echo Building project...
+    bun run build
+    echo.
+)
+
+if defined BRAVE_API_KEY (
+    echo Web search: enabled (Brave)
+) else (
+    echo Web search: disabled (set BRAVE_API_KEY in .env to enable)
+)
+echo.
+
 echo Starting server...
-echo The usage viewer page will open automatically after the server starts
 echo.
 
 start "" "https://ericc-ch.github.io/copilot-api?endpoint=http://localhost:4141/usage"
-bun run dev
+bun run start
 
 pause
