@@ -37,6 +37,6 @@ echo Starting server...
 echo.
 
 start "" "https://ericc-ch.github.io/copilot-api?endpoint=http://localhost:4141/usage"
-bun run start
+bun run ./src/main.ts start
 
 pause
