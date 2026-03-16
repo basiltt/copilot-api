@@ -271,21 +271,25 @@ content: mapToolResultContent(block.content),
 
 #### 2.3 Document block handling in `mapContent`
 
-The canonical placeholder string is **`"[Document: PDF content not displayable]"`** — used in both paths below.
+The canonical placeholder string is **`"[Document: PDF content not displayable]"`** — used consistently in all code paths.
 
-The placeholder must appear in **both** the no-image path and the image path to be consistent. In the no-image path, include document blocks explicitly:
+The placeholder must appear in **both** the no-image path and the image path. The no-image text path in `mapContent` is the **single authoritative filter** that handles content for both user and assistant messages. It must include `document` (user context) and `server_tool_use` (assistant context) together — these are mutually exclusive by context but the same code path handles both:
 
 ```typescript
 const hasImage = content.some((block) => block.type === "image")
 if (!hasImage) {
   return content
     .filter((block) =>
-      block.type === "text" || block.type === "thinking" || block.type === "document",
+      block.type === "text"
+      || block.type === "thinking"
+      || block.type === "document"         // user messages: PDFs → placeholder
+      || block.type === "server_tool_use", // assistant messages: server tool → JSON
     )
     .map((block) => {
-      if (block.type === "text") return block.text
+      if (block.type === "text") return (block as AnthropicTextBlock).text
       if (block.type === "thinking") return (block as AnthropicThinkingBlock).thinking
-      return "[Document: PDF content not displayable]"  // document block
+      if (block.type === "document") return "[Document: PDF content not displayable]"
+      return `[Server tool use: ${JSON.stringify(block)}]`  // server_tool_use
     })
     .join("\n\n")
 }
@@ -294,62 +298,49 @@ if (!hasImage) {
 In the image path, add to the switch statement:
 ```typescript
 case "document": {
-  // PDFs cannot be sent to Copilot; include a placeholder
-  contentParts.push({
-    type: "text",
-    text: "[Document: PDF content not displayable]",
-  })
+  contentParts.push({ type: "text", text: "[Document: PDF content not displayable]" })
+  break
+}
+case "server_tool_use": {
+  contentParts.push({ type: "text", text: `[Server tool use: ${JSON.stringify(block)}]` })
   break
 }
 ```
 
 #### 2.4 `handleAssistantMessage` — new block types
 
-Add filtering for new assistant block types:
-- `redacted_thinking` blocks: strip entirely (no OpenAI equivalent, contains opaque binary data)
-- `server_tool_use` blocks: serialize as JSON in text (preserves multi-turn context)
-
-`server_tool_use` blocks must be serialized in **both** branches of `handleAssistantMessage`:
-- Branch 1 (has custom `tool_use` blocks): append to `allTextContent`
-- Branch 2 (no custom tool_use blocks): add to the content passed to `mapContent`, OR add a `server_tool_use` case to `mapContent`'s switch
-
-The simplest approach: add a `server_tool_use` case to `mapContent` that serializes to text. This ensures both branches handle it correctly through the existing `mapContent(message.content)` call.
+**`redacted_thinking` blocks:** Strip before any processing. This only needs to happen in the **no-tool-use branch** (branch 2), because the tool-use branch (branch 1) already naturally excludes `redacted_thinking` through its explicit `textBlocks`, `thinkingBlocks`, and `toolUseBlocks` filters — `redacted_thinking` matches none of them and is already dropped.
 
 ```typescript
-// In mapContent switch:
-case "server_tool_use": {
-  contentParts.push({
-    type: "text",
-    text: `[Server tool use: ${JSON.stringify(block)}]`,
-  })
-  break
-}
+// Branch 2 only (no custom tool_use blocks):
+// Filter out redacted_thinking before calling mapContent
+const assistantContent =
+  typeof message.content === "string"
+    ? message.content
+    : message.content.filter((b) => b.type !== "redacted_thinking")
+return [{ role: "assistant", content: mapContent(assistantContent) }]
 ```
 
-And in the no-image text path, include `server_tool_use` blocks:
-```typescript
-.filter((block) =>
-  block.type === "text" || block.type === "thinking" || block.type === "server_tool_use",
-)
-.map((block) => {
-  if (block.type === "text") return block.text
-  if (block.type === "thinking") return (block as AnthropicThinkingBlock).thinking
-  return `[Server tool use: ${JSON.stringify(block)}]`
-})
-```
+**`server_tool_use` blocks:** Handled entirely via `mapContent` (section 2.3 switch case + no-image path). Both branches of `handleAssistantMessage` call `mapContent` at some point, so no branch-specific changes are needed for `server_tool_use`.
 
-The `redacted_thinking` filter in `handleAssistantMessage`:
-```typescript
-// Filter out redacted_thinking blocks before passing to mapContent
-const visibleContent = message.content.filter(
-  (block) => block.type !== "redacted_thinking"
-)
-// Then pass visibleContent instead of message.content to mapContent calls
-```
+**Summary of what the two branches do after changes:**
+
+- **Branch 1** (has `tool_use` blocks): `textBlocks`, `thinkingBlocks`, `toolUseBlocks` explicit filters → `redacted_thinking` already excluded; `server_tool_use` will appear in `allTextContent` via `mapContent` if called, but since Branch 1 constructs content from explicit filtered arrays rather than calling `mapContent`, add `serverToolUseBlocks` filter explicitly:
+  ```typescript
+  const serverToolUseBlocks = message.content.filter(
+    (block): block is AnthropicServerToolUseBlock => block.type === "server_tool_use",
+  )
+  const allTextContent = [
+    ...textBlocks.map((b) => b.text),
+    ...thinkingBlocks.map((b) => b.thinking),
+    ...serverToolUseBlocks.map((b) => `[Server tool use: ${JSON.stringify(b)}]`),
+  ].filter(Boolean).join("\n\n")
+  ```
+- **Branch 2** (no `tool_use` blocks): filter `redacted_thinking`, call `mapContent` → `document` and `server_tool_use` handled by updated `mapContent`
 
 #### 2.5 `handleUserMessage` — web_search_tool_result blocks
 
-`web_search_tool_result` blocks must be excluded from `otherBlocks` (alongside `tool_result` and `document` exclusions) to avoid double-processing, then serialized as a user message:
+`web_search_tool_result` blocks must be excluded from `otherBlocks` to avoid double-processing. `document` blocks are **intentionally left in `otherBlocks`** — they route through `mapContent` correctly and should be passed as a user message (they represent a PDF a user is asking about).
 
 ```typescript
 const toolResultBlocks = message.content.filter(
@@ -362,11 +353,17 @@ const webSearchResultBlocks = message.content.filter(
 const otherBlocks = message.content.filter(
   (block) =>
     block.type !== "tool_result" &&
-    block.type !== "web_search_tool_result",  // ← new exclusion
+    block.type !== "web_search_tool_result",  // ← new exclusion; document blocks remain
 )
 
-// tool_result blocks → role: "tool" messages (existing logic)
-for (const block of toolResultBlocks) { ... }
+// tool_result blocks → role: "tool" messages (existing logic, now using mapToolResultContent)
+for (const block of toolResultBlocks) {
+  newMessages.push({
+    role: "tool",
+    tool_call_id: block.tool_use_id,
+    content: mapToolResultContent(block.content),
+  })
+}
 
 // web_search_tool_result blocks → role: "user" message with serialized content
 if (webSearchResultBlocks.length > 0) {
@@ -376,20 +373,23 @@ if (webSearchResultBlocks.length > 0) {
   newMessages.push({ role: "user", content: text })
 }
 
-// remaining blocks → existing logic
-if (otherBlocks.length > 0) { ... }
+// remaining otherBlocks → existing logic (now handles document blocks via mapContent)
+if (otherBlocks.length > 0) {
+  newMessages.push({ role: "user", content: mapContent(otherBlocks) })
+}
 ```
 
 #### 2.6 `translateModelName` — generalized normalization
 
 The regex must only apply to claude **generation 4+** models to avoid mangling existing `claude-haiku-3-5` or `claude-sonnet-3-5` model IDs (which use format `claude-family-major-minor` where minor is meaningful and part of the stable name).
 
-Strategy: anchor to claude-4+ explicitly, normalizing `claude-{family}-4-{minor}[-extra]` → `claude-{family}-4`:
-
 ```typescript
 function translateModelName(model: string): string {
   // Normalize claude-{family}-4-{minor}[-extra] → claude-{family}-4
-  // Only applies to generation 4+ where minor version numbers are subagent-build-specific
+  // Only applies to generation 4+ where minor version numbers are subagent-build-specific.
+  // Known limitation: multi-word family names like claude-sonnet-mini-4 won't match
+  // (the [a-z]+ pattern does not cross hyphens), but no such models currently exist.
+  //
   // Examples:
   //   claude-sonnet-4-6 → claude-sonnet-4
   //   claude-haiku-4-5  → claude-haiku-4
@@ -399,8 +399,6 @@ function translateModelName(model: string): string {
   return model.replace(/^(claude-[a-z]+-4)-\d+.*$/, "$1")
 }
 ```
-
-This replaces the current family-specific `if/else` with a single general pattern that handles all current and future claude-4+ families.
 
 ---
 
