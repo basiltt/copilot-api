@@ -47,8 +47,17 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.rateLimitWait = options.rateLimitWait
   state.showToken = options.showToken
 
+  const tavilyApiKey = process.env.TAVILY_API_KEY
   const braveApiKey = process.env.BRAVE_API_KEY
-  if (braveApiKey) {
+
+  if (tavilyApiKey) {
+    state.tavilyApiKey = tavilyApiKey
+    consola.info("Web search enabled (Tavily)")
+    consola.info(
+      "Note: each web search request uses 2-3 internal Copilot API calls " +
+        "(not counted against the rate limit).",
+    )
+  } else if (braveApiKey) {
     state.braveApiKey = braveApiKey
     consola.info("Web search enabled (Brave)")
     consola.info(
