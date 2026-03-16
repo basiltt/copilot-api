@@ -350,6 +350,102 @@ describe("Anthropic new content block types (Task 2)", () => {
   })
 })
 
+describe("handleUserMessage array tool_result content and web_search_tool_result (Task 8)", () => {
+  test("tool_result with array content containing image is translated to vision ContentPart", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Take a screenshot." },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_sc", name: "computer", input: { action: "screenshot" } }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_sc",
+              content: [
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: "image/png",
+                    data: "iVBORw0KGgo=",
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    const toolMsg = result.messages.find((m) => m.role === "tool")
+    // Should be an array with an image_url part
+    expect(Array.isArray(toolMsg?.content)).toBe(true)
+    const parts = toolMsg?.content as Array<{ type: string }>
+    expect(parts[0].type).toBe("image_url")
+  })
+
+  test("tool_result with array content containing text is translated to string", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Run a command." },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_b", name: "Bash", input: { command: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_b",
+              content: [
+                { type: "text", text: "file1.txt\nfile2.txt" },
+              ],
+            },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    const toolMsg = result.messages.find((m) => m.role === "tool")
+    expect(typeof toolMsg?.content).toBe("string")
+    expect(toolMsg?.content).toContain("file1.txt")
+  })
+
+  test("web_search_tool_result block is serialized as user message", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Search the web." },
+        {
+          role: "user",
+          content: [
+            {
+              type: "web_search_tool_result",
+              tool_use_id: "srv_ws_1",
+              content: [{ type: "web_search_result", url: "https://example.com", title: "Example", encrypted_content: "abc" }],
+            },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    const webResultMsg = result.messages.find(
+      (m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("[Web search result:")
+    )
+    expect(webResultMsg).toBeDefined()
+  })
+})
+
 describe("handleAssistantMessage redacted_thinking and server_tool_use (Task 7)", () => {
   test("redacted_thinking block is stripped from assistant message (Branch 2, no tool calls)", () => {
     const anthropicPayload: AnthropicMessagesPayload = {

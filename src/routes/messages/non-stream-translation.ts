@@ -93,15 +93,17 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
 
   if (Array.isArray(message.content)) {
     const toolResultBlocks = message.content.filter(
-      (block): block is AnthropicToolResultBlock =>
-        block.type === "tool_result",
+      (block): block is AnthropicToolResultBlock => block.type === "tool_result",
     )
-    // web_search_tool_result has no OpenAI equivalent — strip it
+    const webSearchResultBlocks = message.content.filter(
+      (block): block is AnthropicWebSearchToolResultBlock =>
+        block.type === "web_search_tool_result",
+    )
     const otherBlocks = message.content.filter(
-      (
-        block,
-      ): block is Exclude<typeof block, AnthropicWebSearchToolResultBlock> =>
-        block.type !== "tool_result" && block.type !== "web_search_tool_result",
+      (block) =>
+        block.type !== "tool_result" &&
+        block.type !== "web_search_tool_result",
+      // document blocks remain here intentionally — mapContent handles them
     )
 
     // Tool results must come first to maintain protocol: tool_use -> tool_result -> user
@@ -109,8 +111,16 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
       newMessages.push({
         role: "tool",
         tool_call_id: block.tool_use_id,
-        content: mapContent(block.content),
+        content: mapToolResultContent(block.content),
       })
+    }
+
+    // Web search result blocks → serialize as user message
+    if (webSearchResultBlocks.length > 0) {
+      const text = webSearchResultBlocks
+        .map((b) => `[Web search result: ${JSON.stringify(b.content)}]`)
+        .join("\n\n")
+      newMessages.push({ role: "user", content: text })
     }
 
     if (otherBlocks.length > 0) {
@@ -195,6 +205,17 @@ function handleAssistantMessage(
           content: mapContent(visibleBlocks),
         },
       ]
+}
+
+// Handles tool_result content which may be a string or array of content blocks
+function mapToolResultContent(
+  content: AnthropicToolResultBlock["content"],
+): string | Array<ContentPart> | null {
+  if (typeof content === "string") {
+    return content
+  }
+  // content is an array of text/image/document blocks — reuse mapContent logic
+  return mapContent(content as Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>)
 }
 
 function mapContent(
