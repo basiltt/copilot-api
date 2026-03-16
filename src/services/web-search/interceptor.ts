@@ -1,15 +1,22 @@
 import consola from "consola"
 
+import { state } from "~/lib/state"
 import {
   createChatCompletions,
   type ChatCompletionsPayload,
   type ChatCompletionResponse,
   type Message,
 } from "~/services/copilot/create-chat-completions"
-import { state } from "~/lib/state"
 
 import { searchBrave } from "./brave"
 import { BraveSearchError, type BraveSearchResult } from "./types"
+
+type SecondPassOptions = {
+  payload: ChatCompletionsPayload
+  choice: ChatCompletionResponse["choices"][number]
+  webSearchCallId: string
+  toolResultContent: string
+}
 
 export async function webSearchInterceptor(
   payload: ChatCompletionsPayload,
@@ -20,7 +27,7 @@ export async function webSearchInterceptor(
     firstPassPayload,
   )) as ChatCompletionResponse
 
-  const choice = firstResponse.choices[0]
+  const choice = firstResponse.choices.at(0)
   if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
     return firstResponse
   }
@@ -33,31 +40,38 @@ export async function webSearchInterceptor(
   }
 
   // Parse query and perform search
-  let toolResultContent: string | undefined
+  let toolResultContent: string
   try {
     const args = JSON.parse(webSearchCall.function.arguments) as { query: string }
     const query = args.query
 
-    let results: BraveSearchResult[] = []
+    let results: Array<BraveSearchResult> = []
     try {
       if (!state.braveApiKey) throw new BraveSearchError("BRAVE_API_KEY not set")
       results = await searchBrave(query, state.braveApiKey)
-    } catch (error) {
+    } catch (error: unknown) {
       const reason = error instanceof BraveSearchError ? error.reason : String(error)
       consola.warn(`Web search failed: ${reason}`)
       toolResultContent = `Web search failed: ${reason}\nPlease answer based on your training data and let the user know that web search is currently unavailable.`
+      return await buildSecondPass({ payload, choice, webSearchCallId: webSearchCall.id, toolResultContent })
     }
 
-    if (toolResultContent === undefined) {
-      toolResultContent = formatSearchResults(query, results)
-    }
+    toolResultContent = formatSearchResults(query, results)
   } catch {
     consola.warn("Web search: failed to parse tool call arguments")
     toolResultContent =
       "Web search failed: could not parse search query.\nPlease answer based on your training data and let the user know that web search is currently unavailable."
   }
 
-  // Build messages for second pass
+  return buildSecondPass({ payload, choice, webSearchCallId: webSearchCall.id, toolResultContent })
+}
+
+function buildSecondPass({
+  payload,
+  choice,
+  webSearchCallId,
+  toolResultContent,
+}: SecondPassOptions): ReturnType<typeof createChatCompletions> {
   const assistantMessage: Message = {
     role: "assistant",
     content: choice.message.content ?? null,
@@ -67,13 +81,13 @@ export async function webSearchInterceptor(
   // Inject a tool result for every tool_call in the assistant message.
   // Non-search tool calls get an empty stub so Copilot's second pass has
   // a complete result set (required — partial results cause rejection).
-  const toolResultMessages: Message[] = choice.message.tool_calls.map((tc) => ({
+  const toolResultMessages: Array<Message> = (choice.message.tool_calls ?? []).map((tc) => ({
     role: "tool",
     tool_call_id: tc.id,
-    content: tc.id === webSearchCall.id ? (toolResultContent ?? "") : "",
+    content: tc.id === webSearchCallId ? toolResultContent : "",
   }))
 
-  const secondPassMessages: Message[] = [
+  const secondPassMessages: Array<Message> = [
     ...payload.messages,
     assistantMessage,
     ...toolResultMessages,
@@ -86,17 +100,14 @@ export async function webSearchInterceptor(
   })
 }
 
-function formatSearchResults(query: string, results: BraveSearchResult[]): string {
+function formatSearchResults(query: string, results: Array<BraveSearchResult>): string {
   if (results.length === 0) {
     return `No results found for: "${query}"`
   }
 
-  const lines = [`Web search results for: "${query}"`, ""]
+  const lines: Array<string> = [`Web search results for: "${query}"`, ""]
   for (const [i, result] of results.entries()) {
-    lines.push(`${i + 1}. Title: ${result.title}`)
-    lines.push(`   URL: ${result.url}`)
-    lines.push(`   Snippet: ${result.description}`)
-    lines.push("")
+    lines.push(`${i + 1}. Title: ${result.title}`, `   URL: ${result.url}`, `   Snippet: ${result.description}`, "")
   }
 
   return lines.join("\n").trimEnd()

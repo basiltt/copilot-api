@@ -1,10 +1,10 @@
 import consola from "consola"
 
+import { state } from "~/lib/state"
 import {
   createChatCompletions,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
-import { state } from "~/lib/state"
 import { WEB_SEARCH_TOOL_NAMES } from "~/services/web-search/tool-definition"
 
 import { isTypedTool, type AnthropicMessagesPayload } from "./anthropic-types"
@@ -15,7 +15,8 @@ import { isTypedTool, type AnthropicMessagesPayload } from "./anthropic-types"
  * Path 1: Zero-cost — checks if any typed tool in the request has a name
  * in WEB_SEARCH_TOOL_NAMES. Short-circuits to true without an API call.
  *
- * Path 2: Only fires when Path 1 is false. Sends a lightweight preflight
+ * Path 2: Only fires when Path 1 is false AND the payload has at least one
+ * tool defined (client is tool-capable). Sends a lightweight preflight
  * classification request to Copilot asking whether the last user message
  * requires real-time web data. Falls back to false on any failure.
  */
@@ -32,7 +33,13 @@ export async function detectWebSearchIntent(
     return true
   }
 
-  // Path 2: natural language preflight (costs one Copilot API call)
+  // Path 2: natural language preflight (costs one Copilot API call).
+  // Skip when the payload has no tools at all — if the client didn't
+  // supply any tools, web search was not intended.
+  if (!payload.tools || payload.tools.length === 0) {
+    return false
+  }
+
   const lastUserMessage = getLastUserMessageText(payload)
   if (!lastUserMessage) {
     return false
@@ -79,14 +86,14 @@ export function stripWebSearchTypedTools(
   return {
     ...payload,
     tools: payload.tools?.filter(
-      (tool) => !(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)),
+      (tool) => !isTypedTool(tool) || !WEB_SEARCH_TOOL_NAMES.has(tool.name),
     ),
   }
 }
 
 function getLastUserMessageText(payload: AnthropicMessagesPayload): string {
   for (let i = payload.messages.length - 1; i >= 0; i--) {
-    const msg = payload.messages[i]
+    const msg = payload.messages[i] as (typeof payload.messages)[number] | undefined
     if (msg?.role !== "user") continue
     if (typeof msg.content === "string") return msg.content
     if (Array.isArray(msg.content)) {

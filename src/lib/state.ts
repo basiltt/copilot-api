@@ -26,5 +26,5 @@ export const state: State = {
 }
 
 export function isWebSearchEnabled(): boolean {
-  return !!state.braveApiKey
+  return Boolean(state.braveApiKey)
 }

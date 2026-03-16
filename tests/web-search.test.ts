@@ -1,10 +1,37 @@
-import { describe, test, expect } from "bun:test"
+import {
+  describe,
+  test,
+  expect,
+  spyOn,
+  beforeEach,
+  afterEach,
+  mock,
+} from "bun:test"
 
-import { isTypedTool, type AnthropicTool } from "~/routes/messages/anthropic-types"
+import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
+import type {
+  ChatCompletionsPayload,
+  ChatCompletionResponse,
+} from "~/services/copilot/create-chat-completions"
+
+import * as stateModule from "~/lib/state"
+import { state } from "~/lib/state"
+import {
+  isTypedTool,
+  type AnthropicTool,
+} from "~/routes/messages/anthropic-types"
+import {
+  detectWebSearchIntent,
+  stripWebSearchTypedTools,
+} from "~/routes/messages/web-search-detection"
+import * as createChatCompletionsModule from "~/services/copilot/create-chat-completions"
+import * as braveModule from "~/services/web-search/brave"
+import { webSearchInterceptor } from "~/services/web-search/interceptor"
 import {
   WEB_SEARCH_TOOL_NAMES,
   WEB_SEARCH_FUNCTION_TOOL,
 } from "~/services/web-search/tool-definition"
+import { BraveSearchError } from "~/services/web-search/types"
 
 describe("WEB_SEARCH_TOOL_NAMES", () => {
   test("contains web_search", () => {
@@ -22,17 +49,26 @@ describe("WEB_SEARCH_TOOL_NAMES", () => {
 
 describe("Typed tool detection guard", () => {
   test("typed tool named web_search — no input_schema — matches", () => {
-    const tool: AnthropicTool = { type: "web_search_20260101", name: "web_search" }
+    const tool: AnthropicTool = {
+      type: "web_search_20260101",
+      name: "web_search",
+    }
     expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(true)
   })
 
   test("typed tool named internet_research matches", () => {
-    const tool: AnthropicTool = { type: "internet_research_20260101", name: "internet_research" }
+    const tool: AnthropicTool = {
+      type: "internet_research_20260101",
+      name: "internet_research",
+    }
     expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(true)
   })
 
-  test("future versioned type — detected by name, not type string", () => {
-    const tool: AnthropicTool = { type: "web_search_20260101", name: "web_search" }
+  test("future versioned type — detected by name, not type string (different version)", () => {
+    const tool: AnthropicTool = {
+      type: "web_search_20260601",
+      name: "web_search",
+    }
     expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(true)
   })
 
@@ -41,7 +77,9 @@ describe("Typed tool detection guard", () => {
       name: "web_search",
       input_schema: { type: "object", properties: {} },
     }
-    expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(false)
+    expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(
+      false,
+    )
   })
 
   test("custom tool named search WITH input_schema — NOT matched", () => {
@@ -49,7 +87,9 @@ describe("Typed tool detection guard", () => {
       name: "search",
       input_schema: { type: "object", properties: {} },
     }
-    expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(false)
+    expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(
+      false,
+    )
   })
 })
 
@@ -65,141 +105,146 @@ describe("WEB_SEARCH_FUNCTION_TOOL", () => {
   test("has parameters with query property", () => {
     const params = WEB_SEARCH_FUNCTION_TOOL.function.parameters as {
       properties: { query: unknown }
-      required: string[]
+      required: Array<string>
     }
     expect(params.properties.query).toBeDefined()
     expect(params.required).toContain("query")
   })
 })
 
-import { BraveSearchError } from "~/services/web-search/types"
-import * as braveModule from "~/services/web-search/brave"
-
 describe("searchBrave — result formatting", () => {
-  test("formats top 5 results as BraveSearchResult[]", async () => {
+  afterEach(() => {
+    mock.restore()
+  })
+
+  test("formats top 5 results as Array<BraveSearchResult>", async () => {
     const mockResponse = {
       web: {
         results: [
-          { title: "Result 1", url: "https://example.com/1", description: "Desc 1" },
-          { title: "Result 2", url: "https://example.com/2", description: "Desc 2" },
-          { title: "Result 3", url: "https://example.com/3", description: "Desc 3" },
-          { title: "Result 4", url: "https://example.com/4", description: "Desc 4" },
-          { title: "Result 5", url: "https://example.com/5", description: "Desc 5" },
+          {
+            title: "Result 1",
+            url: "https://example.com/1",
+            description: "Desc 1",
+          },
+          {
+            title: "Result 2",
+            url: "https://example.com/2",
+            description: "Desc 2",
+          },
+          {
+            title: "Result 3",
+            url: "https://example.com/3",
+            description: "Desc 3",
+          },
+          {
+            title: "Result 4",
+            url: "https://example.com/4",
+            description: "Desc 4",
+          },
+          {
+            title: "Result 5",
+            url: "https://example.com/5",
+            description: "Desc 5",
+          },
         ],
       },
     }
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify(mockResponse), { status: 200 })) as unknown as typeof fetch
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), { status: 200 }),
+    )
 
-    try {
-      const results = await braveModule.searchBrave("test query", "fake-api-key")
-      expect(results).toHaveLength(5)
-      expect(results[0]).toEqual({
-        title: "Result 1",
-        url: "https://example.com/1",
-        description: "Desc 1",
-      })
-      expect(results[4]?.url).toBe("https://example.com/5")
-    } finally {
-      globalThis.fetch = originalFetch
-    }
+    const results = await braveModule.searchBrave("test query", "fake-api-key")
+    expect(results).toHaveLength(5)
+    expect(results[0]).toEqual({
+      title: "Result 1",
+      url: "https://example.com/1",
+      description: "Desc 1",
+    })
+    expect(results[4]?.url).toBe("https://example.com/5")
   })
 
   test("returns empty array when web.results is empty", async () => {
     const mockResponse = { web: { results: [] } }
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify(mockResponse), { status: 200 })) as unknown as typeof fetch
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), { status: 200 }),
+    )
 
-    try {
-      const results = await braveModule.searchBrave("nothing here", "fake-api-key")
-      expect(results).toHaveLength(0)
-    } finally {
-      globalThis.fetch = originalFetch
-    }
+    const results = await braveModule.searchBrave(
+      "nothing here",
+      "fake-api-key",
+    )
+    expect(results).toHaveLength(0)
   })
 
   test("returns empty array when web key is absent", async () => {
     const mockResponse = {}
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify(mockResponse), { status: 200 })) as unknown as typeof fetch
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), { status: 200 }),
+    )
 
-    try {
-      const results = await braveModule.searchBrave("nothing", "fake-api-key")
-      expect(results).toHaveLength(0)
-    } finally {
-      globalThis.fetch = originalFetch
-    }
+    const results = await braveModule.searchBrave("nothing", "fake-api-key")
+    expect(results).toHaveLength(0)
   })
 
   test("uses empty string for missing description field", async () => {
     const mockResponse = {
       web: { results: [{ title: "T", url: "https://u.com" }] },
     }
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify(mockResponse), { status: 200 })) as unknown as typeof fetch
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(mockResponse), { status: 200 }),
+    )
 
-    try {
-      const results = await braveModule.searchBrave("q", "fake-api-key")
-      expect(results[0]?.description).toBe("")
-    } finally {
-      globalThis.fetch = originalFetch
-    }
+    const results = await braveModule.searchBrave("q", "fake-api-key")
+    expect(results[0]?.description).toBe("")
   })
 })
 
 describe("searchBrave — error handling", () => {
-  test("throws BraveSearchError on non-200 response", async () => {
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response("Forbidden", { status: 403 })) as unknown as typeof fetch
+  afterEach(() => {
+    mock.restore()
+  })
 
+  test("throws BraveSearchError on non-200 response", async () => {
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("Forbidden", { status: 403 }),
+    )
+
+    let threw: unknown
     try {
-      await expect(braveModule.searchBrave("query", "bad-key")).rejects.toBeInstanceOf(BraveSearchError)
-    } finally {
-      globalThis.fetch = originalFetch
+      await braveModule.searchBrave("query", "bad-key")
+    } catch (e) {
+      threw = e
     }
+    expect(threw).toBeInstanceOf(BraveSearchError)
   })
 
   test("BraveSearchError reason includes status code on non-200", async () => {
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response("Forbidden", { status: 403 })) as unknown as typeof fetch
+    spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("Forbidden", { status: 403 }),
+    )
 
+    let threw: unknown
     try {
-      expect.assertions(2)
-      await braveModule.searchBrave("query", "bad-key").catch((e: BraveSearchError) => {
-        expect(e).toBeInstanceOf(BraveSearchError)
-        expect(e.reason).toContain("403")
-      })
-    } finally {
-      globalThis.fetch = originalFetch
+      await braveModule.searchBrave("query", "bad-key")
+    } catch (e) {
+      threw = e
     }
+    expect(threw).toBeInstanceOf(BraveSearchError)
+    expect((threw as BraveSearchError).reason).toContain("403")
   })
 
   test("throws BraveSearchError on network failure", async () => {
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () => {
-      throw new Error("network error")
-    }) as unknown as typeof fetch
+    spyOn(globalThis, "fetch").mockRejectedValue(new Error("network error"))
 
+    let threw: unknown
     try {
-      await expect(braveModule.searchBrave("query", "key")).rejects.toBeInstanceOf(BraveSearchError)
-    } finally {
-      globalThis.fetch = originalFetch
+      await braveModule.searchBrave("query", "key")
+    } catch (e) {
+      threw = e
     }
+    expect(threw).toBeInstanceOf(BraveSearchError)
   })
 })
-
-import { spyOn, beforeEach, afterEach, mock } from "bun:test"
-
-import { webSearchInterceptor } from "~/services/web-search/interceptor"
-import type { ChatCompletionsPayload, ChatCompletionResponse, Message } from "~/services/copilot/create-chat-completions"
-import * as createChatCompletionsModule from "~/services/copilot/create-chat-completions"
-import { state } from "~/lib/state"
 
 // Helper: build a minimal non-streaming ChatCompletionResponse
 function makeCopilotResponse(
@@ -241,7 +286,11 @@ function makePayload(stream = false): ChatCompletionsPayload {
         function: {
           name: "web_search",
           description: "Search the web",
-          parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+          parameters: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
         },
       },
     ],
@@ -255,8 +304,10 @@ describe("webSearchInterceptor — no search path", () => {
 
   test("returns response as-is when finish_reason is stop", async () => {
     const stopResponse = makeCopilotResponse("stop")
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
-      .mockResolvedValue(stopResponse)
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    ).mockResolvedValue(stopResponse)
 
     const result = await webSearchInterceptor(makePayload())
 
@@ -268,8 +319,10 @@ describe("webSearchInterceptor — no search path", () => {
     const otherToolResponse = makeCopilotResponse("tool_calls", [
       { id: "tc-1", name: "bash", arguments: '{"command":"ls"}' },
     ])
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
-      .mockResolvedValue(otherToolResponse)
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    ).mockResolvedValue(otherToolResponse)
 
     const result = await webSearchInterceptor(makePayload())
 
@@ -292,14 +345,25 @@ describe("webSearchInterceptor — search path", () => {
 
   test("calls Brave and makes a second Copilot call when web_search is triggered", async () => {
     const firstResponse = makeCopilotResponse("tool_calls", [
-      { id: "tc-ws", name: "web_search", arguments: '{"query":"latest AI news"}' },
+      {
+        id: "tc-ws",
+        name: "web_search",
+        arguments: '{"query":"latest AI news"}',
+      },
     ])
     const finalResponse = makeCopilotResponse("stop")
     const braveResults = [
-      { title: "AI News", url: "https://ainews.com", description: "Latest AI developments" },
+      {
+        title: "AI News",
+        url: "https://ainews.com",
+        description: "Latest AI developments",
+      },
     ]
 
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
       .mockResolvedValueOnce(firstResponse)
       .mockResolvedValueOnce(finalResponse)
     spyOn(braveModule, "searchBrave").mockResolvedValue(braveResults)
@@ -317,7 +381,10 @@ describe("webSearchInterceptor — search path", () => {
     ])
     const finalResponse = makeCopilotResponse("stop")
 
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
       .mockResolvedValueOnce(firstResponse)
       .mockResolvedValueOnce(finalResponse)
     spyOn(braveModule, "searchBrave").mockResolvedValue([])
@@ -336,14 +403,17 @@ describe("webSearchInterceptor — search path", () => {
     ])
     const finalResponse = makeCopilotResponse("stop")
 
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
       .mockResolvedValueOnce(firstResponse)
       .mockResolvedValueOnce(finalResponse)
     spyOn(braveModule, "searchBrave").mockResolvedValue([])
 
     await webSearchInterceptor(makePayload())
 
-    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages as Message[]
+    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages
     const toolMessages = secondCallMessages.filter((m) => m.role === "tool")
     expect(toolMessages).toHaveLength(2)
     const toolIds = toolMessages.map((m) => m.tool_call_id)
@@ -357,15 +427,20 @@ describe("webSearchInterceptor — search path", () => {
     ])
     const finalResponse = makeCopilotResponse("stop")
 
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
       .mockResolvedValueOnce(firstResponse)
       .mockResolvedValueOnce(finalResponse)
-    spyOn(braveModule, "searchBrave").mockRejectedValue(new BraveSearchError("HTTP 429"))
+    spyOn(braveModule, "searchBrave").mockRejectedValue(
+      new BraveSearchError("HTTP 429"),
+    )
 
     await webSearchInterceptor(makePayload())
 
     expect(createSpy).toHaveBeenCalledTimes(2)
-    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages as Message[]
+    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages
     const toolMsg = secondCallMessages.find((m) => m.role === "tool")
     expect(toolMsg?.content).toContain("Web search failed")
     expect(toolMsg?.content).toContain("training data")
@@ -377,7 +452,10 @@ describe("webSearchInterceptor — search path", () => {
     ])
     const finalResponse = makeCopilotResponse("stop")
 
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
       .mockResolvedValueOnce(firstResponse)
       .mockResolvedValueOnce(finalResponse)
     spyOn(braveModule, "searchBrave").mockResolvedValue([])
@@ -385,7 +463,7 @@ describe("webSearchInterceptor — search path", () => {
     await webSearchInterceptor(makePayload())
 
     expect(createSpy).toHaveBeenCalledTimes(2)
-    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages as Message[]
+    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages
     const toolMsg = secondCallMessages.find((m) => m.role === "tool")
     expect(toolMsg?.content).toContain("Web search failed")
   })
@@ -396,7 +474,10 @@ describe("webSearchInterceptor — search path", () => {
     ])
     const finalResponse = makeCopilotResponse("stop")
 
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
       .mockResolvedValueOnce(firstResponse)
       .mockResolvedValueOnce(finalResponse)
     spyOn(braveModule, "searchBrave").mockResolvedValue([])
@@ -414,12 +495,6 @@ describe("webSearchInterceptor — search path", () => {
     })
   })
 })
-
-import {
-  detectWebSearchIntent,
-  stripWebSearchTypedTools,
-} from "~/routes/messages/web-search-detection"
-import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
 
 function makeAnthropicPayload(
   tools?: AnthropicMessagesPayload["tools"],
@@ -454,7 +529,11 @@ describe("stripWebSearchTypedTools", () => {
   test("removes typed web_search tool from tools array", () => {
     const payload = makeAnthropicPayload([
       { type: "web_search_20250305", name: "web_search" },
-      { name: "bash", description: "Run bash", input_schema: { type: "object", properties: {}, required: [] } },
+      {
+        name: "bash",
+        description: "Run bash",
+        input_schema: { type: "object", properties: {}, required: [] },
+      },
     ])
     const stripped = stripWebSearchTypedTools(payload)
     expect(stripped.tools).toHaveLength(1)
@@ -473,7 +552,11 @@ describe("stripWebSearchTypedTools", () => {
 
   test("returns payload unchanged when no web search tools present", () => {
     const payload = makeAnthropicPayload([
-      { name: "my_tool", description: "A tool", input_schema: { type: "object", properties: {} } },
+      {
+        name: "my_tool",
+        description: "A tool",
+        input_schema: { type: "object", properties: {} },
+      },
     ])
     const stripped = stripWebSearchTypedTools(payload)
     expect(stripped.tools).toHaveLength(1)
@@ -499,7 +582,10 @@ describe("detectWebSearchIntent — Path 1 (typed tool)", () => {
       { type: "web_search_20250305", name: "web_search" },
     ])
 
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
 
     const result = await detectWebSearchIntent(payload)
 
@@ -514,10 +600,25 @@ describe("detectWebSearchIntent — Path 2 (natural language preflight)", () => 
   })
 
   test("returns true when preflight responds yes", async () => {
-    const payload = makeAnthropicPayload(undefined, "What happened in the news today?")
+    const payload = makeAnthropicPayload(
+      [
+        {
+          name: "web_search",
+          description: "Search",
+          input_schema: {
+            type: "object",
+            properties: { query: {} },
+            required: ["query"],
+          },
+        },
+      ],
+      "What happened in the news today?",
+    )
 
-    spyOn(createChatCompletionsModule, "createChatCompletions")
-      .mockResolvedValue(makePreflightResponse("yes"))
+    spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    ).mockResolvedValue(makePreflightResponse("yes"))
 
     const result = await detectWebSearchIntent(payload)
 
@@ -525,10 +626,25 @@ describe("detectWebSearchIntent — Path 2 (natural language preflight)", () => 
   })
 
   test("returns false when preflight responds no", async () => {
-    const payload = makeAnthropicPayload(undefined, "Write me a poem")
+    const payload = makeAnthropicPayload(
+      [
+        {
+          name: "web_search",
+          description: "Search",
+          input_schema: {
+            type: "object",
+            properties: { query: {} },
+            required: ["query"],
+          },
+        },
+      ],
+      "Write me a poem",
+    )
 
-    spyOn(createChatCompletionsModule, "createChatCompletions")
-      .mockResolvedValue(makePreflightResponse("no"))
+    spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    ).mockResolvedValue(makePreflightResponse("no"))
 
     const result = await detectWebSearchIntent(payload)
 
@@ -536,18 +652,45 @@ describe("detectWebSearchIntent — Path 2 (natural language preflight)", () => 
   })
 
   test("returns false (and logs warning) when preflight call throws", async () => {
-    const payload = makeAnthropicPayload(undefined, "Search for something")
+    const payload = makeAnthropicPayload(
+      [
+        {
+          name: "web_search",
+          description: "Search",
+          input_schema: {
+            type: "object",
+            properties: { query: {} },
+            required: ["query"],
+          },
+        },
+      ],
+      "Search for something",
+    )
 
-    spyOn(createChatCompletionsModule, "createChatCompletions")
-      .mockRejectedValue(new Error("network failure"))
+    spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    ).mockRejectedValue(new Error("network failure"))
 
     const result = await detectWebSearchIntent(payload)
 
     expect(result).toBe(false)
   })
-})
 
-import * as stateModule from "~/lib/state"
+  test("returns false immediately when payload has no tools (skips preflight)", async () => {
+    const payload = makeAnthropicPayload(undefined, "What is the news today?")
+
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
+
+    const result = await detectWebSearchIntent(payload)
+
+    expect(result).toBe(false)
+    expect(createSpy).not.toHaveBeenCalled()
+  })
+})
 
 describe("isWebSearchEnabled", () => {
   test("returns false when braveApiKey is not set", () => {

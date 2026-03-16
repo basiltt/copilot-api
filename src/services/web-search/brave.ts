@@ -7,7 +7,7 @@ const MAX_RESULTS = 5
 export async function searchBrave(
   query: string,
   apiKey: string,
-): Promise<BraveSearchResult[]> {
+): Promise<Array<BraveSearchResult>> {
   const controller = new AbortController()
   const timeoutId = setTimeout(() => {
     controller.abort()
