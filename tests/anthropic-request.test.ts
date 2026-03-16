@@ -289,6 +289,47 @@ describe("Anthropic new content block types (Task 2)", () => {
   })
 })
 
+describe("strict field forwarding (Task 3)", () => {
+  test("should forward strict:true from custom tool definitions to OpenAI", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [{ role: "user", content: "Hello" }],
+      max_tokens: 100,
+      tools: [
+        {
+          name: "getWeather",
+          description: "Get weather",
+          input_schema: {
+            type: "object",
+            properties: { location: { type: "string" } },
+            required: ["location"],
+          },
+          strict: true,
+        },
+      ],
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    expect(result.tools?.[0].function.strict).toBe(true)
+  })
+
+  test("should not add strict field when not provided", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [{ role: "user", content: "Hello" }],
+      max_tokens: 100,
+      tools: [
+        {
+          name: "getWeather",
+          description: "Get weather",
+          input_schema: { type: "object", properties: {} },
+        },
+      ],
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    expect(result.tools?.[0].function.strict).toBeUndefined()
+  })
+})
+
 describe("OpenAI Chat Completion v1 Request Payload Validation with Zod", () => {
   test("should return true for a minimal valid request payload", () => {
     const validPayload = {

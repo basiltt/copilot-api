@@ -156,6 +156,7 @@ export interface Tool {
     name: string
     description?: string
     parameters: Record<string, unknown>
+    strict?: boolean // Structured Outputs — forwarded from Anthropic custom tool definitions
   }
 }
 
