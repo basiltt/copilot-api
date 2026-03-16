@@ -145,7 +145,14 @@ if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_cal
 const choice = firstResponse.choices.at(0)
 if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
   if (payload.stream) {
-    return createChatCompletions(payload)  // re-issue streaming — preserves client's stream flag
+    // Strip WEB_SEARCH_FUNCTION_TOOL before re-issuing so Copilot cannot call it again
+    // in the streaming response (a tool_call chunk would reach the client raw and corrupt
+    // the Anthropic translation layer).
+    const streamPayload: ChatCompletionsPayload = {
+      ...payload,
+      tools: payload.tools?.filter(t => t.function.name !== WEB_SEARCH_TOOL_NAME),
+    }
+    return createChatCompletions(streamPayload)
   }
   return firstResponse  // non-streaming: return first pass directly (no extra call)
 }
@@ -172,7 +179,12 @@ const webSearchCall = choice.message.tool_calls.find(
 )
 if (!webSearchCall) {
   if (payload.stream) {
-    return createChatCompletions(payload)  // re-issue streaming
+    // Strip WEB_SEARCH_FUNCTION_TOOL before re-issuing (same reason as first early exit)
+    const streamPayload: ChatCompletionsPayload = {
+      ...payload,
+      tools: payload.tools?.filter(t => t.function.name !== WEB_SEARCH_TOOL_NAME),
+    }
+    return createChatCompletions(streamPayload)
   }
   return firstResponse
 }
@@ -293,6 +305,7 @@ The following imports must be added to files that don't already have them:
 
 | File | Import to add |
 |------|--------------|
+| `src/lib/model-selector.ts` | `import type { ModelsResponse } from "~/services/copilot/get-models"` |
 | `src/routes/messages/handler.ts` | `import { getTokenCount } from "~/lib/tokenizer"` |
 | `src/routes/messages/handler.ts` | `import { selectModelForTokenCount } from "~/lib/model-selector"` |
 | `src/routes/chat-completions/handler.ts` | `import { selectModelForTokenCount } from "~/lib/model-selector"` |
