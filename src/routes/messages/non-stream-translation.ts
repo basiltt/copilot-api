@@ -16,6 +16,7 @@ import {
   type AnthropicMessagesPayload,
   type AnthropicRedactedThinkingBlock,
   type AnthropicResponse,
+  type AnthropicServerToolUseBlock,
   type AnthropicTextBlock,
   type AnthropicThinkingBlock,
   type AnthropicTool,
@@ -152,17 +153,26 @@ function handleAssistantMessage(
     (block): block is AnthropicThinkingBlock => block.type === "thinking",
   )
 
+  const serverToolUseBlocks = message.content.filter(
+    (block): block is AnthropicServerToolUseBlock =>
+      block.type === "server_tool_use",
+  )
+
   // redacted_thinking has no OpenAI equivalent — strip it; server_tool_use is serialised to text by mapContent
   const visibleBlocks = message.content.filter(
     (block): block is Exclude<typeof block, AnthropicRedactedThinkingBlock> =>
       block.type !== "redacted_thinking",
   )
 
-  // Combine text and thinking blocks, as OpenAI doesn't have separate thinking blocks
+  // Combine text, thinking, and server_tool_use blocks for Branch 1 (tool_calls path)
+  // OpenAI doesn't have separate thinking or server_tool_use blocks
   const allTextContent = [
     ...textBlocks.map((b) => b.text),
     ...thinkingBlocks.map((b) => b.thinking),
-  ].join("\n\n")
+    ...serverToolUseBlocks.map((b) => `[Server tool use: ${JSON.stringify(b)}]`),
+  ]
+    .filter(Boolean) // strip empty strings to avoid spurious \n\n
+    .join("\n\n")
 
   return toolUseBlocks.length > 0 ?
       [

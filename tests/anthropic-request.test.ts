@@ -350,6 +350,56 @@ describe("Anthropic new content block types (Task 2)", () => {
   })
 })
 
+describe("handleAssistantMessage redacted_thinking and server_tool_use (Task 7)", () => {
+  test("redacted_thinking block is stripped from assistant message (Branch 2, no tool calls)", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Think hard." },
+        {
+          role: "assistant",
+          content: [
+            { type: "redacted_thinking", data: "EncryptedBinaryData==" },
+            { type: "text", text: "My considered answer." },
+          ],
+        },
+        { role: "user", content: "Follow up." },
+      ],
+      max_tokens: 100,
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    const assistantMsg = result.messages.find((m) => m.role === "assistant")
+    // Content must contain the text but NOT the redacted data
+    expect(assistantMsg?.content).toContain("My considered answer.")
+    expect(assistantMsg?.content).not.toContain("EncryptedBinaryData==")
+  })
+
+  test("server_tool_use block is serialized in assistant message with tool calls (Branch 1)", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Do something." },
+        {
+          role: "assistant",
+          content: [
+            { type: "server_tool_use", id: "srv_1", name: "web_search", input: { query: "test" } },
+            { type: "text", text: "Let me also call a tool." },
+            { type: "tool_use", id: "call_1", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    const assistantMsg = result.messages.find((m) => m.role === "assistant")
+    // Branch 1: has tool_use, so content is the text + server_tool_use serialized
+    expect(assistantMsg?.content).toContain("Let me also call a tool.")
+    expect(assistantMsg?.content).toContain("[Server tool use:")
+    expect(assistantMsg?.tool_calls).toHaveLength(1)
+    expect(assistantMsg?.tool_calls?.[0].function.name).toBe("Bash")
+  })
+})
+
 describe("strict field forwarding (Task 3)", () => {
   test("should forward strict:true from custom tool definitions to OpenAI", () => {
     const anthropicPayload: AnthropicMessagesPayload = {
