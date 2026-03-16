@@ -62,7 +62,7 @@ Expected: no errors.
 
 ```bash
 git add src/services/web-search/types.ts
-SKIP_SIMPLE_GIT_HOOKS=1 git commit -m "feat: add BraveSearchResult and BraveSearchError types"
+git commit -m "feat: add BraveSearchResult and BraveSearchError types"
 ```
 
 ---
@@ -80,10 +80,9 @@ The `Tool` type is imported from `~/services/copilot/create-chat-completions` �
 Create `tests/web-search.test.ts`:
 
 ```typescript
-import { describe, test, expect, spyOn, afterEach, mock } from "bun:test"
+import { describe, test, expect } from "bun:test"
 
-import { isTypedTool } from "~/routes/messages/anthropic-types"
-import type { AnthropicTool, AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
+import { isTypedTool, type AnthropicTool } from "~/routes/messages/anthropic-types"
 import {
   WEB_SEARCH_TOOL_NAMES,
   WEB_SEARCH_FUNCTION_TOOL,
@@ -221,7 +220,7 @@ Expected: no errors.
 
 ```bash
 git add src/services/web-search/tool-definition.ts tests/web-search.test.ts
-SKIP_SIMPLE_GIT_HOOKS=1 git commit -m "feat: add WEB_SEARCH_TOOL_NAMES and WEB_SEARCH_FUNCTION_TOOL constants"
+git commit -m "feat: add WEB_SEARCH_TOOL_NAMES and WEB_SEARCH_FUNCTION_TOOL constants"
 ```
 
 ---
@@ -358,7 +357,10 @@ describe("searchBrave — error handling", () => {
       new Response("Forbidden", { status: 403 })
 
     try {
+      // Use expect.assertions to ensure the catch handler runs (prevents silent pass if no throw)
+      expect.assertions(2)
       await braveModule.searchBrave("query", "bad-key").catch((e: BraveSearchError) => {
+        expect(e).toBeInstanceOf(BraveSearchError)
         expect(e.reason).toContain("403")
       })
     } finally {
@@ -472,8 +474,8 @@ Expected: no errors.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/services/web-search/types.ts src/services/web-search/brave.ts tests/web-search.test.ts
-SKIP_SIMPLE_GIT_HOOKS=1 git commit -m "feat: add Brave Search API client with 5s timeout"
+git add src/services/web-search/brave.ts tests/web-search.test.ts
+git commit -m "feat: add Brave Search API client with 5s timeout"
 ```
 
 ---
@@ -498,9 +500,12 @@ The `formatSearchResults` helper is a pure function that converts `BraveSearchRe
 Append these imports and describe blocks at the end of the file. Tests use `spyOn` from `bun:test` (Bun's ESM-compatible mocking API) — never `@ts-ignore` namespace reassignment, which is read-only in native ESM.
 
 ```typescript
+import { spyOn, beforeEach, afterEach, mock } from "bun:test"
+
 import { webSearchInterceptor } from "~/services/web-search/interceptor"
 import type { ChatCompletionsPayload, ChatCompletionResponse, Message } from "~/services/copilot/create-chat-completions"
 import * as createChatCompletionsModule from "~/services/copilot/create-chat-completions"
+import { state } from "~/lib/state"
 
 // Helper: build a minimal non-streaming ChatCompletionResponse
 function makeCopilotResponse(
@@ -580,7 +585,14 @@ describe("webSearchInterceptor — no search path", () => {
 })
 
 describe("webSearchInterceptor — search path", () => {
+  beforeEach(() => {
+    // The interceptor guards on state.braveApiKey before calling searchBrave.
+    // Set a fake key so the guard passes and the spy is reached.
+    state.braveApiKey = "test-key"
+  })
+
   afterEach(() => {
+    state.braveApiKey = undefined
     mock.restore()
   })
 
@@ -685,6 +697,31 @@ describe("webSearchInterceptor — search path", () => {
     const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages as Message[]
     const toolMsg = secondCallMessages.find((m) => m.role === "tool")
     expect(toolMsg?.content).toContain("Web search failed")
+  })
+
+  test("passes tool_choice through to second Copilot call unchanged", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: '{"query":"q"}' },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(braveModule, "searchBrave").mockResolvedValue([])
+
+    const payloadWithChoice: ChatCompletionsPayload = {
+      ...makePayload(),
+      tool_choice: { type: "function", function: { name: "web_search" } },
+    }
+
+    await webSearchInterceptor(payloadWithChoice)
+
+    // tool_choice must be forwarded to the second (synthesis) call unchanged
+    expect(createSpy.mock.calls[1]?.[0]?.tool_choice).toEqual({
+      type: "function",
+      function: { name: "web_search" },
+    })
   })
 })
 ```
@@ -823,8 +860,10 @@ The interceptor references `state.braveApiKey`, which is not added to the `State
 
 ```bash
 git add src/services/web-search/interceptor.ts tests/web-search.test.ts
-SKIP_SIMPLE_GIT_HOOKS=1 git commit -m "feat: add web search interceptor (tool-call loop)"
+git commit -m "feat: add web search interceptor (tool-call loop)"
 ```
+
+> ⚠️ **Typecheck window**: After this commit, `bun run typecheck` will fail because `interceptor.ts` references `state.braveApiKey` which does not yet exist on the `State` interface. This is resolved in Task 5 Step 1. Do not run `bun run typecheck` between Tasks 4 and 5.
 
 ---
 
@@ -884,7 +923,7 @@ Expected: all existing tests pass, no new failures.
 
 ```bash
 git add src/lib/state.ts src/start.ts
-SKIP_SIMPLE_GIT_HOOKS=1 git commit -m "feat: add braveApiKey to state and isWebSearchEnabled() helper"
+git commit -m "feat: add braveApiKey to state and isWebSearchEnabled() helper"
 ```
 
 ---
@@ -1180,7 +1219,7 @@ Expected: no errors.
 
 ```bash
 git add src/routes/messages/web-search-detection.ts tests/web-search.test.ts
-SKIP_SIMPLE_GIT_HOOKS=1 git commit -m "feat: add web search detection and stripping module"
+git commit -m "feat: add web search detection and stripping module"
 ```
 
 ---
@@ -1419,7 +1458,7 @@ Expected: completes without errors.
 
 ```bash
 git add src/routes/messages/handler.ts tests/web-search.test.ts
-SKIP_SIMPLE_GIT_HOOKS=1 git commit -m "feat: wire web search into message handler"
+git commit -m "feat: wire web search into message handler"
 ```
 
 ---
