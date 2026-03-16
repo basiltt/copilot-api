@@ -273,7 +273,19 @@ content: mapToolResultContent(block.content),
 
 The canonical placeholder string is **`"[Document: PDF content not displayable]"`** — used consistently in all code paths.
 
-The placeholder must appear in **both** the no-image path and the image path. The no-image text path in `mapContent` is the **single authoritative filter** that handles content for both user and assistant messages. It must include `document` (user context) and `server_tool_use` (assistant context) together — these are mutually exclusive by context but the same code path handles both:
+**Type signature update required:** Update `mapContent`'s parameter type to accept the new union members added in §1.8:
+
+```typescript
+function mapContent(
+  content:
+    | string
+    | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
+): string | Array<ContentPart> | null
+```
+
+Since `AnthropicUserContentBlock` now includes `AnthropicDocumentBlock` and `AnthropicWebSearchToolResultBlock`, and `AnthropicAssistantContentBlock` includes `AnthropicServerToolUseBlock` and `AnthropicRedactedThinkingBlock`, the switch statements below will typecheck correctly without extra casts.
+
+The no-image text path in `mapContent` is the **single authoritative filter** that handles content for both user and assistant messages. It must include `document` and `server_tool_use` — these are mutually exclusive by context but the same code path handles both:
 
 ```typescript
 const hasImage = content.some((block) => block.type === "image")
@@ -305,11 +317,12 @@ case "server_tool_use": {
   contentParts.push({ type: "text", text: `[Server tool use: ${JSON.stringify(block)}]` })
   break
 }
+// redacted_thinking: silently skip — no OpenAI equivalent, opaque binary data
 ```
 
 #### 2.4 `handleAssistantMessage` — new block types
 
-**`redacted_thinking` blocks:** Strip before any processing. This only needs to happen in the **no-tool-use branch** (branch 2), because the tool-use branch (branch 1) already naturally excludes `redacted_thinking` through its explicit `textBlocks`, `thinkingBlocks`, and `toolUseBlocks` filters — `redacted_thinking` matches none of them and is already dropped.
+**`redacted_thinking` blocks:** Strip before any processing. This only needs to happen in the **no-tool-use branch** (branch 2), because the tool-use branch (branch 1) already naturally excludes `redacted_thinking` through its explicit `textBlocks`, `thinkingBlocks`, and `toolUseBlocks` filters — `redacted_thinking` matches none of them and is already silently dropped with no change required.
 
 ```typescript
 // Branch 2 only (no custom tool_use blocks):
@@ -321,22 +334,28 @@ const assistantContent =
 return [{ role: "assistant", content: mapContent(assistantContent) }]
 ```
 
-**`server_tool_use` blocks:** Handled entirely via `mapContent` (section 2.3 switch case + no-image path). Both branches of `handleAssistantMessage` call `mapContent` at some point, so no branch-specific changes are needed for `server_tool_use`.
+**`server_tool_use` blocks:** Handled in **both** branches, but through different mechanisms:
 
-**Summary of what the two branches do after changes:**
+- **Branch 2** (no custom `tool_use` blocks): `server_tool_use` flows through `mapContent` via the updated switch and no-image filter in §2.3. No additional changes needed in Branch 2.
 
-- **Branch 1** (has `tool_use` blocks): `textBlocks`, `thinkingBlocks`, `toolUseBlocks` explicit filters → `redacted_thinking` already excluded; `server_tool_use` will appear in `allTextContent` via `mapContent` if called, but since Branch 1 constructs content from explicit filtered arrays rather than calling `mapContent`, add `serverToolUseBlocks` filter explicitly:
-  ```typescript
-  const serverToolUseBlocks = message.content.filter(
-    (block): block is AnthropicServerToolUseBlock => block.type === "server_tool_use",
-  )
-  const allTextContent = [
-    ...textBlocks.map((b) => b.text),
-    ...thinkingBlocks.map((b) => b.thinking),
-    ...serverToolUseBlocks.map((b) => `[Server tool use: ${JSON.stringify(b)}]`),
-  ].filter(Boolean).join("\n\n")
-  ```
-- **Branch 2** (no `tool_use` blocks): filter `redacted_thinking`, call `mapContent` → `document` and `server_tool_use` handled by updated `mapContent`
+- **Branch 1** (has custom `tool_use` blocks): Branch 1 constructs `allTextContent` directly from explicit filtered arrays (`textBlocks`, `thinkingBlocks`) rather than calling `mapContent`. Therefore, `server_tool_use` blocks would be silently dropped without an explicit filter. Add a `serverToolUseBlocks` filter to Branch 1:
+
+```typescript
+// Branch 1 — after the existing textBlocks and thinkingBlocks filters, add:
+const serverToolUseBlocks = message.content.filter(
+  (block): block is AnthropicServerToolUseBlock => block.type === "server_tool_use",
+)
+// Update allTextContent to include server tool use serialization:
+const allTextContent = [
+  ...textBlocks.map((b) => b.text),
+  ...thinkingBlocks.map((b) => b.thinking),
+  ...serverToolUseBlocks.map((b) => `[Server tool use: ${JSON.stringify(b)}]`),
+]
+  .filter(Boolean)  // filter empty strings to avoid leading/trailing \n\n separators
+  .join("\n\n")
+```
+
+> Note: `.filter(Boolean)` on the joined array is intentional — it prevents double `\n\n` separators when any of the text/thinking/serverToolUse arrays produce empty entries. The existing code uses `.join("\n\n")` directly on always-populated arrays, but with the new additions an empty serverToolUseBlocks array would contribute nothing, so this is safe.
 
 #### 2.5 `handleUserMessage` — web_search_tool_result blocks
 
@@ -381,7 +400,7 @@ if (otherBlocks.length > 0) {
 
 #### 2.6 `translateModelName` — generalized normalization
 
-The regex must only apply to claude **generation 4+** models to avoid mangling existing `claude-haiku-3-5` or `claude-sonnet-3-5` model IDs (which use format `claude-family-major-minor` where minor is meaningful and part of the stable name).
+**Replace** the existing `translateModelName` function body entirely with:
 
 ```typescript
 function translateModelName(model: string): string {
@@ -390,12 +409,13 @@ function translateModelName(model: string): string {
   // Known limitation: multi-word family names like claude-sonnet-mini-4 won't match
   // (the [a-z]+ pattern does not cross hyphens), but no such models currently exist.
   //
-  // Examples:
-  //   claude-sonnet-4-6 → claude-sonnet-4
-  //   claude-haiku-4-5  → claude-haiku-4
-  //   claude-opus-4-6   → claude-opus-4
-  //   claude-sonnet-3-5 → claude-sonnet-3-5 (unchanged — 3.x is stable)
-  //   claude-haiku-3-5  → claude-haiku-3-5  (unchanged — 3.x is stable)
+  // Test cases:
+  //   claude-sonnet-4-6       → claude-sonnet-4   ✓
+  //   claude-haiku-4-5        → claude-haiku-4    ✓  (was missing in old code)
+  //   claude-opus-4-6         → claude-opus-4     ✓
+  //   claude-sonnet-4-6-20251231 → claude-sonnet-4 ✓
+  //   claude-sonnet-3-5       → claude-sonnet-3-5 ✓  (unchanged — 3.x is stable)
+  //   claude-haiku-3-5        → claude-haiku-3-5  ✓  (unchanged — 3.x is stable)
   return model.replace(/^(claude-[a-z]+-4)-\d+.*$/, "$1")
 }
 ```
@@ -403,6 +423,11 @@ function translateModelName(model: string): string {
 ---
 
 ### File 3: `count-tokens-handler.ts`
+
+**Add import** at the top of the file:
+```typescript
+import { isTypedTool } from "./anthropic-types"
+```
 
 The current code adds `+346` **once** for the entire custom tools array (a flat overhead regardless of how many tools). This existing behavior is **preserved** for custom tools. The only change is: when typed tools are present, add their specific per-tool overhead on top.
 
