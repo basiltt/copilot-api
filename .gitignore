@@ -12,3 +12,10 @@ node_modules/
 
 # build output
 dist/
+
+
+# Ignore pycharm, webstorm, vscode files
+.idea/
+.vscode/
+# Ignore log files
+*.log
