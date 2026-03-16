@@ -98,7 +98,7 @@ Detection uses `tool.name` (stable across versions) rather than `tool.type` (e.g
 
 ### Path 2: Natural Language Detection
 
-Only triggered when Path 1 is false. Sends a lightweight preflight classification request to Copilot:
+Only triggered when Path 1 is false. Sends a lightweight preflight classification request to Copilot using only the **last user message** in the conversation (the most recent turn, not the full history — sufficient for intent detection and keeps the preflight call cheap):
 
 ```
 System: You are a classifier. Answer only "yes" or "no". No explanation.
@@ -251,6 +251,7 @@ Single responsibility: detection + tool-call loop.
     : await createChatCompletions(openAIPayload)
   ```
 - The rest of the handler (streaming/non-streaming Anthropic translation) is unchanged
+- **Note:** The `manualApprove` prompt fires once before the interceptor. The interceptor's internal Copilot calls (first pass + second pass) bypass manual approval intentionally — they are implementation details of the web search loop, not new user-visible requests.
 
 ---
 
