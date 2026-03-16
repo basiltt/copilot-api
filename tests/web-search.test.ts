@@ -1,4 +1,3 @@
-/* eslint-disable max-lines */
 import {
   describe,
   test,
@@ -9,7 +8,6 @@ import {
   mock,
 } from "bun:test"
 
-import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
 import type {
   ChatCompletionsPayload,
   ChatCompletionResponse,
@@ -21,10 +19,6 @@ import {
   isTypedTool,
   type AnthropicTool,
 } from "~/routes/messages/anthropic-types"
-import {
-  detectWebSearchIntent,
-  stripWebSearchTypedTools,
-} from "~/routes/messages/web-search-detection"
 import * as createChatCompletionsModule from "~/services/copilot/create-chat-completions"
 import * as braveModule from "~/services/web-search/brave"
 import {
@@ -500,216 +494,6 @@ describe("webSearchInterceptor — search path", () => {
   })
 })
 
-function makeAnthropicPayload(
-  tools?: AnthropicMessagesPayload["tools"],
-  lastUserContent = "Tell me about yourself",
-): AnthropicMessagesPayload {
-  return {
-    model: "claude-opus-4",
-    max_tokens: 1024,
-    messages: [{ role: "user", content: lastUserContent }],
-    tools,
-  }
-}
-
-function makePreflightResponse(answer: "yes" | "no"): ChatCompletionResponse {
-  return {
-    id: "preflight-1",
-    object: "chat.completion",
-    created: 0,
-    model: "gpt-4o-mini",
-    choices: [
-      {
-        index: 0,
-        logprobs: null,
-        finish_reason: "stop",
-        message: { role: "assistant", content: answer },
-      },
-    ],
-  }
-}
-
-describe("stripWebSearchTypedTools", () => {
-  test("removes typed web_search tool from tools array", () => {
-    const payload = makeAnthropicPayload([
-      { type: "web_search_20250305", name: "web_search" },
-      {
-        name: "bash",
-        description: "Run bash",
-        input_schema: { type: "object", properties: {}, required: [] },
-      },
-    ])
-    const stripped = stripWebSearchTypedTools(payload)
-    expect(stripped.tools).toHaveLength(1)
-    expect(stripped.tools?.[0]).toMatchObject({ name: "bash" })
-  })
-
-  test("keeps non-search typed tools (e.g. bash_20250124)", () => {
-    const payload = makeAnthropicPayload([
-      { type: "web_search_20250305", name: "web_search" },
-      { type: "bash_20250124", name: "bash" },
-    ])
-    const stripped = stripWebSearchTypedTools(payload)
-    expect(stripped.tools).toHaveLength(1)
-    expect(stripped.tools?.[0]).toMatchObject({ name: "bash" })
-  })
-
-  test("returns payload unchanged when no web search tools present", () => {
-    const payload = makeAnthropicPayload([
-      {
-        name: "my_tool",
-        description: "A tool",
-        input_schema: { type: "object", properties: {} },
-      },
-    ])
-    const stripped = stripWebSearchTypedTools(payload)
-    expect(stripped.tools).toHaveLength(1)
-  })
-
-  test("does not mutate original payload", () => {
-    const payload = makeAnthropicPayload([
-      { type: "web_search_20250305", name: "web_search" },
-    ])
-    const originalToolsLength = payload.tools?.length
-    stripWebSearchTypedTools(payload)
-    expect(payload.tools?.length).toBe(originalToolsLength)
-  })
-})
-
-describe("detectWebSearchIntent — Path 1 (typed tool)", () => {
-  afterEach(() => {
-    mock.restore()
-  })
-
-  test("returns true immediately when typed web_search tool present (no preflight call)", async () => {
-    const payload = makeAnthropicPayload([
-      { type: "web_search_20250305", name: "web_search" },
-    ])
-
-    const createSpy = spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    )
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(true)
-    expect(createSpy).not.toHaveBeenCalled()
-  })
-})
-
-describe("detectWebSearchIntent — Path 2 (natural language preflight)", () => {
-  afterEach(() => {
-    mock.restore()
-  })
-
-  test("returns true when preflight responds yes", async () => {
-    const payload = makeAnthropicPayload(
-      [
-        {
-          name: "web_search",
-          description: "Search",
-          input_schema: {
-            type: "object",
-            properties: { query: {} },
-            required: ["query"],
-          },
-        },
-      ],
-      "What happened in the news today?",
-    )
-
-    spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    ).mockResolvedValue(makePreflightResponse("yes"))
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(true)
-  })
-
-  test("returns false when preflight responds no", async () => {
-    const payload = makeAnthropicPayload(
-      [
-        {
-          name: "web_search",
-          description: "Search",
-          input_schema: {
-            type: "object",
-            properties: { query: {} },
-            required: ["query"],
-          },
-        },
-      ],
-      "Write me a poem",
-    )
-
-    spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    ).mockResolvedValue(makePreflightResponse("no"))
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(false)
-  })
-
-  test("returns false (and logs warning) when preflight call throws", async () => {
-    const payload = makeAnthropicPayload(
-      [
-        {
-          name: "web_search",
-          description: "Search",
-          input_schema: {
-            type: "object",
-            properties: { query: {} },
-            required: ["query"],
-          },
-        },
-      ],
-      "Search for something",
-    )
-
-    spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    ).mockRejectedValue(new Error("network failure"))
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(false)
-  })
-
-  test("returns false immediately when payload has no tools (skips preflight)", async () => {
-    const payload = makeAnthropicPayload(undefined, "What is the news today?")
-
-    const createSpy = spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    )
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(false)
-    expect(createSpy).not.toHaveBeenCalled()
-  })
-
-  test("returns false immediately when tools array is empty (skips preflight)", async () => {
-    const payload = makeAnthropicPayload([], "What is the news today?")
-
-    const createSpy = spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    )
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(false)
-    expect(createSpy).not.toHaveBeenCalled()
-  })
-})
-
 describe("prepareWebSearchPayload", () => {
   test("appends WEB_SEARCH_FUNCTION_TOOL to tools array", () => {
     const payload = makePayload()
@@ -733,51 +517,16 @@ describe("prepareWebSearchPayload", () => {
   })
 })
 
-describe("detectWebSearchIntent — Path 2 scoping", () => {
-  afterEach(() => {
-    mock.restore()
-  })
-
-  test("skips preflight when tools are all non-web-search (e.g. bash)", async () => {
-    // A request with Bash/editor tools but no web-search-named tools should
-    // never fire a preflight call (protects Claude Code sessions from overhead).
-    const payload = makeAnthropicPayload(
-      [
-        {
-          name: "bash",
-          description: "Run bash commands",
-          input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
-        },
-      ],
-      "What is the current stock price of Apple?",
-    )
-
-    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(false)
-    expect(createSpy).not.toHaveBeenCalled()
-  })
-
-  test("fires preflight when a custom web_search tool is present", async () => {
-    const payload = makeAnthropicPayload(
-      [
-        {
-          name: "web_search",
-          description: "Search the web",
-          input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-        },
-      ],
-      "What is the current stock price of Apple?",
-    )
-
-    spyOn(createChatCompletionsModule, "createChatCompletions")
-      .mockResolvedValue(makePreflightResponse("yes"))
-
-    const result = await detectWebSearchIntent(payload)
-
-    expect(result).toBe(true)
+describe("prepareWebSearchPayload — always-on injection", () => {
+  test("preserves existing custom tools alongside WEB_SEARCH_FUNCTION_TOOL", () => {
+    const base: ChatCompletionsPayload = {
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{ type: "function", function: { name: "my_tool", parameters: {} } }],
+    }
+    const prepared = prepareWebSearchPayload(base)
+    expect(prepared.tools?.some((t) => t.function.name === "my_tool")).toBe(true)
+    expect(prepared.tools?.some((t) => t.function.name === "web_search")).toBe(true)
   })
 })
 

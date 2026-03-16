@@ -4,12 +4,15 @@ import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
+import { selectModelForTokenCount } from "~/lib/model-selector"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
+import { getTokenCount } from "~/lib/tokenizer"
 import {
   createChatCompletions,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
+  type ChatCompletionsPayload,
 } from "~/services/copilot/create-chat-completions"
 import {
   prepareWebSearchPayload,
@@ -25,10 +28,25 @@ import {
   translateToOpenAI,
 } from "./non-stream-translation"
 import { translateChunkToAnthropicEvents } from "./stream-translation"
-import {
-  detectWebSearchIntent,
-  stripWebSearchTypedTools,
-} from "./web-search-detection"
+
+async function applyModelSwitch(
+  payload: ChatCompletionsPayload,
+): Promise<ChatCompletionsPayload> {
+  if (!state.models) return payload
+  try {
+    const modelForCount = state.models.data.find((m) => m.id === payload.model)
+    if (!modelForCount) return payload
+    const { input: estimatedTokens } = await getTokenCount(payload, modelForCount)
+    const result = selectModelForTokenCount(payload.model, state.models, estimatedTokens)
+    if (result.switched) {
+      consola.warn(`Context overflow: ${result.reason}`)
+      return { ...payload, model: result.model }
+    }
+  } catch {
+    consola.debug("Token count estimation failed, skipping model switch")
+  }
+  return payload
+}
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
@@ -42,16 +60,15 @@ export async function handleCompletion(c: Context) {
 
   let response: Awaited<ReturnType<typeof createChatCompletions>>
 
-  if (isWebSearchEnabled() && (await detectWebSearchIntent(anthropicPayload))) {
-    const cleanedPayload = stripWebSearchTypedTools(anthropicPayload)
-    const openAIPayload = prepareWebSearchPayload(translateToOpenAI(cleanedPayload))
+  if (isWebSearchEnabled()) {
+    const openAIPayload = await applyModelSwitch(prepareWebSearchPayload(translateToOpenAI(anthropicPayload)))
     consola.debug(
       "Translated OpenAI request payload (web search):",
       JSON.stringify(openAIPayload),
     )
     response = await webSearchInterceptor(openAIPayload)
   } else {
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const openAIPayload = await applyModelSwitch(translateToOpenAI(anthropicPayload))
     consola.debug(
       "Translated OpenAI request payload:",
       JSON.stringify(openAIPayload),
