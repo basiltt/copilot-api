@@ -16,9 +16,14 @@ import { isTypedTool, type AnthropicMessagesPayload } from "./anthropic-types"
  * in WEB_SEARCH_TOOL_NAMES. Short-circuits to true without an API call.
  *
  * Path 2: Only fires when Path 1 is false AND the payload has at least one
- * tool defined (client is tool-capable). Sends a lightweight preflight
+ * custom tool whose name is in WEB_SEARCH_TOOL_NAMES (i.e., the client
+ * declared a web-search-capable custom tool). Sends a lightweight preflight
  * classification request to Copilot asking whether the last user message
  * requires real-time web data. Falls back to false on any failure.
+ *
+ * Note: the preflight Copilot API call is not tracked by the outer rate
+ * limiter — it is an internal fan-out. See interceptor.ts for the full
+ * accounting of internal Copilot calls per request.
  */
 export async function detectWebSearchIntent(
   payload: AnthropicMessagesPayload,
@@ -34,9 +39,16 @@ export async function detectWebSearchIntent(
   }
 
   // Path 2: natural language preflight (costs one Copilot API call).
-  // Skip when the payload has no tools at all — if the client didn't
-  // supply any tools, web search was not intended.
-  if (!payload.tools || payload.tools.length === 0) {
+  // Only fires when the client has explicitly declared a custom tool with a
+  // web-search name — this prevents the preflight from firing on every
+  // Claude Code request (which always supplies Bash/editor tools but never
+  // web search tools unless the user explicitly adds one).
+  const hasWebSearchCustomTool =
+    payload.tools?.some(
+      (tool) => !isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name),
+    ) ?? false
+
+  if (!hasWebSearchCustomTool) {
     return false
   }
 
@@ -59,7 +71,9 @@ export async function detectWebSearchIntent(
         },
         {
           role: "user",
-          content: `Does this message require searching the web for current or real-time information?\nMessage: "${lastUserMessage}"`,
+          // Use XML delimiters so that quote characters in the user message
+          // cannot break the classifier prompt (prompt injection mitigation).
+          content: `Does this message require searching the web for current or real-time information?\n<message>${lastUserMessage}</message>`,
         },
       ],
     })) as ChatCompletionResponse
@@ -93,7 +107,7 @@ export function stripWebSearchTypedTools(
 
 function getLastUserMessageText(payload: AnthropicMessagesPayload): string {
   for (let i = payload.messages.length - 1; i >= 0; i--) {
-    const msg = payload.messages[i] as (typeof payload.messages)[number] | undefined
+    const msg = payload.messages.at(i)
     if (msg?.role !== "user") continue
     if (typeof msg.content === "string") return msg.content
     if (Array.isArray(msg.content)) {
@@ -109,8 +123,20 @@ function getLastUserMessageText(payload: AnthropicMessagesPayload): string {
   return ""
 }
 
+/**
+ * Picks a small/cheap model for the single-token preflight classification.
+ * Prefers models whose name contains "mini", "flash", "haiku", or "small"
+ * as a heuristic for lower-cost models. Falls back to the request model if
+ * no cheaper alternative is found.
+ */
 function getPreflightModel(requestModel: string): string {
   const models = state.models?.data ?? []
+  const CHEAP_HINTS = ["mini", "flash", "haiku", "small"]
+  const cheap = models.find((m) =>
+    CHEAP_HINTS.some((hint) => m.id.toLowerCase().includes(hint)),
+  )
+  if (cheap) return cheap.id
+  // Fall back: any model that isn't the request model (avoids same-model round-trip)
   const alternative = models.find((m) => m.id !== requestModel)
   return alternative?.id ?? requestModel
 }

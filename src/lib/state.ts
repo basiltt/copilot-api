@@ -15,6 +15,8 @@ export interface State {
   // Rate limiting configuration
   rateLimitSeconds?: number
   lastRequestTimestamp?: number
+
+  // Web search configuration
   braveApiKey?: string
 }
 

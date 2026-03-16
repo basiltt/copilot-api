@@ -11,8 +11,10 @@ import {
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
-import { webSearchInterceptor } from "~/services/web-search/interceptor"
-import { WEB_SEARCH_FUNCTION_TOOL } from "~/services/web-search/tool-definition"
+import {
+  prepareWebSearchPayload,
+  webSearchInterceptor,
+} from "~/services/web-search/interceptor"
 
 import {
   type AnthropicMessagesPayload,
@@ -42,8 +44,7 @@ export async function handleCompletion(c: Context) {
 
   if (isWebSearchEnabled() && (await detectWebSearchIntent(anthropicPayload))) {
     const cleanedPayload = stripWebSearchTypedTools(anthropicPayload)
-    const openAIPayload = translateToOpenAI(cleanedPayload)
-    openAIPayload.tools = [...(openAIPayload.tools ?? []), WEB_SEARCH_FUNCTION_TOOL]
+    const openAIPayload = prepareWebSearchPayload(translateToOpenAI(cleanedPayload))
     consola.debug(
       "Translated OpenAI request payload (web search):",
       JSON.stringify(openAIPayload),
