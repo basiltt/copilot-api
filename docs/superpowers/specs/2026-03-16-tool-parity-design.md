@@ -20,7 +20,7 @@ The translation layer was built against an earlier subset of the Anthropic API. 
 
 Claude Code sends all its built-in tools as **custom tools** (with `input_schema`) in the `tools` array on every API call. Key findings:
 
-- **Always sent (30 tools):** `Agent`, `Bash`, `Edit`, `EnterPlanMode`, `EnterWorktree`, `ExitPlanMode`, `ExitWorktree`, `Glob`, `Grep`, `LSP`, `NotebookEdit`, `Read`, `Skill`, `TaskOutput`, `TaskStop`, `TodoWrite`, `WebFetch`, `WebSearch`, `Write`, `AskUserQuestion`, `CronCreate`, `CronDelete`, `CronList`, `Brief`
+- **Always sent (24 tools):** `Agent`, `Bash`, `Edit`, `EnterPlanMode`, `EnterWorktree`, `ExitPlanMode`, `ExitWorktree`, `Glob`, `Grep`, `LSP`, `NotebookEdit`, `Read`, `Skill`, `TaskOutput`, `TaskStop`, `TodoWrite`, `WebFetch`, `WebSearch`, `Write`, `AskUserQuestion`, `CronCreate`, `CronDelete`, `CronList`, `Brief`
 - **Conditionally sent:** `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate` (interactive mode), `TeamCreate`, `TeamDelete`, `SendMessage` (agent teams feature)
 - **Never sent to model:** `ListMcpResourcesTool`, `ReadMcpResourceTool`, `StructuredOutput` (excluded from API payload by Claude Code itself)
 - **Conditional/feature-gated:** `ToolSearch` (requires `ENABLE_TOOL_SEARCH` env var)
@@ -117,19 +117,24 @@ export type AnthropicTool = AnthropicCustomTool | AnthropicTypedTool
 ```
 
 **Detection helper (used in non-stream-translation.ts):**
+
+The discriminant is the **presence of `input_schema`**: custom tools always have it; typed tools never do. Using `!('input_schema' in tool)` as the typed-tool discriminant is more robust than `'type' in tool`, because a future custom tool definition could hypothetically include a `type` field.
+
 ```typescript
 export function isTypedTool(tool: AnthropicTool): tool is AnthropicTypedTool {
-  return 'type' in tool
+  return !('input_schema' in tool)
 }
 ```
 
 #### 1.2 `tool_choice` — Add `disable_parallel_tool_use`
 
+`disable_parallel_tool_use` has no OpenAI equivalent and is silently ignored in the translation (not forwarded). It must be parsed in the type so it doesn't cause TypeScript errors, but the `translateAnthropicToolChoiceToOpenAI` function does not need to do anything with it.
+
 ```typescript
 tool_choice?: {
   type: "auto" | "any" | "tool" | "none"
   name?: string
-  disable_parallel_tool_use?: boolean  // ← new
+  disable_parallel_tool_use?: boolean  // ← new; parsed but not forwarded (no OpenAI equivalent)
 }
 ```
 
@@ -146,14 +151,15 @@ export interface AnthropicToolResultBlock {
 
 #### 1.4 New `AnthropicDocumentBlock`
 
+Documents can arrive with different source types (base64 PDF, URL, plain text). The interface uses a wide union to avoid TypeScript errors if non-PDF documents arrive, since the handler emits a placeholder regardless of source type.
+
 ```typescript
 export interface AnthropicDocumentBlock {
   type: "document"
-  source: {
-    type: "base64"
-    media_type: "application/pdf"
-    data: string
-  }
+  source:
+    | { type: "base64"; media_type: string; data: string }
+    | { type: "url"; url: string }
+    | { type: "text"; data: string }
   cache_control?: { type: "ephemeral"; ttl?: number }
 }
 ```
@@ -265,29 +271,35 @@ content: mapToolResultContent(block.content),
 
 #### 2.3 Document block handling in `mapContent`
 
-Add to the switch statement:
+The canonical placeholder string is **`"[Document: PDF content not displayable]"`** — used in both paths below.
+
+The placeholder must appear in **both** the no-image path and the image path to be consistent. In the no-image path, include document blocks explicitly:
+
+```typescript
+const hasImage = content.some((block) => block.type === "image")
+if (!hasImage) {
+  return content
+    .filter((block) =>
+      block.type === "text" || block.type === "thinking" || block.type === "document",
+    )
+    .map((block) => {
+      if (block.type === "text") return block.text
+      if (block.type === "thinking") return (block as AnthropicThinkingBlock).thinking
+      return "[Document: PDF content not displayable]"  // document block
+    })
+    .join("\n\n")
+}
+```
+
+In the image path, add to the switch statement:
 ```typescript
 case "document": {
   // PDFs cannot be sent to Copilot; include a placeholder
   contentParts.push({
     type: "text",
-    text: "[Document: PDF content]",
+    text: "[Document: PDF content not displayable]",
   })
   break
-}
-```
-
-When no images are present, add document block filtering to the text-path:
-```typescript
-const hasImage = content.some((block) => block.type === "image")
-if (!hasImage) {
-  return content
-    .filter((block): block is AnthropicTextBlock | AnthropicThinkingBlock =>
-      block.type === "text" || block.type === "thinking",
-    )
-    // document blocks are skipped (PDF → not representable as text meaningfully)
-    .map((block) => (block.type === "text" ? block.text : block.thinking))
-    .join("\n\n")
 }
 ```
 
@@ -295,59 +307,110 @@ if (!hasImage) {
 
 Add filtering for new assistant block types:
 - `redacted_thinking` blocks: strip entirely (no OpenAI equivalent, contains opaque binary data)
-- `server_tool_use` blocks: serialize as JSON in a text block (preserves multi-turn context)
+- `server_tool_use` blocks: serialize as JSON in text (preserves multi-turn context)
+
+`server_tool_use` blocks must be serialized in **both** branches of `handleAssistantMessage`:
+- Branch 1 (has custom `tool_use` blocks): append to `allTextContent`
+- Branch 2 (no custom tool_use blocks): add to the content passed to `mapContent`, OR add a `server_tool_use` case to `mapContent`'s switch
+
+The simplest approach: add a `server_tool_use` case to `mapContent` that serializes to text. This ensures both branches handle it correctly through the existing `mapContent(message.content)` call.
 
 ```typescript
-// Existing filter for text blocks stays the same
-// Existing filter for thinking blocks stays the same
-// New:
-const serverToolUseBlocks = message.content.filter(
-  (block): block is AnthropicServerToolUseBlock => block.type === "server_tool_use",
+// In mapContent switch:
+case "server_tool_use": {
+  contentParts.push({
+    type: "text",
+    text: `[Server tool use: ${JSON.stringify(block)}]`,
+  })
+  break
+}
+```
+
+And in the no-image text path, include `server_tool_use` blocks:
+```typescript
+.filter((block) =>
+  block.type === "text" || block.type === "thinking" || block.type === "server_tool_use",
 )
-// Include in allTextContent as JSON:
-const allTextContent = [
-  ...textBlocks.map((b) => b.text),
-  ...thinkingBlocks.map((b) => b.thinking),
-  ...serverToolUseBlocks.map((b) => `[Server tool use: ${JSON.stringify(b)}]`),
-].join("\n\n")
+.map((block) => {
+  if (block.type === "text") return block.text
+  if (block.type === "thinking") return (block as AnthropicThinkingBlock).thinking
+  return `[Server tool use: ${JSON.stringify(block)}]`
+})
+```
+
+The `redacted_thinking` filter in `handleAssistantMessage`:
+```typescript
+// Filter out redacted_thinking blocks before passing to mapContent
+const visibleContent = message.content.filter(
+  (block) => block.type !== "redacted_thinking"
+)
+// Then pass visibleContent instead of message.content to mapContent calls
 ```
 
 #### 2.5 `handleUserMessage` — web_search_tool_result blocks
 
+`web_search_tool_result` blocks must be excluded from `otherBlocks` (alongside `tool_result` and `document` exclusions) to avoid double-processing, then serialized as a user message:
+
 ```typescript
-// web_search_tool_result blocks in user messages → serialize as text
+const toolResultBlocks = message.content.filter(
+  (block): block is AnthropicToolResultBlock => block.type === "tool_result",
+)
 const webSearchResultBlocks = message.content.filter(
   (block): block is AnthropicWebSearchToolResultBlock =>
     block.type === "web_search_tool_result",
 )
+const otherBlocks = message.content.filter(
+  (block) =>
+    block.type !== "tool_result" &&
+    block.type !== "web_search_tool_result",  // ← new exclusion
+)
+
+// tool_result blocks → role: "tool" messages (existing logic)
+for (const block of toolResultBlocks) { ... }
+
+// web_search_tool_result blocks → role: "user" message with serialized content
 if (webSearchResultBlocks.length > 0) {
   const text = webSearchResultBlocks
     .map((b) => `[Web search result: ${JSON.stringify(b.content)}]`)
     .join("\n\n")
   newMessages.push({ role: "user", content: text })
 }
+
+// remaining blocks → existing logic
+if (otherBlocks.length > 0) { ... }
 ```
 
 #### 2.6 `translateModelName` — generalized normalization
 
+The regex must only apply to claude **generation 4+** models to avoid mangling existing `claude-haiku-3-5` or `claude-sonnet-3-5` model IDs (which use format `claude-family-major-minor` where minor is meaningful and part of the stable name).
+
+Strategy: anchor to claude-4+ explicitly, normalizing `claude-{family}-4-{minor}[-extra]` → `claude-{family}-4`:
+
 ```typescript
 function translateModelName(model: string): string {
-  // Normalize claude-{family}-{major}-{minor}[-extra] → claude-{family}-{major}
+  // Normalize claude-{family}-4-{minor}[-extra] → claude-{family}-4
+  // Only applies to generation 4+ where minor version numbers are subagent-build-specific
   // Examples:
   //   claude-sonnet-4-6 → claude-sonnet-4
   //   claude-haiku-4-5  → claude-haiku-4
   //   claude-opus-4-6   → claude-opus-4
-  //   claude-opus-4     → claude-opus-4 (unchanged, no minor version)
-  return model.replace(/^(claude-[a-z]+-\d+)-\d+.*$/, "$1")
+  //   claude-sonnet-3-5 → claude-sonnet-3-5 (unchanged — 3.x is stable)
+  //   claude-haiku-3-5  → claude-haiku-3-5  (unchanged — 3.x is stable)
+  return model.replace(/^(claude-[a-z]+-4)-\d+.*$/, "$1")
 }
 ```
+
+This replaces the current family-specific `if/else` with a single general pattern that handles all current and future claude-4+ families.
 
 ---
 
 ### File 3: `count-tokens-handler.ts`
 
+The current code adds `+346` **once** for the entire custom tools array (a flat overhead regardless of how many tools). This existing behavior is **preserved** for custom tools. The only change is: when typed tools are present, add their specific per-tool overhead on top.
+
 ```typescript
 // Anthropic-typed tool token overhead (per Anthropic pricing docs)
+// Only versioned typed tools have specific overhead; custom tools use the existing flat +346
 const ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD: Record<string, number> = {
   "text_editor_20250728": 700,
   "text_editor_20250429": 700,
@@ -358,7 +421,7 @@ const ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD: Record<string, number> = {
   // computer_use and web_search: overhead included in beta pricing, not additive
 }
 
-// In handleCountTokens, replace the flat +346 logic with per-tool calculation:
+// In handleCountTokens — replace the existing tools block:
 if (anthropicPayload.tools && anthropicPayload.tools.length > 0) {
   let mcpToolExist = false
   if (anthropicBeta?.startsWith("claude-code")) {
@@ -368,12 +431,16 @@ if (anthropicPayload.tools && anthropicPayload.tools.length > 0) {
   }
   if (!mcpToolExist) {
     if (anthropicPayload.model.startsWith("claude")) {
-      for (const tool of anthropicPayload.tools) {
-        if (isTypedTool(tool)) {
-          tokenCount.input += ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD[tool.type] ?? 0
-        } else {
-          tokenCount.input += 346  // base overhead for custom tools
-        }
+      const hasCustomTools = anthropicPayload.tools.some((t) => !isTypedTool(t))
+      const typedTools = anthropicPayload.tools.filter(isTypedTool)
+
+      // Preserve existing flat +346 for custom tools (unchanged behavior)
+      if (hasCustomTools) {
+        tokenCount.input += 346
+      }
+      // Add per-typed-tool overhead for Anthropic-typed tools (new)
+      for (const tool of typedTools) {
+        tokenCount.input += ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD[tool.type] ?? 0
       }
     } else if (anthropicPayload.model.startsWith("grok")) {
       tokenCount.input += 480  // grok flat overhead unchanged
@@ -409,13 +476,13 @@ Claude Code → copilot-api proxy → GitHub Copilot
 
 [Anthropic Request]
 tools: [
-  { name: "Bash", input_schema: {...}, cache_control: {...}, strict: true },  // custom
-  { type: "bash_20250124", name: "bash" },  // typed tool (non-CC client)
+  { name: "Bash", input_schema: {...}, cache_control: {...}, strict: true },  // custom tool
+  { type: "bash_20250124", name: "bash" },  // typed tool (non-CC Anthropic client)
 ]
 tool_choice: { type: "auto", disable_parallel_tool_use: true }
 messages: [
   { role: "user", content: [
-    { type: "tool_result", tool_use_id: "x", content: [{ type: "image", ... }] },
+    { type: "tool_result", tool_use_id: "x", content: [{ type: "image", source: {...} }] },
     { type: "document", source: { type: "base64", media_type: "application/pdf", ... } }
   ]}
 ]
@@ -425,15 +492,20 @@ messages: [
 [OpenAI Request]
 tools: [
   { type: "function", function: { name: "Bash", parameters: {...}, strict: true } },
-  // typed tool "bash_20250124" → stripped
-  // cache_control, defer_loading → stripped
+  // typed tool "bash_20250124" → stripped (no input_schema, Copilot can't implement)
+  // cache_control, defer_loading, input_examples, eager_input_streaming → stripped
 ]
-tool_choice: "auto"  // disable_parallel_tool_use → acknowledged, no OpenAI equivalent
+tool_choice: "auto"
+// disable_parallel_tool_use → acknowledged in type, not forwarded (no OpenAI equivalent)
 messages: [
-  { role: "tool", tool_call_id: "x", content: [image_url: "data:image/..."] },
-  { role: "user", content: "[Document: PDF content]" }
+  // tool_result with image array → role:"tool" with ContentPart array (vision-capable)
+  { role: "tool", tool_call_id: "x", content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,..." } }] },
+  // document block → role:"user" with placeholder text
+  { role: "user", content: "[Document: PDF content not displayable]" }
 ]
 ```
+
+> **Note on tool role content:** OpenAI tool messages technically accept string content only in the base spec. However, GitHub Copilot's vision-capable models accept `ContentPart` arrays (including `image_url`) in tool messages, matching the pattern used for user messages with images. This is consistent with how the existing `image` block handling works in `handleUserMessage`. If a Copilot model rejects this, the fallback would be to extract only the text parts, but that would lose the image data entirely.
 
 ---
 
