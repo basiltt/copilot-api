@@ -1,7 +1,8 @@
 import { describe, test, expect } from "bun:test"
 import { z } from "zod"
 
-import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
+import type { AnthropicMessagesPayload, AnthropicTool } from "~/routes/messages/anthropic-types"
+import { isTypedTool } from "../src/routes/messages/anthropic-types"
 
 import { translateToOpenAI } from "../src/routes/messages/non-stream-translation"
 
@@ -215,9 +216,7 @@ describe("Anthropic to OpenAI translation logic", () => {
           },
         },
         // Anthropic-typed tool — should be filtered
-        { type: "bash_20250124", name: "bash" } as unknown as Parameters<
-          typeof translateToOpenAI
-        >[0]["tools"][0],
+        { type: "bash_20250124", name: "bash" } as unknown as AnthropicTool,
       ],
     }
     const result = translateToOpenAI(anthropicPayload)
@@ -690,5 +689,22 @@ describe("OpenAI Chat Completion v1 Request Payload Validation with Zod", () => 
     expect(isValidChatCompletionRequest(undefined)).toBe(false)
     expect(isValidChatCompletionRequest("a string")).toBe(false)
     expect(isValidChatCompletionRequest(123)).toBe(false)
+  })
+})
+
+describe("isTypedTool discriminator", () => {
+  test("returns true for a typed tool (no input_schema)", () => {
+    const typedTool = { type: "bash_20250124", name: "bash" }
+    expect(isTypedTool(typedTool)).toBe(true)
+  })
+
+  test("returns false for a custom tool (has input_schema)", () => {
+    const customTool = { name: "Bash", description: "Run shell commands", input_schema: {} }
+    expect(isTypedTool(customTool)).toBe(false)
+  })
+
+  test("returns false for custom tool even if it has extra fields", () => {
+    const customTool = { name: "Bash", input_schema: {}, strict: true, cache_control: { type: "ephemeral" } }
+    expect(isTypedTool(customTool as AnthropicTool)).toBe(false)
   })
 })
