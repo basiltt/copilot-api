@@ -115,27 +115,29 @@ This requires two passes through the first-pass logic:
 2. If `finish_reason !== "tool_calls"` → **re-issue** the request with the original `stream` flag and return that response
 3. If `finish_reason === "tool_calls"` → proceed with tool execution and second pass as before
 
-This adds one extra Copilot call on non-search requests (total: 2 calls — one non-streaming inspection + one streaming passthrough). This is acceptable because: web search is an opt-in feature (requires API key), and the extra call is lightweight (it produces only a short non-streaming response for inspection).
+This adds one extra Copilot call only when the client requests streaming and Copilot doesn't call the tool (total: 2 calls — one non-streaming inspection + one streaming re-issue). For non-streaming non-search requests, there is zero overhead: 1 call total (the non-streaming inspection is returned directly). This is acceptable because web search is opt-in (requires an API key).
 
 **Option B: Single streaming first pass with tool-call sniffing**
 Send first pass with original `stream` flag. If streaming, buffer SSE chunks looking for `finish_reason: tool_calls`. If tool call detected, switch to non-streaming second pass. Complex and fragile — rejected.
 
 ### Change to `src/services/web-search/interceptor.ts`
 
-The current code at the early-exit point (when Copilot doesn't call the tool):
+There are **two** early-exit points in the current interceptor that both return `firstResponse` (non-streaming) — both must be updated.
+
+**First early exit** (lines ~55–58, when `finish_reason !== "tool_calls"`):
 
 ```typescript
-// CURRENT (returns non-streaming firstResponse regardless of client's stream flag)
+// CURRENT
 const choice = firstResponse.choices.at(0)
 if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
   return firstResponse   // always non-streaming — BUG when client wanted streaming
 }
 ```
 
-**Change this block to:**
+**Change to:**
 
 ```typescript
-// NEW: re-issue with original stream flag when no tool was called
+// NEW
 const choice = firstResponse.choices.at(0)
 if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
   if (payload.stream) {
@@ -143,7 +145,33 @@ if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_cal
   }
   return firstResponse  // non-streaming: return first pass directly (no extra call)
 }
-// rest of function unchanged (tool call execution + second pass)
+```
+
+**Second early exit** (lines ~63–65, when tool_calls were made but none was the web_search tool):
+
+```typescript
+// CURRENT
+const webSearchCall = choice.message.tool_calls.find(
+  (tc) => tc.function.name === WEB_SEARCH_TOOL_NAME,
+)
+if (!webSearchCall) {
+  return firstResponse   // always non-streaming — same streaming BUG
+}
+```
+
+**Change to:**
+
+```typescript
+// NEW
+const webSearchCall = choice.message.tool_calls.find(
+  (tc) => tc.function.name === WEB_SEARCH_TOOL_NAME,
+)
+if (!webSearchCall) {
+  if (payload.stream) {
+    return createChatCompletions(payload)  // re-issue streaming
+  }
+  return firstResponse
+}
 ```
 
 When `payload.stream` is falsy, `firstResponse` is returned directly — 1 Copilot call total. When `payload.stream` is truthy, a second request is issued with the original payload — 2 Copilot calls total. For actual web search (tool was called): first non-streaming pass + second pass with original stream flag = 2 Copilot calls + 1 Tavily call (unchanged).
@@ -190,6 +218,7 @@ Inserted after `prepareWebSearchPayload`/`translateToOpenAI`, before routing to 
 
 ```typescript
 // Model-switch guard (inserted in both branches, after openAIPayload is assigned)
+// Retain the existing consola.debug log of openAIPayload immediately before this block.
 if (state.models) {
   try {
     const modelForCount = state.models.data.find(m => m.id === openAIPayload.model)
@@ -224,15 +253,14 @@ try {
     const tokenCount = await getTokenCount(payload, selectedModel)
     consola.info("Current token count:", tokenCount)
     // NEW: model-switch guard
-    if (state.models) {
-      const result = selectModelForTokenCount(payload.model, state.models, tokenCount.input)
+    // state.models is non-null here — selectedModel was found from it
+    const result = selectModelForTokenCount(payload.model, state.models, tokenCount.input)
       if (result.switched) {
         consola.warn(`Context overflow: ${result.reason}`)
         payload = { ...payload, model: result.model }
         // Update selectedModel so max_tokens defaulting below uses the switched model
         selectedModel = state.models.data.find(m => m.id === result.model) ?? selectedModel
       }
-    }
   } else {
     consola.warn("No model selected, skipping token count calculation")
   }
