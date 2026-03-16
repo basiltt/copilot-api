@@ -47,6 +47,12 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.rateLimitWait = options.rateLimitWait
   state.showToken = options.showToken
 
+  const braveApiKey = process.env.BRAVE_API_KEY
+  if (braveApiKey) {
+    state.braveApiKey = braveApiKey
+    consola.info("Web search enabled (Brave) — note: each web search request uses 2-3 Copilot API calls")
+  }
+
   await ensurePaths()
   await cacheVSCodeVersion()
 

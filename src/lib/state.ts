@@ -15,6 +15,7 @@ export interface State {
   // Rate limiting configuration
   rateLimitSeconds?: number
   lastRequestTimestamp?: number
+  braveApiKey?: string
 }
 
 export const state: State = {
@@ -22,4 +23,8 @@ export const state: State = {
   manualApprove: false,
   rateLimitWait: false,
   showToken: false,
+}
+
+export function isWebSearchEnabled(): boolean {
+  return !!state.braveApiKey
 }
