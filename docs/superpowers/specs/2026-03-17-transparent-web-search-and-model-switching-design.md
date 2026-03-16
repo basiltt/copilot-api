@@ -82,13 +82,17 @@ if (isWebSearchEnabled() && (await detectWebSearchIntent(anthropicPayload))) {
 if (isWebSearchEnabled()) {
   let openAIPayload = prepareWebSearchPayload(translateToOpenAI(anthropicPayload))
   // model-switch guard inserted here (see Section 3)
+  consola.debug("Translated OpenAI request payload (web search):", JSON.stringify(openAIPayload))
   response = await webSearchInterceptor(openAIPayload)
 } else {
   let openAIPayload = translateToOpenAI(anthropicPayload)
   // model-switch guard inserted here (see Section 3)
+  consola.debug("Translated OpenAI request payload:", JSON.stringify(openAIPayload))
   response = await createChatCompletions(openAIPayload)
 }
 ```
+
+The `consola.debug` calls are placed **after** the model-switch guard so they log the final payload (including any model change). Note: the current handler has these debug calls at the end of each branch in the same position — they are retained, not removed.
 
 ---
 
@@ -254,13 +258,14 @@ try {
     consola.info("Current token count:", tokenCount)
     // NEW: model-switch guard
     // state.models is non-null here — selectedModel was found from it
-    const result = selectModelForTokenCount(payload.model, state.models, tokenCount.input)
-      if (result.switched) {
-        consola.warn(`Context overflow: ${result.reason}`)
-        payload = { ...payload, model: result.model }
-        // Update selectedModel so max_tokens defaulting below uses the switched model
-        selectedModel = state.models.data.find(m => m.id === result.model) ?? selectedModel
-      }
+    // Use non-null assertion (!) since TypeScript cannot narrow through the optional-chain above
+    const result = selectModelForTokenCount(payload.model, state.models!, tokenCount.input)
+    if (result.switched) {
+      consola.warn(`Context overflow: ${result.reason}`)
+      payload = { ...payload, model: result.model }
+      // Update selectedModel so max_tokens defaulting below uses the switched model
+      selectedModel = state.models!.data.find(m => m.id === result.model) ?? selectedModel
+    }
   } else {
     consola.warn("No model selected, skipping token count calculation")
   }
@@ -279,6 +284,21 @@ See companion spec `2026-03-17-upstream-error-forwarding-design.md`. Both change
 
 1. Remove premature `consola.error(..., response)` in `create-chat-completions.ts`
 2. Forward Copilot's parsed JSON error body directly in `error.ts`
+
+---
+
+## Required New Imports
+
+The following imports must be added to files that don't already have them:
+
+| File | Import to add |
+|------|--------------|
+| `src/routes/messages/handler.ts` | `import { getTokenCount } from "~/lib/tokenizer"` |
+| `src/routes/messages/handler.ts` | `import { selectModelForTokenCount } from "~/lib/model-selector"` |
+| `src/routes/chat-completions/handler.ts` | `import { selectModelForTokenCount } from "~/lib/model-selector"` |
+
+Remove from `src/routes/messages/handler.ts`:
+- `import { detectWebSearchIntent, stripWebSearchTypedTools } from "./web-search-detection"` (entire import, file is deleted)
 
 ---
 
