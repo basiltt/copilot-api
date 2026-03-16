@@ -1024,6 +1024,67 @@ describe("webSearchInterceptor — Tavily search path", () => {
   })
 })
 
+describe("webSearchInterceptor — streaming preservation", () => {
+  afterEach(() => {
+    mock.restore()
+  })
+
+  test("re-issues with stream:true when Copilot returns stop (no tool call)", async () => {
+    const stopResponse = makeCopilotResponse("stop")
+    const streamingPayload: ChatCompletionsPayload = makePayload(true)
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
+      .mockResolvedValueOnce(stopResponse)          // first pass: non-streaming inspection
+      .mockResolvedValueOnce(stopResponse)          // streaming re-issue: no tool call, returned to caller
+
+    await webSearchInterceptor(streamingPayload)
+
+    // Interceptor must have made exactly 2 calls
+    expect(createSpy).toHaveBeenCalledTimes(2)
+
+    // Second call must NOT include the web_search tool
+    const secondCallArg = createSpy.mock.calls[1]![0] as ChatCompletionsPayload
+    expect(secondCallArg.stream).toBe(true)
+    expect(secondCallArg.tools?.some((t) => t.function.name === "web_search")).toBe(false)
+  })
+
+  test("does NOT re-issue when stream is false and Copilot returns stop", async () => {
+    const stopResponse = makeCopilotResponse("stop")
+    const nonStreamingPayload: ChatCompletionsPayload = makePayload(false)
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    ).mockResolvedValue(stopResponse)
+
+    await webSearchInterceptor(nonStreamingPayload)
+
+    // Only 1 call — non-streaming first pass returned directly, no re-issue
+    expect(createSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test("re-issues with stream:true when Copilot calls a different tool (not web_search)", async () => {
+    const otherToolResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-1", name: "bash", arguments: '{"command":"ls"}' },
+    ])
+    const streamingPayload: ChatCompletionsPayload = makePayload(true)
+    const createSpy = spyOn(
+      createChatCompletionsModule,
+      "createChatCompletions",
+    )
+      .mockResolvedValueOnce(otherToolResponse)
+      .mockResolvedValueOnce(otherToolResponse)
+
+    await webSearchInterceptor(streamingPayload)
+
+    expect(createSpy).toHaveBeenCalledTimes(2)
+    const secondCallArg = createSpy.mock.calls[1]![0] as ChatCompletionsPayload
+    expect(secondCallArg.stream).toBe(true)
+    expect(secondCallArg.tools?.some((t) => t.function.name === "web_search")).toBe(false)
+  })
+})
+
 describe("isWebSearchEnabled — Tavily", () => {
   test("returns false when neither key is set", () => {
     const originalBrave = stateModule.state.braveApiKey

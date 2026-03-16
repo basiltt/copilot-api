@@ -54,6 +54,13 @@ export async function webSearchInterceptor(
 
   const choice = firstResponse.choices.at(0)
   if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
+    if (payload.stream) {
+      const streamPayload: ChatCompletionsPayload = {
+        ...payload,
+        tools: payload.tools?.filter((t) => t.function.name !== WEB_SEARCH_TOOL_NAME),
+      }
+      return createChatCompletions(streamPayload)
+    }
     return firstResponse
   }
 
@@ -61,6 +68,13 @@ export async function webSearchInterceptor(
     (tc) => tc.function.name === WEB_SEARCH_TOOL_NAME,
   )
   if (!webSearchCall) {
+    if (payload.stream) {
+      const streamPayload: ChatCompletionsPayload = {
+        ...payload,
+        tools: payload.tools?.filter((t) => t.function.name !== WEB_SEARCH_TOOL_NAME),
+      }
+      return createChatCompletions(streamPayload)
+    }
     return firstResponse
   }
 
