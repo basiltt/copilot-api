@@ -305,7 +305,7 @@ function translateAnthropicToolsToOpenAI(
     return undefined
   }
 
-  return anthropicTools
+  const customTools: Array<Tool> = anthropicTools
     .filter((tool): tool is AnthropicCustomTool => !isTypedTool(tool))
     .map((tool) => ({
       type: "function",
@@ -318,6 +318,9 @@ function translateAnthropicToolsToOpenAI(
         ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
       },
     }))
+  // Return undefined (not []) when all tools are typed — an empty tools array with an active
+  // tool_choice would produce a malformed OpenAI request.
+  return customTools.length > 0 ? customTools : undefined
 }
 
 function translateAnthropicToolChoiceToOpenAI(
