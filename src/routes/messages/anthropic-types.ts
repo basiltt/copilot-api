@@ -80,10 +80,33 @@ export interface AnthropicAssistantMessage {
 
 export type AnthropicMessage = AnthropicUserMessage | AnthropicAssistantMessage
 
-export interface AnthropicTool {
+// Custom tool (has input_schema) — what Claude Code and standard clients send
+export interface AnthropicCustomTool {
   name: string
   description?: string
   input_schema: Record<string, unknown>
+  strict?: boolean
+  cache_control?: { type: "ephemeral"; ttl?: number }
+  defer_loading?: boolean
+  input_examples?: Array<unknown>
+  eager_input_streaming?: boolean
+}
+
+// Anthropic-typed tool (versioned type string, no input_schema)
+// Examples: bash_20250124, text_editor_20250728, computer_20251124, web_search_20250305
+export interface AnthropicTypedTool {
+  type: string
+  name: string
+  [key: string]: unknown
+}
+
+export type AnthropicTool = AnthropicCustomTool | AnthropicTypedTool
+
+// Discriminant: typed tools never have input_schema; custom tools always do.
+// Using presence of input_schema is more robust than checking for type,
+// since a future custom tool definition could include a type field.
+export function isTypedTool(tool: AnthropicTool): tool is AnthropicTypedTool {
+  return !("input_schema" in tool)
 }
 
 export interface AnthropicResponse {

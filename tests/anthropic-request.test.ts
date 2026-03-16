@@ -197,6 +197,34 @@ describe("Anthropic to OpenAI translation logic", () => {
     expect(assistantMessage?.tool_calls).toHaveLength(1)
     expect(assistantMessage?.tool_calls?.[0].function.name).toBe("get_weather")
   })
+
+  test("should filter out Anthropic typed tools (no input_schema) from tools array", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [{ role: "user", content: "Hello" }],
+      max_tokens: 100,
+      tools: [
+        // Custom tool — should be kept
+        {
+          name: "Bash",
+          description: "Run shell commands",
+          input_schema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+        // Anthropic-typed tool — should be filtered
+        { type: "bash_20250124", name: "bash" } as unknown as Parameters<
+          typeof translateToOpenAI
+        >[0]["tools"][0],
+      ],
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    // Only the custom "Bash" tool survives
+    expect(result.tools).toHaveLength(1)
+    expect(result.tools?.[0].function.name).toBe("Bash")
+  })
 })
 
 describe("OpenAI Chat Completion v1 Request Payload Validation with Zod", () => {
