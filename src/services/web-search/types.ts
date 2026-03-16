@@ -1,15 +1,20 @@
-export interface BraveSearchResult {
+export interface WebSearchResult {
   title: string
   url: string
   description: string
 }
 
-export class BraveSearchError extends Error {
+export class WebSearchError extends Error {
   readonly reason: string
 
   constructor(reason: string) {
-    super(`Brave search failed: ${reason}`)
-    this.name = "BraveSearchError"
+    super(`Web search failed: ${reason}`)
+    this.name = "WebSearchError"
     this.reason = reason
   }
 }
+
+// Backward-compat aliases
+export type BraveSearchResult = WebSearchResult
+export type BraveSearchError = WebSearchError
+export const BraveSearchError = WebSearchError
