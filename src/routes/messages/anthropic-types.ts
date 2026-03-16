@@ -17,6 +17,7 @@ export interface AnthropicMessagesPayload {
   tool_choice?: {
     type: "auto" | "any" | "tool" | "none"
     name?: string
+    disable_parallel_tool_use?: boolean // parsed but not forwarded — no OpenAI equivalent
   }
   thinking?: {
     type: "enabled"
@@ -39,10 +40,25 @@ export interface AnthropicImageBlock {
   }
 }
 
+// New: document block (PDFs sent via Read tool)
+// source union covers all Anthropic-documented source types; handler emits a
+// placeholder string regardless, so media_type is intentionally wide.
+export interface AnthropicDocumentBlock {
+  type: "document"
+  title?: string
+  source:
+    | { type: "base64"; media_type: string; data: string }
+    | { type: "url"; url: string }
+    | { type: "text"; data: string }
+  cache_control?: { type: "ephemeral"; ttl?: number }
+}
+
 export interface AnthropicToolResultBlock {
   type: "tool_result"
   tool_use_id: string
-  content: string
+  content:
+    | string
+    | Array<AnthropicTextBlock | AnthropicImageBlock | AnthropicDocumentBlock>
   is_error?: boolean
 }
 
@@ -56,17 +72,45 @@ export interface AnthropicToolUseBlock {
 export interface AnthropicThinkingBlock {
   type: "thinking"
   thinking: string
+  signature?: string // Used by Claude Code extended thinking
+}
+
+// New: redacted thinking (redact-thinking-2026-02-12 beta)
+export interface AnthropicRedactedThinkingBlock {
+  type: "redacted_thinking"
+  data: string
+}
+
+// New: server-side tool use block in assistant messages
+// Appears in multi-turn histories from real Anthropic API with web_search server tool
+export interface AnthropicServerToolUseBlock {
+  type: "server_tool_use"
+  id: string
+  name: string
+  input: Record<string, unknown>
+}
+
+// New: web search tool result block in user messages
+// Appears in multi-turn histories from real Anthropic API with web_search server tool
+export interface AnthropicWebSearchToolResultBlock {
+  type: "web_search_tool_result"
+  tool_use_id: string
+  content: unknown
 }
 
 export type AnthropicUserContentBlock =
   | AnthropicTextBlock
   | AnthropicImageBlock
+  | AnthropicDocumentBlock
   | AnthropicToolResultBlock
+  | AnthropicWebSearchToolResultBlock
 
 export type AnthropicAssistantContentBlock =
   | AnthropicTextBlock
   | AnthropicToolUseBlock
   | AnthropicThinkingBlock
+  | AnthropicRedactedThinkingBlock
+  | AnthropicServerToolUseBlock
 
 export interface AnthropicUserMessage {
   role: "user"

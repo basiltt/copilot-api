@@ -227,6 +227,68 @@ describe("Anthropic to OpenAI translation logic", () => {
   })
 })
 
+describe("Anthropic new content block types (Task 2)", () => {
+  test("should handle document blocks in user messages", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "What does this PDF say?" },
+            {
+              type: "document",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: "JVBERi0x",
+              },
+            },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    }
+    // Should not throw; document block is converted to placeholder text
+    expect(() => translateToOpenAI(anthropicPayload)).not.toThrow()
+    const result = translateToOpenAI(anthropicPayload)
+    expect(isValidChatCompletionRequest(result)).toBe(true)
+    // Placeholder text must appear in the message content
+    const userMsg = result.messages.find((m) => m.role === "user")
+    expect(typeof userMsg?.content).toBe("string")
+    expect(userMsg?.content as string).toContain(
+      "[Document: PDF content not displayable]",
+    )
+  })
+
+  test("should handle redacted_thinking blocks in assistant messages", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Think hard about this." },
+        {
+          role: "assistant",
+          content: [
+            { type: "redacted_thinking", data: "EncryptedThinkingData==" },
+            { type: "text", text: "Here is my answer." },
+          ],
+        },
+        { role: "user", content: "Follow up." },
+      ],
+      max_tokens: 100,
+    }
+    expect(() => translateToOpenAI(anthropicPayload)).not.toThrow()
+    const result = translateToOpenAI(anthropicPayload)
+    // The redacted_thinking block is stripped; only the text block survives
+    const assistantMsg = result.messages.find((m) => m.role === "assistant")
+    expect(assistantMsg?.content).toContain("Here is my answer.")
+    // redacted_thinking data must NOT appear as raw base64
+    expect(assistantMsg?.content as string).not.toContain(
+      "EncryptedThinkingData==",
+    )
+  })
+})
+
 describe("OpenAI Chat Completion v1 Request Payload Validation with Zod", () => {
   test("should return true for a minimal valid request payload", () => {
     const validPayload = {
