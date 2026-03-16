@@ -19,3 +19,6 @@ dist/
 .vscode/
 # Ignore log files
 *.log
+
+# git worktrees
+.worktrees/
