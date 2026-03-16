@@ -443,6 +443,7 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
       (m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("[Web search result:")
     )
     expect(webResultMsg).toBeDefined()
+    expect(webResultMsg?.content).toContain("example.com")
   })
 })
 

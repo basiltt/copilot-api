@@ -214,7 +214,8 @@ function mapToolResultContent(
   if (typeof content === "string") {
     return content
   }
-  // content is an array of text/image/document blocks — reuse mapContent logic
+  // Safe cast: AnthropicToolResultBlock content array is Array<TextBlock|ImageBlock|DocumentBlock>,
+  // all of which are members of AnthropicUserContentBlock — mapContent handles them correctly.
   return mapContent(content as Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>)
 }
 
