@@ -4,6 +4,7 @@ import consola from "consola"
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
+import { selectModelForTokenCount } from "~/lib/model-selector"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
@@ -21,15 +22,23 @@ export async function handleCompletion(c: Context) {
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
 
   // Find the selected model
-  const selectedModel = state.models?.data.find(
+  let selectedModel = state.models?.data.find(
     (model) => model.id === payload.model,
   )
 
-  // Calculate and display token count
   try {
     if (selectedModel) {
       const tokenCount = await getTokenCount(payload, selectedModel)
       consola.info("Current token count:", tokenCount)
+      // Context-overflow guard: auto-switch to largest-context model if needed
+      // state.models is non-null here — selectedModel was found from it
+      const result = selectModelForTokenCount(payload.model, state.models!, tokenCount.input)
+      if (result.switched) {
+        consola.warn(`Context overflow: ${result.reason}`)
+        payload = { ...payload, model: result.model }
+        // Update selectedModel so max_tokens defaulting below uses the switched model
+        selectedModel = state.models!.data.find((m) => m.id === result.model) ?? selectedModel
+      }
     } else {
       consola.warn("No model selected, skipping token count calculation")
     }
