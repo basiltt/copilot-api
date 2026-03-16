@@ -227,6 +227,67 @@ describe("Anthropic to OpenAI translation logic", () => {
   })
 })
 
+describe("Anthropic new content block types (Task 6)", () => {
+  test("document block in user message produces placeholder text", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Summarize this PDF." },
+            {
+              type: "document",
+              title: "My Report",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: "JVBERi0x",
+              },
+            },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    const userMsg = result.messages.find((m) => m.role === "user")
+    expect(typeof userMsg?.content).toBe("string")
+    const content = userMsg?.content as string
+    expect(content).toContain("Summarize this PDF.")
+    expect(content).toContain("[Document: PDF content not displayable]")
+  })
+
+  test("server_tool_use block in assistant message is serialized to text", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Search for something." },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "server_tool_use",
+              id: "srv_1",
+              name: "web_search",
+              input: { query: "test" },
+            },
+            { type: "text", text: "I searched for you." },
+          ],
+        },
+        { role: "user", content: "Thanks." },
+      ],
+      max_tokens: 100,
+    }
+    const result = translateToOpenAI(anthropicPayload)
+    const assistantMsg = result.messages.find((m) => m.role === "assistant")
+    const content = assistantMsg?.content as string
+    expect(content).toContain("[Server tool use:")
+    expect(content).toContain("web_search")
+    expect(content).toContain("I searched for you.")
+  })
+})
+
 describe("Anthropic new content block types (Task 2)", () => {
   test("should handle document blocks in user messages", () => {
     const anthropicPayload: AnthropicMessagesPayload = {

@@ -16,7 +16,6 @@ import {
   type AnthropicMessagesPayload,
   type AnthropicRedactedThinkingBlock,
   type AnthropicResponse,
-  type AnthropicServerToolUseBlock,
   type AnthropicTextBlock,
   type AnthropicThinkingBlock,
   type AnthropicTool,
@@ -153,14 +152,10 @@ function handleAssistantMessage(
     (block): block is AnthropicThinkingBlock => block.type === "thinking",
   )
 
-  // server_tool_use and redacted_thinking have no OpenAI equivalent — strip them
+  // redacted_thinking has no OpenAI equivalent — strip it; server_tool_use is serialised to text by mapContent
   const visibleBlocks = message.content.filter(
-    (
-      block,
-    ): block is Exclude<
-      typeof block,
-      AnthropicServerToolUseBlock | AnthropicRedactedThinkingBlock
-    > => block.type !== "server_tool_use" && block.type !== "redacted_thinking",
+    (block): block is Exclude<typeof block, AnthropicRedactedThinkingBlock> =>
+      block.type !== "redacted_thinking",
   )
 
   // Combine text and thinking blocks, as OpenAI doesn't have separate thinking blocks
@@ -207,17 +202,20 @@ function mapContent(
   const hasImage = content.some((block) => block.type === "image")
   if (!hasImage) {
     return content
-      .flatMap((block): Array<string> => {
-        if (block.type === "text") return [block.text]
-        if (block.type === "thinking") return [block.thinking]
+      .filter(
+        (block) =>
+          block.type === "text"
+          || block.type === "thinking"
+          || block.type === "document" // user messages: PDF → placeholder
+          || block.type === "server_tool_use", // assistant messages: serialise to JSON
+      )
+      .map((block) => {
+        if (block.type === "text") return block.text
+        if (block.type === "thinking") return block.thinking
         if (block.type === "document")
-          return [
-            block.title ?
-              `[Document: ${block.title} — PDF content not displayable]`
-            : "[Document: PDF content not displayable]",
-          ]
-        // redacted_thinking, server_tool_use, web_search_tool_result, image (no image path), tool_result, tool_use — strip
-        return []
+          return "[Document: PDF content not displayable]"
+        // server_tool_use
+        return `[Server tool use: ${JSON.stringify(block)}]`
       })
       .join("\n\n")
   }
@@ -246,18 +244,22 @@ function mapContent(
         break
       }
       case "document": {
-        const docBlock = block
         contentParts.push({
           type: "text",
-          text:
-            docBlock.title ?
-              `[Document: ${docBlock.title} — PDF content not displayable]`
-            : "[Document: PDF content not displayable]",
+          text: "[Document: PDF content not displayable]",
         })
 
         break
       }
-      // redacted_thinking, server_tool_use, web_search_tool_result — strip (no OpenAI equivalent)
+      case "server_tool_use": {
+        contentParts.push({
+          type: "text",
+          text: `[Server tool use: ${JSON.stringify(block)}]`,
+        })
+
+        break
+      }
+      // redacted_thinking: silently skip — opaque binary data, no OpenAI equivalent
       // No default
     }
   }
