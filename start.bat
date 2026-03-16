@@ -24,10 +24,12 @@ if not exist dist (
     echo.
 )
 
-if defined BRAVE_API_KEY (
-    echo Web search: enabled (Brave)
+if defined TAVILY_API_KEY (
+    echo Web search: enabled ^(Tavily^)
+) else if defined BRAVE_API_KEY (
+    echo Web search: enabled ^(Brave^)
 ) else (
-    echo Web search: disabled (set BRAVE_API_KEY in .env to enable)
+    echo Web search: disabled ^(set TAVILY_API_KEY or BRAVE_API_KEY in .env to enable^)
 )
 echo.
 
