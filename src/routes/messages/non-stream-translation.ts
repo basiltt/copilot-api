@@ -11,9 +11,12 @@ import {
 import {
   type AnthropicAssistantContentBlock,
   type AnthropicAssistantMessage,
+  type AnthropicCustomTool,
   type AnthropicMessage,
   type AnthropicMessagesPayload,
+  type AnthropicRedactedThinkingBlock,
   type AnthropicResponse,
+  type AnthropicServerToolUseBlock,
   type AnthropicTextBlock,
   type AnthropicThinkingBlock,
   type AnthropicTool,
@@ -21,6 +24,7 @@ import {
   type AnthropicToolUseBlock,
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
+  type AnthropicWebSearchToolResultBlock,
   isTypedTool,
 } from "./anthropic-types"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
@@ -95,8 +99,12 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
       (block): block is AnthropicToolResultBlock =>
         block.type === "tool_result",
     )
+    // web_search_tool_result has no OpenAI equivalent — strip it
     const otherBlocks = message.content.filter(
-      (block) => block.type !== "tool_result",
+      (
+        block,
+      ): block is Exclude<typeof block, AnthropicWebSearchToolResultBlock> =>
+        block.type !== "tool_result" && block.type !== "web_search_tool_result",
     )
 
     // Tool results must come first to maintain protocol: tool_use -> tool_result -> user
@@ -148,6 +156,16 @@ function handleAssistantMessage(
     (block): block is AnthropicThinkingBlock => block.type === "thinking",
   )
 
+  // server_tool_use and redacted_thinking have no OpenAI equivalent — strip them
+  const visibleBlocks = message.content.filter(
+    (
+      block,
+    ): block is Exclude<
+      typeof block,
+      AnthropicServerToolUseBlock | AnthropicRedactedThinkingBlock
+    > => block.type !== "server_tool_use" && block.type !== "redacted_thinking",
+  )
+
   // Combine text and thinking blocks, as OpenAI doesn't have separate thinking blocks
   const allTextContent = [
     ...textBlocks.map((b) => b.text),
@@ -172,7 +190,7 @@ function handleAssistantMessage(
     : [
         {
           role: "assistant",
-          content: mapContent(message.content),
+          content: mapContent(visibleBlocks),
         },
       ]
 }
@@ -192,11 +210,18 @@ function mapContent(
   const hasImage = content.some((block) => block.type === "image")
   if (!hasImage) {
     return content
-      .filter(
-        (block): block is AnthropicTextBlock | AnthropicThinkingBlock =>
-          block.type === "text" || block.type === "thinking",
-      )
-      .map((block) => (block.type === "text" ? block.text : block.thinking))
+      .flatMap((block): Array<string> => {
+        if (block.type === "text") return [block.text]
+        if (block.type === "thinking") return [block.thinking]
+        if (block.type === "document")
+          return [
+            block.title ?
+              `[Document: ${block.title} — PDF content not displayable]`
+            : "[Document: PDF content not displayable]",
+          ]
+        // redacted_thinking, server_tool_use, web_search_tool_result, image (no image path), tool_result, tool_use — strip
+        return []
+      })
       .join("\n\n")
   }
 
@@ -223,6 +248,19 @@ function mapContent(
 
         break
       }
+      case "document": {
+        const docBlock = block
+        contentParts.push({
+          type: "text",
+          text:
+            docBlock.title ?
+              `[Document: ${docBlock.title} — PDF content not displayable]`
+            : "[Document: PDF content not displayable]",
+        })
+
+        break
+      }
+      // redacted_thinking, server_tool_use, web_search_tool_result — strip (no OpenAI equivalent)
       // No default
     }
   }
@@ -235,14 +273,18 @@ function translateAnthropicToolsToOpenAI(
   if (!anthropicTools) {
     return undefined
   }
+
   return anthropicTools
-    .filter((tool) => !isTypedTool(tool))
+    .filter((tool): tool is AnthropicCustomTool => !isTypedTool(tool))
     .map((tool) => ({
       type: "function",
       function: {
         name: tool.name,
         description: tool.description,
         parameters: tool.input_schema,
+        // Forward strict for Structured Outputs; strip all other extra fields
+        // (cache_control, defer_loading, input_examples, eager_input_streaming)
+        ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
       },
     }))
 }
