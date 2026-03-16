@@ -935,6 +935,7 @@ describe("webSearchInterceptor — Tavily search path", () => {
 
   afterEach(() => {
     state.tavilyApiKey = undefined
+    state.braveApiKey = undefined
     mock.restore()
   })
 
