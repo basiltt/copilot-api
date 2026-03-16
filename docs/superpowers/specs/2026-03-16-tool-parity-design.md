@@ -151,11 +151,12 @@ export interface AnthropicToolResultBlock {
 
 #### 1.4 New `AnthropicDocumentBlock`
 
-Documents can arrive with different source types (base64 PDF, URL, plain text). The interface uses a wide union to avoid TypeScript errors if non-PDF documents arrive, since the handler emits a placeholder regardless of source type.
+Documents can arrive with different source types (base64 PDF, URL, plain text). The interface uses a wide union to avoid TypeScript errors if non-PDF documents arrive, since the handler emits a placeholder regardless of source type. The optional `title` field is included for completeness; it is not used by the translation layer but ensures the interface accurately reflects the wire format.
 
 ```typescript
 export interface AnthropicDocumentBlock {
   type: "document"
+  title?: string
   source:
     | { type: "base64"; media_type: string; data: string }
     | { type: "url"; url: string }
@@ -345,17 +346,33 @@ return [{ role: "assistant", content: mapContent(assistantContent) }]
 const serverToolUseBlocks = message.content.filter(
   (block): block is AnthropicServerToolUseBlock => block.type === "server_tool_use",
 )
-// Update allTextContent to include server tool use serialization:
+// Update allTextContent to include server tool use serialization.
+// The complete updated return statement in Branch 1:
 const allTextContent = [
   ...textBlocks.map((b) => b.text),
   ...thinkingBlocks.map((b) => b.thinking),
   ...serverToolUseBlocks.map((b) => `[Server tool use: ${JSON.stringify(b)}]`),
 ]
-  .filter(Boolean)  // filter empty strings to avoid leading/trailing \n\n separators
+  .filter(Boolean)  // strip empty strings produced by text/thinking .map() calls
   .join("\n\n")
+
+return [
+  {
+    role: "assistant",
+    content: allTextContent || null,  // preserve existing || null: send null not "" when empty
+    tool_calls: toolUseBlocks.map((toolUse) => ({
+      id: toolUse.id,
+      type: "function",
+      function: {
+        name: toolUse.name,
+        arguments: JSON.stringify(toolUse.input),
+      },
+    })),
+  },
+]
 ```
 
-> Note: `.filter(Boolean)` on the joined array is intentional — it prevents double `\n\n` separators when any of the text/thinking/serverToolUse arrays produce empty entries. The existing code uses `.join("\n\n")` directly on always-populated arrays, but with the new additions an empty serverToolUseBlocks array would contribute nothing, so this is safe.
+> Note: `.filter(Boolean)` removes empty strings that can be produced by `textBlocks.map(b => b.text)` or `thinkingBlocks.map(b => b.thinking)` when blocks contain empty string content. Without it, `""` entries would create spurious `\n\n` separators in the joined string. The `|| null` on `content` is preserved from the existing code — it converts an empty `allTextContent` to `null`, which is the correct value for an assistant message with no text content (only tool calls).
 
 #### 2.5 `handleUserMessage` — web_search_tool_result blocks
 
