@@ -30,6 +30,7 @@ import {
   WEB_SEARCH_TOOL_NAMES,
   WEB_SEARCH_FUNCTION_TOOL,
 } from "~/services/web-search/tool-definition"
+import { appendWebSearchInstruction } from "~/services/web-search/system-prompt"
 import { BraveSearchError, WebSearchError } from "~/services/web-search/types"
 
 describe("WEB_SEARCH_TOOL_NAMES", () => {
@@ -872,5 +873,43 @@ describe("isWebSearchEnabled — Tavily", () => {
       stateModule.state.braveApiKey = originalBrave
       stateModule.state.tavilyApiKey = originalTavily
     }
+  })
+})
+
+describe("appendWebSearchInstruction", () => {
+  test("appends instruction to string system prompt", () => {
+    const result = appendWebSearchInstruction("You are a helpful assistant.")
+    expect(typeof result).toBe("string")
+    expect(result as string).toContain("You are a helpful assistant.")
+    expect(result as string).toContain("web_search")
+  })
+
+  test("appends instruction to last text block in array system prompt", () => {
+    const system = [
+      { type: "text" as const, text: "First block." },
+      { type: "text" as const, text: "Second block." },
+    ]
+    const result = appendWebSearchInstruction(system)
+    expect(Array.isArray(result)).toBe(true)
+    const blocks = result as typeof system
+    expect(blocks[0].text).toBe("First block.")
+    expect(blocks[1].text).toContain("Second block.")
+    expect(blocks[1].text).toContain("web_search")
+  })
+
+  test("adds new text block when array has no text blocks", () => {
+    const system = [{ type: "tool_result" as const, text: "some tool result" }]
+    const result = appendWebSearchInstruction(system as unknown as Parameters<typeof appendWebSearchInstruction>[0])
+    expect(Array.isArray(result)).toBe(true)
+    const blocks = result as Array<{ type: string; text: string }>
+    expect(blocks).toHaveLength(2)
+    expect(blocks[1].type).toBe("text")
+    expect(blocks[1].text).toContain("web_search")
+  })
+
+  test("returns instruction string when system is undefined", () => {
+    const result = appendWebSearchInstruction(undefined)
+    expect(typeof result).toBe("string")
+    expect(result as string).toContain("web_search")
   })
 })

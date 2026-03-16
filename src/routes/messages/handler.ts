@@ -18,6 +18,7 @@ import {
   prepareWebSearchPayload,
   webSearchInterceptor,
 } from "~/services/web-search/interceptor"
+import { appendWebSearchInstruction } from "~/services/web-search/system-prompt"
 
 import {
   type AnthropicMessagesPayload,
@@ -61,7 +62,11 @@ export async function handleCompletion(c: Context) {
   let response: Awaited<ReturnType<typeof createChatCompletions>>
 
   if (isWebSearchEnabled()) {
-    const openAIPayload = await applyModelSwitch(prepareWebSearchPayload(translateToOpenAI(anthropicPayload)))
+    const augmentedPayload: AnthropicMessagesPayload = {
+      ...anthropicPayload,
+      system: appendWebSearchInstruction(anthropicPayload.system),
+    }
+    const openAIPayload = await applyModelSwitch(prepareWebSearchPayload(translateToOpenAI(augmentedPayload)))
     consola.debug(
       "Translated OpenAI request payload (web search):",
       JSON.stringify(openAIPayload),
