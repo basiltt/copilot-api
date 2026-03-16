@@ -19,11 +19,12 @@ When a long conversation (e.g. accumulated tool results, large system prompts) e
 
 ## Solution Overview
 
-Three coordinated changes:
+Four coordinated changes:
 
 1. **Always-on web search** — when web search is enabled, inject `web_search` into every request unconditionally; let Copilot decide when to call it
-2. **Context-aware model switching** — before sending any request, check if the prompt exceeds the model's context window and auto-switch to the largest-context available model
-3. **Upstream error forwarding** — forward Copilot's JSON error body directly (already approved in companion spec `2026-03-17-upstream-error-forwarding-design.md`)
+2. **Fix streaming in interceptor** — the interceptor currently forces `stream: false` on the first pass; when Copilot doesn't call the tool, streaming must be preserved by re-issuing the request with the original `stream` flag
+3. **Context-aware model switching** — before sending any request, check if the prompt exceeds the model's context window and auto-switch to the largest-context available model
+4. **Upstream error forwarding** — forward Copilot's JSON error body directly (already approved in companion spec `2026-03-17-upstream-error-forwarding-design.md`)
 
 ---
 
@@ -46,19 +47,25 @@ else:
   createChatCompletions directly
 ```
 
-Detection is removed entirely. When `TAVILY_API_KEY` or `BRAVE_API_KEY` is set, every request gets `WEB_SEARCH_FUNCTION_TOOL` injected into the OpenAI `tools` array. Copilot calls the tool when it judges the question needs real-time data; otherwise it ignores the tool and answers normally. Zero extra API calls on non-search requests.
+Detection is removed entirely. When `TAVILY_API_KEY` or `BRAVE_API_KEY` is set, every request gets `WEB_SEARCH_FUNCTION_TOOL` injected into the OpenAI `tools` array. Copilot calls the tool when it judges the question needs real-time data; otherwise it ignores the tool. See Section 2 for how streaming is preserved on non-search requests.
 
 ### `web-search-detection.ts` — deleted
 
 The entire file is removed. It contained:
 - `detectWebSearchIntent()` — no longer needed
-- `stripWebSearchTypedTools()` — no longer needed (typed web search tools from clients are still handled by the existing `translateAnthropicToolsToOpenAI` filter, which already strips typed tools)
+- `stripWebSearchTypedTools()` — no longer needed (typed web search tools from clients are already stripped by `translateAnthropicToolsToOpenAI` in `non-stream-translation.ts`, which filters to custom tools only)
 - `getPreflightModel()` — no longer needed
 - `getLastUserMessageText()` — no longer needed
 
-The import of `detectWebSearchIntent` and `stripWebSearchTypedTools` in `handler.ts` is removed.
+The imports of `detectWebSearchIntent` and `stripWebSearchTypedTools` in `handler.ts` are removed.
+
+Note on `stripWebSearchTypedTools`: `translateAnthropicToolsToOpenAI` filters to `!isTypedTool(tool)`, which strips all Anthropic typed tools (including `web_search_20250305`) before the OpenAI payload is built. This was already true on the non-web-search branch in the old flow, so removal of `stripWebSearchTypedTools` is safe.
+
+Note on `tool_choice` pointing to a stripped typed tool (e.g. `tool_choice: { type: "tool", name: "web_search_20250305" }`): this produces a malformed OpenAI request regardless of this change — the typed tool is stripped but the `tool_choice` is translated to a named function choice. This pre-existing edge case is not made worse by this change and is out of scope.
 
 ### handler.ts changes (messages route)
+
+The `response` variable is declared with `let` at the outer scope so it can be assigned in either branch. The web search branch declares `openAIPayload` with `let` so the model-switch guard (Section 3) can reassign it.
 
 ```typescript
 // Before
@@ -73,23 +80,81 @@ if (isWebSearchEnabled() && (await detectWebSearchIntent(anthropicPayload))) {
 
 // After
 if (isWebSearchEnabled()) {
-  const openAIPayload = prepareWebSearchPayload(translateToOpenAI(anthropicPayload))
+  let openAIPayload = prepareWebSearchPayload(translateToOpenAI(anthropicPayload))
+  // model-switch guard inserted here (see Section 3)
   response = await webSearchInterceptor(openAIPayload)
 } else {
-  const openAIPayload = translateToOpenAI(anthropicPayload)
+  let openAIPayload = translateToOpenAI(anthropicPayload)
+  // model-switch guard inserted here (see Section 3)
   response = await createChatCompletions(openAIPayload)
 }
 ```
 
-Note: `stripWebSearchTypedTools` is no longer called. Anthropic typed tools (e.g. `web_search_20250305`) are already stripped by `translateAnthropicToolsToOpenAI` in `non-stream-translation.ts` — that function filters out all typed tools (those without `input_schema`) and only forwards custom tools. No behaviour change for typed-tool payloads.
+---
 
-### webSearchInterceptor — unchanged
+## Section 2: Fix Streaming in webSearchInterceptor
 
-The interceptor already handles the "Copilot didn't call web_search" case: if `finish_reason !== "tool_calls"` it returns the first-pass response as-is. So on non-search requests, the interceptor is a transparent pass-through with one non-streaming Copilot call (the first pass). Streaming is preserved — the second pass uses the original `stream` flag.
+### The problem
+
+`webSearchInterceptor` currently forces `stream: false` on the first pass unconditionally:
+
+```typescript
+const firstPassPayload: ChatCompletionsPayload = { ...payload, stream: false }
+```
+
+When Copilot doesn't call the web search tool (`finish_reason !== "tool_calls"`), the interceptor returns `firstResponse` — which was fetched non-streaming. If the client requested streaming, they get a non-streaming response. This is a silent regression introduced by always routing through the interceptor.
+
+### The fix
+
+Change the interceptor to use the **client's original `stream` flag on the first pass**. If Copilot doesn't call the tool, the streaming response is returned directly as-is. If Copilot does call the tool, the first pass response is a non-streaming response (used to extract the tool call arguments), so the first pass must be forced non-streaming **only when the response will be consumed as data** (i.e. only when Copilot calls the tool).
+
+This requires two passes through the first-pass logic:
+
+**Option A (recommended): Two-step first pass**
+1. Always send first pass with `stream: false` (non-streaming) to inspect `finish_reason`
+2. If `finish_reason !== "tool_calls"` → **re-issue** the request with the original `stream` flag and return that response
+3. If `finish_reason === "tool_calls"` → proceed with tool execution and second pass as before
+
+This adds one extra Copilot call on non-search requests (total: 2 calls — one non-streaming inspection + one streaming passthrough). This is acceptable because: web search is an opt-in feature (requires API key), and the extra call is lightweight (it produces only a short non-streaming response for inspection).
+
+**Option B: Single streaming first pass with tool-call sniffing**
+Send first pass with original `stream` flag. If streaming, buffer SSE chunks looking for `finish_reason: tool_calls`. If tool call detected, switch to non-streaming second pass. Complex and fragile — rejected.
+
+### Change to `src/services/web-search/interceptor.ts`
+
+The current code at the early-exit point (when Copilot doesn't call the tool):
+
+```typescript
+// CURRENT (returns non-streaming firstResponse regardless of client's stream flag)
+const choice = firstResponse.choices.at(0)
+if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
+  return firstResponse   // always non-streaming — BUG when client wanted streaming
+}
+```
+
+**Change this block to:**
+
+```typescript
+// NEW: re-issue with original stream flag when no tool was called
+const choice = firstResponse.choices.at(0)
+if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
+  if (payload.stream) {
+    return createChatCompletions(payload)  // re-issue streaming — preserves client's stream flag
+  }
+  return firstResponse  // non-streaming: return first pass directly (no extra call)
+}
+// rest of function unchanged (tool call execution + second pass)
+```
+
+When `payload.stream` is falsy, `firstResponse` is returned directly — 1 Copilot call total. When `payload.stream` is truthy, a second request is issued with the original payload — 2 Copilot calls total. For actual web search (tool was called): first non-streaming pass + second pass with original stream flag = 2 Copilot calls + 1 Tavily call (unchanged).
+
+### `tool_choice: "none"` behaviour
+
+When the client sends `tool_choice: "none"`, the first pass non-streaming inspection call will return `finish_reason: "stop"` (Copilot won't call any tool). The interceptor then re-issues with original stream flag (if streaming) and returns. Correct behaviour.
 
 ---
 
-## Section 2: Context-Aware Model Switching
+## Section 3: Context-Aware Model Switching
 
 ### New file: `src/lib/model-selector.ts`
 
@@ -103,7 +168,7 @@ export interface ModelSelectionResult {
 }
 
 export function selectModelForTokenCount(
-  payload: ChatCompletionsPayload,
+  requestedModelId: string,
   models: ModelsResponse,
   estimatedTokens: number,
 ): ModelSelectionResult
@@ -111,45 +176,76 @@ export function selectModelForTokenCount(
 
 **Logic:**
 1. Find the requested model in `models.data` by `id`
-2. If model not found → return `{ model: payload.model, switched: false }` (can't make a decision without capability data)
-3. Read `capabilities.limits.max_context_window_tokens` (preferred) or `capabilities.limits.max_prompt_tokens` as fallback. If neither is set → return `{ model: payload.model, switched: false }`
-4. If `estimatedTokens <= contextWindow` → return `{ model: payload.model, switched: false }` (no switch needed)
-5. Find the model with the largest `max_context_window_tokens` across all models in `models.data`. If that model is already the requested model → return `{ model: payload.model, switched: false, reason: "already largest context model" }`
-6. Return `{ model: largestContextModel.id, switched: true, reason: "prompt [N] exceeds [requested model] context [M], switched to [new model] [L]" }`
+2. If model not found → return `{ model: requestedModelId, switched: false }` (can't decide without capability data)
+3. Read `capabilities.limits.max_context_window_tokens` (preferred) or `capabilities.limits.max_prompt_tokens` as fallback. If neither is set → return `{ model: requestedModelId, switched: false }`
+4. If `estimatedTokens <= contextWindow` → return `{ model: requestedModelId, switched: false }` (within limits)
+5. Find the model with the largest `max_context_window_tokens` across all `models.data`. If it is the same as the requested model → return `{ model: requestedModelId, switched: false, reason: "already largest context model" }`
+6. Return `{ model: largestContextModel.id, switched: true, reason: "prompt [N] tokens exceeds [requestedModel] context window [M], switching to [newModel] [L]" }`
+
+Note: token estimation uses the original model's tokenizer. If the fallback model uses a different tokenizer the estimate may be slightly off — this is acceptable since the guard is a best-effort heuristic.
 
 ### Integration in handler.ts (messages route)
 
-After `translateToOpenAI` / `prepareWebSearchPayload`, before calling `webSearchInterceptor` or `createChatCompletions`:
+Inserted after `prepareWebSearchPayload`/`translateToOpenAI`, before routing to interceptor or `createChatCompletions`. The `openAIPayload` variable is `let`-scoped (shown in Section 1). The guard is identical in both the web-search and non-web-search branches:
 
 ```typescript
-// Estimate token count and switch model if needed
+// Model-switch guard (inserted in both branches, after openAIPayload is assigned)
 if (state.models) {
   try {
-    const selectedModel = state.models.data.find(m => m.id === openAIPayload.model)
-    if (selectedModel) {
-      const { input: estimatedTokens } = await getTokenCount(openAIPayload, selectedModel)
-      const result = selectModelForTokenCount(openAIPayload, state.models, estimatedTokens)
+    const modelForCount = state.models.data.find(m => m.id === openAIPayload.model)
+    if (modelForCount) {
+      const { input: estimatedTokens } = await getTokenCount(openAIPayload, modelForCount)
+      const result = selectModelForTokenCount(openAIPayload.model, state.models, estimatedTokens)
       if (result.switched) {
         consola.warn(`Context overflow: ${result.reason}`)
         openAIPayload = { ...openAIPayload, model: result.model }
       }
     }
   } catch {
-    // Token count failure is non-fatal — proceed with original model
     consola.debug("Token count estimation failed, skipping model switch")
   }
 }
 ```
 
-The try/catch ensures a tokenizer failure never breaks a request.
+For `getTokenCount`, the model object is found as: `state.models.data.find(m => m.id === openAIPayload.model)`. If not found, the try/catch handles the failure gracefully.
 
-### Also applies to the `/v1/chat/completions` route
+### Integration in chat-completions/handler.ts
 
-The OpenAI-compatible route (`chat-completions/handler.ts`) already calls `getTokenCount` for logging. The same `selectModelForTokenCount` call is added there, after the existing token count calculation, before `createChatCompletions`.
+The `chat-completions/handler.ts` existing handler calls `getTokenCount` with `selectedModel` for logging (lines 29–38). Change `selectedModel` from `const` to `let`, then insert the model-switch guard inside the same try block, after the existing `consola.info` call:
+
+```typescript
+// Change: const → let
+let selectedModel = state.models?.data.find(
+  (model) => model.id === payload.model,
+)
+
+try {
+  if (selectedModel) {
+    const tokenCount = await getTokenCount(payload, selectedModel)
+    consola.info("Current token count:", tokenCount)
+    // NEW: model-switch guard
+    if (state.models) {
+      const result = selectModelForTokenCount(payload.model, state.models, tokenCount.input)
+      if (result.switched) {
+        consola.warn(`Context overflow: ${result.reason}`)
+        payload = { ...payload, model: result.model }
+        // Update selectedModel so max_tokens defaulting below uses the switched model
+        selectedModel = state.models.data.find(m => m.id === result.model) ?? selectedModel
+      }
+    }
+  } else {
+    consola.warn("No model selected, skipping token count calculation")
+  }
+} catch (error) {
+  consola.warn("Failed to calculate token count:", error)
+}
+```
+
+Note: `payload` is already declared with `let` in `chat-completions/handler.ts` (line 21: `let payload = await c.req.json<ChatCompletionsPayload>()`), so reassigning `payload` is valid.
 
 ---
 
-## Section 3: Upstream Error Forwarding
+## Section 4: Upstream Error Forwarding
 
 See companion spec `2026-03-17-upstream-error-forwarding-design.md`. Both changes from that spec are included in this implementation:
 
@@ -162,9 +258,10 @@ See companion spec `2026-03-17-upstream-error-forwarding-design.md`. Both change
 
 | File | Change |
 |------|--------|
-| `src/routes/messages/handler.ts` | Remove detection branch; add model-switch guard |
+| `src/routes/messages/handler.ts` | Remove detection branch; add model-switch guard; use `let` for `openAIPayload` |
 | `src/routes/messages/web-search-detection.ts` | **Deleted** |
-| `src/routes/chat-completions/handler.ts` | Add model-switch guard after existing token count |
+| `src/routes/chat-completions/handler.ts` | Add model-switch guard + `selectedModel` update after existing token count |
+| `src/services/web-search/interceptor.ts` | Fix streaming: re-issue with original `stream` flag when Copilot doesn't call tool |
 | `src/lib/model-selector.ts` | **New** — pure `selectModelForTokenCount` helper |
 | `src/lib/error.ts` | Forward upstream JSON errors directly |
 | `src/services/copilot/create-chat-completions.ts` | Remove premature `Response {}` log |
@@ -174,24 +271,25 @@ See companion spec `2026-03-17-upstream-error-forwarding-design.md`. Both change
 | File | Change |
 |------|--------|
 | `tests/model-selector.test.ts` | **New** — unit tests: overflow detection, model switching, no-op within limits, missing model, missing capability data |
-| `tests/web-search.test.ts` | Remove all detection/preflight tests; add always-on injection tests |
+| `tests/web-search.test.ts` | Remove detection/preflight tests; add always-on injection tests; add streaming preservation tests for interceptor |
 
 ---
 
 ## Edge Cases
 
-- **Web search disabled** (`TAVILY_API_KEY` and `BRAVE_API_KEY` both unset): `isWebSearchEnabled()` returns false, flow is identical to current behaviour with no overhead.
-- **Copilot doesn't call web_search** (question doesn't need it): `webSearchInterceptor` first pass returns `finish_reason: "stop"`, interceptor returns first-pass response directly. One non-streaming Copilot call overhead on the first pass; streaming uses original flag on second pass.
-- **All models have same or smaller context window**: `selectModelForTokenCount` returns `switched: false` with reason — prompt is sent as-is, Copilot may still reject, but the error is now forwarded properly to the client.
+- **Web search disabled** (`TAVILY_API_KEY` and `BRAVE_API_KEY` both unset): `isWebSearchEnabled()` returns false, flow is identical to current behaviour — no overhead at all.
+- **Copilot doesn't call web_search, streaming request**: interceptor fires non-streaming first pass (inspection), then re-issues with `stream: true`. Client gets streaming response. Total: 2 Copilot calls.
+- **Copilot doesn't call web_search, non-streaming request**: interceptor fires non-streaming first pass, returns it directly. Total: 1 Copilot call. No overhead vs. direct path.
+- **Copilot calls web_search**: first non-streaming pass → tool execution → second pass with original stream flag. Total: 2 Copilot calls + 1 Tavily call (unchanged from current behaviour).
+- **`tool_choice: "none"`**: Copilot returns `finish_reason: "stop"` on first pass. Interceptor re-issues with original stream flag if streaming. Web search silently skipped. Correct behaviour.
+- **All models have same or smaller context window**: `selectModelForTokenCount` returns `switched: false` — prompt sent as-is, Copilot may reject, but error is now forwarded properly.
 - **Token count estimation fails**: try/catch swallows the error, original model is used, no request is broken.
-- **Typed web_search tools from client** (e.g. `web_search_20250305`): `translateAnthropicToolsToOpenAI` already strips all typed tools — no change in behaviour.
-- **Client sends tool_choice: "none"**: The `prepareWebSearchPayload` injects the tool, but the existing `translateAnthropicToolChoiceToOpenAI` would forward `"none"` — Copilot won't call the tool. Web search silently skipped. This is correct: if the client explicitly says no tools, we respect that.
+- **Typed web_search tools from client** (e.g. `web_search_20250305`): already stripped by `translateAnthropicToolsToOpenAI` — no behaviour change.
 
 ---
 
 ## Non-Goals
 
-- No changes to `webSearchInterceptor` internals
-- No changes to streaming translation
 - No changes to Brave/Tavily provider implementations
 - No new CLI flags
+- No changes to streaming translation (`stream-translation.ts`)
