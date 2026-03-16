@@ -5,12 +5,16 @@ import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { checkRateLimit } from "~/lib/rate-limit"
-import { state } from "~/lib/state"
+import { isWebSearchEnabled, state } from "~/lib/state"
 import {
   createChatCompletions,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
+import {
+  prepareWebSearchPayload,
+  webSearchInterceptor,
+} from "~/services/web-search/interceptor"
 
 import {
   type AnthropicMessagesPayload,
@@ -21,6 +25,10 @@ import {
   translateToOpenAI,
 } from "./non-stream-translation"
 import { translateChunkToAnthropicEvents } from "./stream-translation"
+import {
+  detectWebSearchIntent,
+  stripWebSearchTypedTools,
+} from "./web-search-detection"
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
@@ -28,17 +36,28 @@ export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
-  const openAIPayload = translateToOpenAI(anthropicPayload)
-  consola.debug(
-    "Translated OpenAI request payload:",
-    JSON.stringify(openAIPayload),
-  )
-
   if (state.manualApprove) {
     await awaitApproval()
   }
 
-  const response = await createChatCompletions(openAIPayload)
+  let response: Awaited<ReturnType<typeof createChatCompletions>>
+
+  if (isWebSearchEnabled() && (await detectWebSearchIntent(anthropicPayload))) {
+    const cleanedPayload = stripWebSearchTypedTools(anthropicPayload)
+    const openAIPayload = prepareWebSearchPayload(translateToOpenAI(cleanedPayload))
+    consola.debug(
+      "Translated OpenAI request payload (web search):",
+      JSON.stringify(openAIPayload),
+    )
+    response = await webSearchInterceptor(openAIPayload)
+  } else {
+    const openAIPayload = translateToOpenAI(anthropicPayload)
+    consola.debug(
+      "Translated OpenAI request payload:",
+      JSON.stringify(openAIPayload),
+    )
+    response = await createChatCompletions(openAIPayload)
+  }
 
   if (isNonStreaming(response)) {
     consola.debug(
