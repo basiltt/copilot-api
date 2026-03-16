@@ -193,3 +193,224 @@ describe("searchBrave — error handling", () => {
     }
   })
 })
+
+import { spyOn, beforeEach, afterEach, mock } from "bun:test"
+
+import { webSearchInterceptor } from "~/services/web-search/interceptor"
+import type { ChatCompletionsPayload, ChatCompletionResponse, Message } from "~/services/copilot/create-chat-completions"
+import * as createChatCompletionsModule from "~/services/copilot/create-chat-completions"
+import { state } from "~/lib/state"
+
+// Helper: build a minimal non-streaming ChatCompletionResponse
+function makeCopilotResponse(
+  finishReason: "stop" | "tool_calls",
+  toolCalls?: Array<{ id: string; name: string; arguments: string }>,
+): ChatCompletionResponse {
+  return {
+    id: "resp-1",
+    object: "chat.completion",
+    created: 0,
+    model: "gpt-4o",
+    choices: [
+      {
+        index: 0,
+        logprobs: null,
+        finish_reason: finishReason,
+        message: {
+          role: "assistant",
+          content: finishReason === "stop" ? "Here is my answer." : null,
+          tool_calls: toolCalls?.map((tc) => ({
+            id: tc.id,
+            type: "function" as const,
+            function: { name: tc.name, arguments: tc.arguments },
+          })),
+        },
+      },
+    ],
+  }
+}
+
+function makePayload(stream = false): ChatCompletionsPayload {
+  return {
+    model: "gpt-4o",
+    stream,
+    messages: [{ role: "user", content: "What is the weather today?" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "web_search",
+          description: "Search the web",
+          parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+        },
+      },
+    ],
+  }
+}
+
+describe("webSearchInterceptor — no search path", () => {
+  afterEach(() => {
+    mock.restore()
+  })
+
+  test("returns response as-is when finish_reason is stop", async () => {
+    const stopResponse = makeCopilotResponse("stop")
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValue(stopResponse)
+
+    const result = await webSearchInterceptor(makePayload())
+
+    expect(result).toEqual(stopResponse)
+    expect(createSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test("returns response as-is when tool_calls is for a different tool", async () => {
+    const otherToolResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-1", name: "bash", arguments: '{"command":"ls"}' },
+    ])
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValue(otherToolResponse)
+
+    const result = await webSearchInterceptor(makePayload())
+
+    expect(result).toEqual(otherToolResponse)
+    expect(createSpy).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("webSearchInterceptor — search path", () => {
+  beforeEach(() => {
+    // The interceptor guards on state.braveApiKey before calling searchBrave.
+    // Set a fake key so the guard passes and the spy is reached.
+    state.braveApiKey = "test-key"
+  })
+
+  afterEach(() => {
+    state.braveApiKey = undefined
+    mock.restore()
+  })
+
+  test("calls Brave and makes a second Copilot call when web_search is triggered", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: '{"query":"latest AI news"}' },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+    const braveResults = [
+      { title: "AI News", url: "https://ainews.com", description: "Latest AI developments" },
+    ]
+
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(braveModule, "searchBrave").mockResolvedValue(braveResults)
+
+    const result = await webSearchInterceptor(makePayload())
+
+    expect(createSpy).toHaveBeenCalledTimes(2)
+    expect(result).toEqual(finalResponse)
+    expect(createSpy.mock.calls[0]?.[0]?.stream).toBe(false)
+  })
+
+  test("second pass uses original stream flag", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: '{"query":"news"}' },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(braveModule, "searchBrave").mockResolvedValue([])
+
+    await webSearchInterceptor(makePayload(true))
+
+    expect(createSpy).toHaveBeenCalledTimes(2)
+    expect(createSpy.mock.calls[0]?.[0]?.stream).toBe(false)
+    expect(createSpy.mock.calls[1]?.[0]?.stream).toBe(true)
+  })
+
+  test("injects stub tool results for non-search tool_calls alongside web_search", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: '{"query":"q"}' },
+      { id: "tc-bash", name: "bash", arguments: '{"command":"ls"}' },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(braveModule, "searchBrave").mockResolvedValue([])
+
+    await webSearchInterceptor(makePayload())
+
+    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages as Message[]
+    const toolMessages = secondCallMessages.filter((m) => m.role === "tool")
+    expect(toolMessages).toHaveLength(2)
+    const toolIds = toolMessages.map((m) => m.tool_call_id)
+    expect(toolIds).toContain("tc-ws")
+    expect(toolIds).toContain("tc-bash")
+  })
+
+  test("injects failure message when Brave throws BraveSearchError", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: '{"query":"q"}' },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(braveModule, "searchBrave").mockRejectedValue(new BraveSearchError("HTTP 429"))
+
+    await webSearchInterceptor(makePayload())
+
+    expect(createSpy).toHaveBeenCalledTimes(2)
+    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages as Message[]
+    const toolMsg = secondCallMessages.find((m) => m.role === "tool")
+    expect(toolMsg?.content).toContain("Web search failed")
+    expect(toolMsg?.content).toContain("training data")
+  })
+
+  test("injects failure message when query JSON.parse fails", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: "INVALID_JSON" },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(braveModule, "searchBrave").mockResolvedValue([])
+
+    await webSearchInterceptor(makePayload())
+
+    expect(createSpy).toHaveBeenCalledTimes(2)
+    const secondCallMessages = createSpy.mock.calls[1]?.[0]?.messages as Message[]
+    const toolMsg = secondCallMessages.find((m) => m.role === "tool")
+    expect(toolMsg?.content).toContain("Web search failed")
+  })
+
+  test("passes tool_choice through to second Copilot call unchanged", async () => {
+    const firstResponse = makeCopilotResponse("tool_calls", [
+      { id: "tc-ws", name: "web_search", arguments: '{"query":"q"}' },
+    ])
+    const finalResponse = makeCopilotResponse("stop")
+
+    const createSpy = spyOn(createChatCompletionsModule, "createChatCompletions")
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(finalResponse)
+    spyOn(braveModule, "searchBrave").mockResolvedValue([])
+
+    const payloadWithChoice: ChatCompletionsPayload = {
+      ...makePayload(),
+      tool_choice: { type: "function", function: { name: "web_search" } },
+    }
+
+    await webSearchInterceptor(payloadWithChoice)
+
+    expect(createSpy.mock.calls[1]?.[0]?.tool_choice).toEqual({
+      type: "function",
+      function: { name: "web_search" },
+    })
+  })
+})
