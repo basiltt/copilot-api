@@ -16,5 +16,4 @@ export class WebSearchError extends Error {
 
 // Backward-compat aliases
 export type BraveSearchResult = WebSearchResult
-export type BraveSearchError = WebSearchError
 export const BraveSearchError = WebSearchError

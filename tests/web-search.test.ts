@@ -233,7 +233,7 @@ describe("searchBrave — error handling", () => {
       threw = e
     }
     expect(threw).toBeInstanceOf(BraveSearchError)
-    expect((threw as BraveSearchError).reason).toContain("403")
+    expect((threw as InstanceType<typeof BraveSearchError>).reason).toContain("403")
   })
 
   test("throws BraveSearchError on network failure", async () => {

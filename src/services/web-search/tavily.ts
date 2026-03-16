@@ -19,8 +19,9 @@ export async function searchTavily(
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ api_key: apiKey, query, max_results: MAX_RESULTS }),
+      body: JSON.stringify({ query, max_results: MAX_RESULTS }),
       signal: controller.signal,
     })
 
@@ -38,8 +39,9 @@ export async function searchTavily(
       description: r.content ?? "",
     }))
   } catch (error) {
-    if (error instanceof WebSearchError) {
-      throw error
+    if (error instanceof WebSearchError) throw error
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new WebSearchError("request timed out")
     }
     const reason =
       error instanceof Error ? error.message : "unknown network error"
