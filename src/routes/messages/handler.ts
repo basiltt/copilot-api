@@ -36,6 +36,12 @@ import {
   stripWebSearchTypedTools,
 } from "./web-search-detection"
 
+// Interval at which SSE ping events are sent to keep the downstream
+// connection alive while waiting for Copilot to start responding.
+// Must be shorter than the network's TCP idle timeout (~5 min on enterprise
+// firewalls). 20 seconds gives comfortable headroom.
+const PING_INTERVAL_MS = 20_000
+
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
@@ -46,14 +52,29 @@ export async function handleCompletion(c: Context) {
     await awaitApproval()
   }
 
+  // For non-streaming requests just fetch and translate synchronously —
+  // no SSE connection needed, so no ping mechanism required.
+  if (!anthropicPayload.stream) {
+    return handleNonStreaming(c, anthropicPayload)
+  }
+
+  // For streaming requests open the SSE connection to the client first,
+  // then fetch from Copilot inside the stream callback. This lets us send
+  // periodic ping events while Copilot is thinking, preventing the
+  // downstream TCP connection from being killed by enterprise firewalls
+  // that drop idle connections after ~5 minutes.
+  return streamSSE(c, (stream) => handleStreaming(stream, anthropicPayload))
+}
+
+async function handleNonStreaming(
+  c: Context,
+  anthropicPayload: AnthropicMessagesPayload,
+) {
   let response: Awaited<ReturnType<typeof createChatCompletions>>
 
   try {
     response = await fetchCopilotResponse(anthropicPayload)
   } catch (error) {
-    // Re-throw HTTPErrors (bad status codes) so forwardError can relay them;
-    // for network errors (TimeoutError, ECONNRESET, etc.) return a structured
-    // Anthropic error response so the client gets a usable failure message.
     if (error instanceof HTTPError) throw error
     consola.error("Copilot connection error (fetch-level):", error)
     return c.json(
@@ -71,21 +92,86 @@ export async function handleCompletion(c: Context) {
     )
   }
 
-  if (isNonStreaming(response)) {
-    consola.debug(
-      "Non-streaming response from Copilot:",
-      JSON.stringify(response).slice(-400),
+  if (!isNonStreaming(response)) {
+    // Payload said non-streaming but Copilot returned a stream — treat as error.
+    consola.error("Expected non-streaming response but got stream")
+    return c.json(
+      {
+        type: "error",
+        error: { type: "api_error", message: "Unexpected streaming response." },
+      },
+      500,
     )
-    const anthropicResponse = translateToAnthropic(response)
-    consola.debug(
-      "Translated Anthropic response:",
-      JSON.stringify(anthropicResponse),
-    )
-    return c.json(anthropicResponse)
   }
 
-  consola.debug("Streaming response from Copilot")
-  return streamSSE(c, (stream) => pipeStreamToClient(stream, response))
+  consola.debug(
+    "Non-streaming response from Copilot:",
+    JSON.stringify(response).slice(-400),
+  )
+  const anthropicResponse = translateToAnthropic(response)
+  consola.debug(
+    "Translated Anthropic response:",
+    JSON.stringify(anthropicResponse),
+  )
+  return c.json(anthropicResponse)
+}
+
+async function handleStreaming(
+  stream: SSEStreamingApi,
+  anthropicPayload: AnthropicMessagesPayload,
+): Promise<void> {
+  // Start pinging every PING_INTERVAL_MS so the downstream TCP connection
+  // stays alive while we wait for Copilot to begin responding.
+  let pingTimer: ReturnType<typeof setInterval> | undefined = setInterval(
+    () => {
+      consola.debug("Sending SSE ping to keep connection alive")
+      stream
+        .writeSSE({ event: "ping", data: JSON.stringify({ type: "ping" }) })
+        .catch(() => {
+          // Client disconnected — clear the timer; the stream will close naturally.
+          clearInterval(pingTimer)
+          pingTimer = undefined
+        })
+    },
+    PING_INTERVAL_MS,
+  )
+
+  try {
+    const copilotResponse = await fetchCopilotResponse(anthropicPayload)
+    clearInterval(pingTimer)
+    pingTimer = undefined
+
+    if (isNonStreaming(copilotResponse)) {
+      // Shouldn't happen for a streaming payload, but handle gracefully.
+      consola.debug(
+        "Non-streaming response from Copilot:",
+        JSON.stringify(copilotResponse).slice(-400),
+      )
+      const anthropicResponse = translateToAnthropic(copilotResponse)
+      await stream.writeSSE({
+        event: "message_start",
+        data: JSON.stringify(anthropicResponse),
+      })
+      return
+    }
+
+    await pipeStreamToClient(stream, copilotResponse)
+  } catch (error) {
+    clearInterval(pingTimer)
+    pingTimer = undefined
+
+    if (error instanceof HTTPError) {
+      consola.error("Copilot HTTP error during streaming fetch:", error)
+    } else {
+      consola.error("Copilot connection error (fetch-level):", error)
+    }
+
+    const errorEvent = translateErrorToAnthropicErrorEvent()
+    await stream.writeSSE({
+      event: errorEvent.type,
+      data: JSON.stringify(errorEvent),
+    })
+  }
 }
 
 async function fetchCopilotResponse(
@@ -122,8 +208,22 @@ async function pipeStreamToClient(
     toolCalls: {},
   }
 
+  // Ping while waiting between chunks to keep the connection alive.
+  const schedulePing = () =>
+    setTimeout(() => {
+      consola.debug("Sending SSE ping between chunks")
+      stream
+        .writeSSE({ event: "ping", data: JSON.stringify({ type: "ping" }) })
+        .catch(() => {})
+    }, PING_INTERVAL_MS)
+
+  let chunkTimer: ReturnType<typeof setTimeout> | undefined = schedulePing()
+
   try {
     for await (const rawEvent of response) {
+      clearTimeout(chunkTimer)
+      chunkTimer = schedulePing()
+
       consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
       if (rawEvent.data === "[DONE]") break
       if (!rawEvent.data) continue
@@ -157,6 +257,8 @@ async function pipeStreamToClient(
       event: errorEvent.type,
       data: JSON.stringify(errorEvent),
     })
+  } finally {
+    clearTimeout(chunkTimer)
   }
 }
 
