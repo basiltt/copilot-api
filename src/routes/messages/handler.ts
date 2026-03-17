@@ -42,6 +42,21 @@ import {
 // firewalls). 20 seconds gives comfortable headroom.
 const PING_INTERVAL_MS = 20_000
 
+// Maximum number of times to retry a timed-out upstream fetch before giving up.
+// Each attempt gets a fresh TCP connection, resetting the firewall idle timer.
+// Retry is safe because we only retry before the first byte arrives — if Copilot
+// hasn't started generating yet, the request is idempotent.
+const MAX_FETCH_RETRIES = 3
+
+// Error name/code patterns that indicate a retriable network failure
+// (firewall idle timeout, connection reset) vs. a non-retriable one (4xx, auth).
+const RETRIABLE_ERROR_NAMES = new Set([
+  "TimeoutError",
+  "ECONNRESET",
+  "FailedToOpenSocket",
+  "ConnectionRefused",
+])
+
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
@@ -137,7 +152,29 @@ async function handleStreaming(
   )
 
   try {
-    const copilotResponse = await fetchCopilotResponse(anthropicPayload)
+    let copilotResponse:
+      | Awaited<ReturnType<typeof fetchCopilotResponse>>
+      | undefined
+    let lastError: unknown
+
+    for (let attempt = 1; attempt <= MAX_FETCH_RETRIES; attempt++) {
+      try {
+        copilotResponse = await fetchCopilotResponse(anthropicPayload)
+        break
+      } catch (error) {
+        lastError = error
+        if (error instanceof HTTPError) throw error
+        const isRetriable =
+          error instanceof Error && RETRIABLE_ERROR_NAMES.has(error.name)
+        if (!isRetriable || attempt === MAX_FETCH_RETRIES) throw error
+        consola.warn(
+          `Copilot fetch attempt ${attempt}/${MAX_FETCH_RETRIES} failed (${error.message}), retrying…`,
+        )
+      }
+    }
+
+    if (!copilotResponse) throw lastError
+
     clearInterval(pingTimer)
     pingTimer = undefined
 
