@@ -54,15 +54,15 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     state.tavilyApiKey = tavilyApiKey
     consola.info("Web search enabled (Tavily)")
     consola.info(
-      "Note: each web search request uses 2-3 internal Copilot API calls " +
-        "(not counted against the rate limit).",
+      "Note: each web search request uses 2-3 internal Copilot API calls "
+        + "(not counted against the rate limit).",
     )
   } else if (braveApiKey) {
     state.braveApiKey = braveApiKey
     consola.info("Web search enabled (Brave)")
     consola.info(
-      "Note: each web search request uses 2-3 internal Copilot API calls " +
-        "(not counted against the rate limit).",
+      "Note: each web search request uses 2-3 internal Copilot API calls "
+        + "(not counted against the rate limit).",
     )
   }
 
@@ -136,6 +136,9 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   serve({
     fetch: server.fetch as ServerHandler,
     port: options.port,
+    // Copilot responses can take several minutes for long generations;
+    // disable Bun's default 10-second idle timeout to prevent premature 500s.
+    // srvx forwards the `bun` object directly to Bun.serve as extra options.
     bun: { idleTimeout: 0 },
   })
 }

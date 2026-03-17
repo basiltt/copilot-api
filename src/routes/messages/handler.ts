@@ -1,24 +1,23 @@
+import type { ServerSentEventMessage } from "fetch-event-stream"
 import type { Context } from "hono"
+import type { SSEStreamingApi } from "hono/streaming"
 
 import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
-import { selectModelForTokenCount } from "~/lib/model-selector"
+import { HTTPError } from "~/lib/error"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
-import { getTokenCount } from "~/lib/tokenizer"
 import {
   createChatCompletions,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
-  type ChatCompletionsPayload,
 } from "~/services/copilot/create-chat-completions"
 import {
   prepareWebSearchPayload,
   webSearchInterceptor,
 } from "~/services/web-search/interceptor"
-import { appendWebSearchInstruction } from "~/services/web-search/system-prompt"
 
 import {
   type AnthropicMessagesPayload,
@@ -28,26 +27,14 @@ import {
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
-import { translateChunkToAnthropicEvents } from "./stream-translation"
-
-async function applyModelSwitch(
-  payload: ChatCompletionsPayload,
-): Promise<ChatCompletionsPayload> {
-  if (!state.models) return payload
-  try {
-    const modelForCount = state.models.data.find((m) => m.id === payload.model)
-    if (!modelForCount) return payload
-    const { input: estimatedTokens } = await getTokenCount(payload, modelForCount)
-    const result = selectModelForTokenCount(payload.model, state.models, estimatedTokens)
-    if (result.switched) {
-      consola.warn(`Context overflow: ${result.reason}`)
-      return { ...payload, model: result.model }
-    }
-  } catch {
-    consola.debug("Token count estimation failed, skipping model switch")
-  }
-  return payload
-}
+import {
+  translateChunkToAnthropicEvents,
+  translateErrorToAnthropicErrorEvent,
+} from "./stream-translation"
+import {
+  detectWebSearchIntent,
+  stripWebSearchTypedTools,
+} from "./web-search-detection"
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
@@ -61,24 +48,27 @@ export async function handleCompletion(c: Context) {
 
   let response: Awaited<ReturnType<typeof createChatCompletions>>
 
-  if (isWebSearchEnabled()) {
-    const augmentedPayload: AnthropicMessagesPayload = {
-      ...anthropicPayload,
-      system: appendWebSearchInstruction(anthropicPayload.system),
-    }
-    const openAIPayload = await applyModelSwitch(prepareWebSearchPayload(translateToOpenAI(augmentedPayload)))
-    consola.debug(
-      "Translated OpenAI request payload (web search):",
-      JSON.stringify(openAIPayload),
+  try {
+    response = await fetchCopilotResponse(anthropicPayload)
+  } catch (error) {
+    // Re-throw HTTPErrors (bad status codes) so forwardError can relay them;
+    // for network errors (TimeoutError, ECONNRESET, etc.) return a structured
+    // Anthropic error response so the client gets a usable failure message.
+    if (error instanceof HTTPError) throw error
+    consola.error("Copilot connection error (fetch-level):", error)
+    return c.json(
+      {
+        type: "error",
+        error: {
+          type: "api_error",
+          message:
+            error instanceof Error ?
+              error.message
+            : "An unexpected error occurred.",
+        },
+      },
+      500,
     )
-    response = await webSearchInterceptor(openAIPayload)
-  } else {
-    const openAIPayload = await applyModelSwitch(translateToOpenAI(anthropicPayload))
-    consola.debug(
-      "Translated OpenAI request payload:",
-      JSON.stringify(openAIPayload),
-    )
-    response = await createChatCompletions(openAIPayload)
   }
 
   if (isNonStreaming(response)) {
@@ -95,23 +85,48 @@ export async function handleCompletion(c: Context) {
   }
 
   consola.debug("Streaming response from Copilot")
-  return streamSSE(c, async (stream) => {
-    const streamState: AnthropicStreamState = {
-      messageStartSent: false,
-      contentBlockIndex: 0,
-      contentBlockOpen: false,
-      toolCalls: {},
-    }
+  return streamSSE(c, (stream) => pipeStreamToClient(stream, response))
+}
 
+async function fetchCopilotResponse(
+  anthropicPayload: AnthropicMessagesPayload,
+): ReturnType<typeof createChatCompletions> {
+  if (isWebSearchEnabled() && (await detectWebSearchIntent(anthropicPayload))) {
+    const cleanedPayload = stripWebSearchTypedTools(anthropicPayload)
+    const openAIPayload = prepareWebSearchPayload(
+      translateToOpenAI(cleanedPayload),
+    )
+    consola.debug(
+      "Translated OpenAI request payload (web search):",
+      JSON.stringify(openAIPayload),
+    )
+    return webSearchInterceptor(openAIPayload)
+  }
+
+  const openAIPayload = translateToOpenAI(anthropicPayload)
+  consola.debug(
+    "Translated OpenAI request payload:",
+    JSON.stringify(openAIPayload),
+  )
+  return createChatCompletions(openAIPayload)
+}
+
+async function pipeStreamToClient(
+  stream: SSEStreamingApi,
+  response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
+): Promise<void> {
+  const streamState: AnthropicStreamState = {
+    messageStartSent: false,
+    contentBlockIndex: 0,
+    contentBlockOpen: false,
+    toolCalls: {},
+  }
+
+  try {
     for await (const rawEvent of response) {
       consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
-      if (rawEvent.data === "[DONE]") {
-        break
-      }
-
-      if (!rawEvent.data) {
-        continue
-      }
+      if (rawEvent.data === "[DONE]") break
+      if (!rawEvent.data) continue
 
       const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
       const events = translateChunkToAnthropicEvents(chunk, streamState)
@@ -124,7 +139,25 @@ export async function handleCompletion(c: Context) {
         })
       }
     }
-  })
+  } catch (error) {
+    consola.error("Stream error from Copilot:", error)
+
+    if (streamState.contentBlockOpen) {
+      await stream.writeSSE({
+        event: "content_block_stop",
+        data: JSON.stringify({
+          type: "content_block_stop",
+          index: streamState.contentBlockIndex,
+        }),
+      })
+    }
+
+    const errorEvent = translateErrorToAnthropicErrorEvent()
+    await stream.writeSSE({
+      event: errorEvent.type,
+      data: JSON.stringify(errorEvent),
+    })
+  }
 }
 
 const isNonStreaming = (
