@@ -31,6 +31,7 @@ export const createChatCompletions = async (
     method: "POST",
     headers,
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(10 * 60 * 1000), // 10 minutes — prevents Bun's ~4 min default from cutting long responses
   })
 
   if (!response.ok) {
