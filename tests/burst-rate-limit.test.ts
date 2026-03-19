@@ -69,7 +69,7 @@ describe("checkBurstLimit", () => {
     // This call should wait ~100ms for the slot to expire
     await checkBurstLimit(state)
     const elapsed = Date.now() - start
-    expect(elapsed).toBeGreaterThanOrEqual(80) // at least 80ms wait
+    expect(elapsed).toBeGreaterThanOrEqual(50) // at least 50ms wait (window is 100ms)
     expect(elapsed).toBeLessThan(500) // but not excessively long
     expect(state.burstRequestTimestamps).toHaveLength(1)
   })

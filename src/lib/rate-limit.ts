@@ -45,7 +45,7 @@ export async function checkRateLimit(state: State) {
   return
 }
 
-export async function checkBurstLimit(state: State): Promise<void> {
+export async function checkBurstLimit(state: State) {
   if (state.burstCount === undefined || state.burstWindowSeconds === undefined)
     return
 
@@ -66,7 +66,11 @@ export async function checkBurstLimit(state: State): Promise<void> {
     }
 
     // Window is full — wait until the oldest slot expires.
-    const waitMs = Math.max(0, state.burstRequestTimestamps[0] + windowMs - now)
+    // state.burstRequestTimestamps[0] is always defined here because the length
+    // check above guarantees at least burstCount (≥1) entries — but we guard
+    // defensively to make the invariant explicit.
+    const oldest = state.burstRequestTimestamps[0] ?? now
+    const waitMs = Math.max(0, oldest + windowMs - now)
     // Use ms for short waits, seconds for long ones — avoids misleading "1s" for a 100ms wait.
     const waitLabel =
       waitMs < 1000 ? `${waitMs}ms` : `${(waitMs / 1000).toFixed(1)}s`
