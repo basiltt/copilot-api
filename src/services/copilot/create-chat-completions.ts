@@ -31,7 +31,12 @@ export const createChatCompletions = async (
     method: "POST",
     headers,
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(10 * 60 * 1000), // 10 minutes — prevents Bun's ~4 min default from cutting long responses
+    signal: AbortSignal.timeout(10 * 60 * 1000),
+    // Bun's internal fetch timer defaults to ~4 minutes and fires mid-stream
+    // when Copilot pauses between chunks on large (6000+ line) file edits.
+    // Setting timeout:false disables it; AbortSignal above is the safety net.
+    // @ts-expect-error — Bun-specific option, not in the standard fetch types
+    timeout: false,
   })
 
   if (!response.ok) {

@@ -54,3 +54,13 @@ test("sets X-Initiator to user if only user present", async () => {
   ).headers
   expect(headers["X-Initiator"]).toBe("user")
 })
+
+test("disables Bun internal body-read timeout to prevent mid-stream timeouts on large files", async () => {
+  const payload: ChatCompletionsPayload = {
+    messages: [{ role: "user", content: "hi" }],
+    model: "gpt-test",
+  }
+  await createChatCompletions(payload)
+  const fetchOpts = fetchMock.mock.calls[2][1] as Record<string, unknown>
+  expect(fetchOpts.timeout).toBe(false)
+})
