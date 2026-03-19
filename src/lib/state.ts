@@ -16,6 +16,11 @@ export interface State {
   rateLimitSeconds?: number
   lastRequestTimestamp?: number
 
+  // Burst rate limiting configuration
+  burstCount?: number
+  burstWindowSeconds?: number
+  burstRequestTimestamps: Array<number>
+
   // Web search configuration
   braveApiKey?: string
   tavilyApiKey?: string
@@ -26,6 +31,7 @@ export const state: State = {
   manualApprove: false,
   rateLimitWait: false,
   showToken: false,
+  burstRequestTimestamps: [],
 }
 
 export function isWebSearchEnabled(): boolean {
