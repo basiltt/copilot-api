@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a sliding-window burst rate limiter that allows at most N requests within X seconds, queuing excess requests until a slot opens, leaving the existing per-request gap limiter (`--rate-limit`) untouched.
+**Goal:** Add a sliding-window burst rate limiter that allows at most N requests within X seconds, throttling excess requests until a slot opens, leaving the existing per-request gap limiter (`--rate-limit`) untouched.
 
-**Architecture:** A new `checkBurstLimit(state)` function in `src/lib/rate-limit.ts` tracks request timestamps in `state.burstRequestTimestamps`; it prunes expired entries on every call and sleeps until a slot opens if the window is full. Two new CLI flags (`--burst-count`, `--burst-window`) configure it, both required together. The function is wired into the chat-completions and messages handlers before the existing rate limit check.
+**Architecture:** A new `checkBurstLimit(state)` function in `src/lib/rate-limit.ts` tracks request timestamps in `state.burstRequestTimestamps` (process-wide, shared across all clients of this proxy — appropriate since a single GitHub Copilot token is shared). It prunes expired entries on every call and sleeps until a slot opens if the window is full (retry loop, not FIFO queue — ordering under concurrent load is not guaranteed). Two new CLI flags (`--burst-count`, `--burst-window`) configure it, both required together. The gap limiter (`checkRateLimit`) runs first so its sleep delay happens before the burst timestamp is recorded, keeping timestamps close to actual outbound dispatch time.
 
 **Tech Stack:** Bun runtime, TypeScript, `bun:test` for tests, `consola` for logging, `citty` for CLI arg parsing.
 
@@ -179,9 +179,11 @@
         0,
         state.burstRequestTimestamps[0] + windowMs - now,
       )
-      const waitSeconds = Math.ceil(waitMs / 1000)
+      // Use ms for short waits, seconds for long ones — avoids misleading "1s" for a 100ms wait.
+      const waitLabel =
+        waitMs < 1000 ? `${waitMs}ms` : `${(waitMs / 1000).toFixed(1)}s`
       consola.warn(
-        `Burst limit reached. Waiting ${waitSeconds}s before proceeding...`,
+        `Burst limit reached. Waiting ${waitLabel} before proceeding...`,
       )
       await sleep(waitMs)
       consola.debug("Burst limit wait completed, re-checking...")
@@ -196,7 +198,7 @@
   bun test tests/burst-rate-limit.test.ts
   ```
 
-  Expected: all 5 tests pass.
+  Expected: all 6 tests pass.
 
 - [ ] **Step 5: Run full test suite to check for regressions**
 
@@ -296,9 +298,10 @@
     burstWindowSeconds = parsedWindow
   } else if (rawBurstCount !== undefined || rawBurstWindow !== undefined) {
     const missing = rawBurstCount === undefined ? "--burst-count" : "--burst-window"
-    consola.warn(
-      `Burst limiting disabled: --burst-count and --burst-window must both be provided (missing: ${missing})`,
+    consola.error(
+      `--burst-count and --burst-window must both be provided (missing: ${missing})`,
     )
+    process.exit(1)
   }
   ```
 
@@ -351,11 +354,11 @@
   import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
   ```
 
-  Then find the line `await checkRateLimit(state)` in `handleCompletion` and add the burst check immediately before it:
+  Then find the line `await checkRateLimit(state)` in `handleCompletion` and add the burst check immediately **after** it (gap limiter runs first so its sleep occurs before the burst timestamp is recorded):
 
   ```typescript
-  await checkBurstLimit(state)
   await checkRateLimit(state)
+  await checkBurstLimit(state)
   ```
 
 - [ ] **Step 2: Update the messages handler**
@@ -372,14 +375,14 @@
   import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
   ```
 
-  Then find `await checkRateLimit(state)` inside `handleCompletion` (it is on the **second line** of that function, around line 61). Add the burst check immediately before it:
+  Then find `await checkRateLimit(state)` inside `handleCompletion` (it is on the **second line** of that function, around line 61). Add the burst check immediately **after** it (gap limiter runs first):
 
   ```typescript
-  await checkBurstLimit(state)
   await checkRateLimit(state)
+  await checkBurstLimit(state)
   ```
 
-  Note: `handleCompletion` in this file is more complex than the chat-completions version — it immediately delegates to `handleNonStreaming` or `streamSSE`. The burst check goes at the top before any of that delegation, the same as in the chat-completions handler.
+  Note: `handleCompletion` in this file is more complex than the chat-completions version — it immediately delegates to `handleNonStreaming` or `streamSSE`. Both limiters run at the top before any of that delegation.
 
 - [ ] **Step 3: Run typecheck**
 
