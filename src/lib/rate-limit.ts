@@ -44,3 +44,37 @@ export async function checkRateLimit(state: State) {
   consola.info("Rate limit wait completed, proceeding with request")
   return
 }
+
+export async function checkBurstLimit(state: State): Promise<void> {
+  if (state.burstCount === undefined || state.burstWindowSeconds === undefined)
+    return
+
+  const windowMs = state.burstWindowSeconds * 1000
+
+  while (true) {
+    const now = Date.now()
+
+    state.burstRequestTimestamps = state.burstRequestTimestamps.filter(
+      (ts) => ts > now - windowMs,
+    )
+
+    if (state.burstRequestTimestamps.length < state.burstCount) {
+      // Slot is free — record this request synchronously (no await between
+      // the length check and push, preventing interleaving in async handlers).
+      state.burstRequestTimestamps.push(now)
+      return
+    }
+
+    // Window is full — wait until the oldest slot expires.
+    const waitMs = Math.max(0, state.burstRequestTimestamps[0] + windowMs - now)
+    // Use ms for short waits, seconds for long ones — avoids misleading "1s" for a 100ms wait.
+    const waitLabel =
+      waitMs < 1000 ? `${waitMs}ms` : `${(waitMs / 1000).toFixed(1)}s`
+    consola.warn(
+      `Burst limit reached. Waiting ${waitLabel} before proceeding...`,
+    )
+    await sleep(waitMs)
+    consola.debug("Burst limit wait completed, re-checking...")
+    // Loop back with a fresh Date.now() — do not push unconditionally.
+  }
+}
