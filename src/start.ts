@@ -21,6 +21,8 @@ interface RunServerOptions {
   manual: boolean
   rateLimit?: number
   rateLimitWait: boolean
+  burstCount?: number
+  burstWindowSeconds?: number
   githubToken?: string
   claudeCode: boolean
   showToken: boolean
@@ -45,6 +47,8 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.manualApprove = options.manual
   state.rateLimitSeconds = options.rateLimit
   state.rateLimitWait = options.rateLimitWait
+  state.burstCount = options.burstCount
+  state.burstWindowSeconds = options.burstWindowSeconds
   state.showToken = options.showToken
 
   const tavilyApiKey = process.env.TAVILY_API_KEY
@@ -184,6 +188,16 @@ export const start = defineCommand({
       description:
         "Wait instead of error when rate limit is hit. Has no effect if rate limit is not set",
     },
+    "burst-count": {
+      type: "string",
+      description:
+        "Max requests allowed within the burst window (positive integer). Must be used with --burst-window.",
+    },
+    "burst-window": {
+      type: "string",
+      description:
+        "Burst window duration in seconds (positive number). Must be used with --burst-count.",
+    },
     "github-token": {
       alias: "g",
       type: "string",
@@ -214,6 +228,43 @@ export const start = defineCommand({
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       rateLimitRaw === undefined ? undefined : Number.parseInt(rateLimitRaw, 10)
 
+    const rawBurstCount = args["burst-count"]
+    const rawBurstWindow = args["burst-window"]
+
+    let burstCount: number | undefined
+    let burstWindowSeconds: number | undefined
+
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if (rawBurstCount !== undefined && rawBurstWindow !== undefined) {
+      const parsedCount = Number(rawBurstCount)
+      if (!Number.isInteger(parsedCount) || parsedCount < 1) {
+        consola.error(
+          `--burst-count must be a positive integer (got: ${rawBurstCount})`,
+        )
+        process.exit(1)
+      }
+
+      const parsedWindow = Number(rawBurstWindow)
+      if (!(parsedWindow > 0)) {
+        consola.error(
+          `--burst-window must be a positive number greater than 0 (got: ${rawBurstWindow})`,
+        )
+        process.exit(1)
+      }
+
+      burstCount = parsedCount
+      burstWindowSeconds = parsedWindow
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    } else if (rawBurstCount !== undefined || rawBurstWindow !== undefined) {
+      const missing =
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+        rawBurstCount === undefined ? "--burst-count" : "--burst-window"
+      consola.error(
+        `--burst-count and --burst-window must both be provided (missing: ${missing})`,
+      )
+      process.exit(1)
+    }
+
     return runServer({
       port: Number.parseInt(args.port, 10),
       verbose: args.verbose,
@@ -225,6 +276,8 @@ export const start = defineCommand({
       claudeCode: args["claude-code"],
       showToken: args["show-token"],
       proxyEnv: args["proxy-env"],
+      burstCount,
+      burstWindowSeconds,
     })
   },
 })
