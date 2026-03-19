@@ -7,7 +7,7 @@ import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { HTTPError } from "~/lib/error"
-import { checkRateLimit } from "~/lib/rate-limit"
+import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
 import {
   createChatCompletions,
@@ -59,6 +59,7 @@ const RETRIABLE_ERROR_NAMES = new Set([
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
+  await checkBurstLimit(state)
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))

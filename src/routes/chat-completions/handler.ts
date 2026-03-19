@@ -5,7 +5,7 @@ import { streamSSE, type SSEMessage } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { selectModelForTokenCount } from "~/lib/model-selector"
-import { checkRateLimit } from "~/lib/rate-limit"
+import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 import { isNullish } from "~/lib/utils"
@@ -17,6 +17,7 @@ import {
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
+  await checkBurstLimit(state)
 
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
@@ -32,12 +33,20 @@ export async function handleCompletion(c: Context) {
       consola.info("Current token count:", tokenCount)
       // Context-overflow guard: auto-switch to largest-context model if needed
       // state.models is non-null here — selectedModel was found from it
-      const result = selectModelForTokenCount(payload.model, state.models!, tokenCount.input)
-      if (result.switched) {
-        consola.warn(`Context overflow: ${result.reason}`)
-        payload = { ...payload, model: result.model }
-        // Update selectedModel so max_tokens defaulting below uses the switched model
-        selectedModel = state.models!.data.find((m) => m.id === result.model) ?? selectedModel
+      if (state.models) {
+        const result = selectModelForTokenCount(
+          payload.model,
+          state.models,
+          tokenCount.input,
+        )
+        if (result.switched) {
+          consola.warn(`Context overflow: ${result.reason}`)
+          payload = { ...payload, model: result.model }
+          // Update selectedModel so max_tokens defaulting below uses the switched model
+          selectedModel =
+            state.models.data.find((m) => m.id === result.model)
+            ?? selectedModel
+        }
       }
     } else {
       consola.warn("No model selected, skipping token count calculation")
