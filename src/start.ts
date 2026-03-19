@@ -245,7 +245,7 @@ export const start = defineCommand({
       }
 
       const parsedWindow = Number(rawBurstWindow)
-      if (!(parsedWindow > 0)) {
+      if (!(parsedWindow > 0) || !Number.isFinite(parsedWindow)) {
         consola.error(
           `--burst-window must be a positive number greater than 0 (got: ${rawBurstWindow})`,
         )
