@@ -42,7 +42,10 @@ export async function webSearchInterceptor(
 ): ReturnType<typeof createChatCompletions> {
   // First pass: always non-streaming so we can inspect finish_reason
   const firstPassPayload: ChatCompletionsPayload = { ...payload, stream: false }
-  consola.debug("Web search first-pass payload:", JSON.stringify(firstPassPayload))
+  consola.debug(
+    "Web search first-pass payload:",
+    JSON.stringify(firstPassPayload),
+  )
 
   const firstResponse = (await createChatCompletions(
     firstPassPayload,
@@ -53,11 +56,17 @@ export async function webSearchInterceptor(
   )
 
   const choice = firstResponse.choices.at(0)
-  if (!choice || choice.finish_reason !== "tool_calls" || !choice.message.tool_calls) {
+  if (
+    !choice
+    || choice.finish_reason !== "tool_calls"
+    || !choice.message.tool_calls
+  ) {
     if (payload.stream) {
       const streamPayload: ChatCompletionsPayload = {
         ...payload,
-        tools: payload.tools?.filter((t) => t.function.name !== WEB_SEARCH_TOOL_NAME),
+        tools: payload.tools?.filter(
+          (t) => t.function.name !== WEB_SEARCH_TOOL_NAME,
+        ),
       }
       return createChatCompletions(streamPayload)
     }
@@ -71,7 +80,9 @@ export async function webSearchInterceptor(
     if (payload.stream) {
       const streamPayload: ChatCompletionsPayload = {
         ...payload,
-        tools: payload.tools?.filter((t) => t.function.name !== WEB_SEARCH_TOOL_NAME),
+        tools: payload.tools?.filter(
+          (t) => t.function.name !== WEB_SEARCH_TOOL_NAME,
+        ),
       }
       return createChatCompletions(streamPayload)
     }
@@ -82,13 +93,16 @@ export async function webSearchInterceptor(
   // every branch before buildSecondPass is called.
   let toolResultContent: string
   try {
-    const args = JSON.parse(webSearchCall.function.arguments) as { query: string }
+    const args = JSON.parse(webSearchCall.function.arguments) as {
+      query: string
+    }
     const query = args.query
 
     try {
       toolResultContent = await executeWebSearch(query)
     } catch (error: unknown) {
-      const reason = error instanceof WebSearchError ? error.reason : String(error)
+      const reason =
+        error instanceof WebSearchError ? error.reason : String(error)
       consola.warn(`Web search failed: ${reason}`)
       toolResultContent = `Web search failed: ${reason}\nPlease answer based on your training data and let the user know that web search is currently unavailable.`
     }
@@ -98,7 +112,12 @@ export async function webSearchInterceptor(
       "Web search failed: could not parse search query.\nPlease answer based on your training data and let the user know that web search is currently unavailable."
   }
 
-  return buildSecondPass({ payload, choice, webSearchCallId: webSearchCall.id, toolResultContent })
+  return buildSecondPass({
+    payload,
+    choice,
+    webSearchCallId: webSearchCall.id,
+    toolResultContent,
+  })
 }
 
 /**
@@ -149,7 +168,9 @@ function buildSecondPass({
   // Inject a tool result for every tool_call in the assistant message.
   // Non-search tool calls get an empty stub so Copilot's second pass has
   // a complete result set (required — partial results cause rejection).
-  const toolResultMessages: Array<Message> = (choice.message.tool_calls ?? []).map((tc) => ({
+  const toolResultMessages: Array<Message> = (
+    choice.message.tool_calls ?? []
+  ).map((tc) => ({
     role: "tool",
     tool_call_id: tc.id,
     content: tc.id === webSearchCallId ? toolResultContent : "",
@@ -171,12 +192,18 @@ function buildSecondPass({
     messages: secondPassMessages,
     tool_choice: "none",
   }
-  consola.debug("Web search second-pass payload:", JSON.stringify(secondPassPayload))
+  consola.debug(
+    "Web search second-pass payload:",
+    JSON.stringify(secondPassPayload),
+  )
 
   return createChatCompletions(secondPassPayload)
 }
 
-function formatSearchResults(query: string, results: Array<WebSearchResult>): string {
+function formatSearchResults(
+  query: string,
+  results: Array<WebSearchResult>,
+): string {
   if (results.length === 0) {
     return `No results found for: "${query}"`
   }

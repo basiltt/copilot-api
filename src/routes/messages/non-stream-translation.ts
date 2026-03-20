@@ -93,7 +93,8 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
 
   if (Array.isArray(message.content)) {
     const toolResultBlocks = message.content.filter(
-      (block): block is AnthropicToolResultBlock => block.type === "tool_result",
+      (block): block is AnthropicToolResultBlock =>
+        block.type === "tool_result",
     )
     const webSearchResultBlocks = message.content.filter(
       (block): block is AnthropicWebSearchToolResultBlock =>
@@ -101,8 +102,7 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
     )
     const otherBlocks = message.content.filter(
       (block) =>
-        block.type !== "tool_result" &&
-        block.type !== "web_search_tool_result",
+        block.type !== "tool_result" && block.type !== "web_search_tool_result",
       // document blocks remain here intentionally — mapContent handles them
     )
 
@@ -179,7 +179,9 @@ function handleAssistantMessage(
   const allTextContent = [
     ...textBlocks.map((b) => b.text),
     ...thinkingBlocks.map((b) => b.thinking),
-    ...serverToolUseBlocks.map((b) => `[Server tool use: ${JSON.stringify(b)}]`),
+    ...serverToolUseBlocks.map(
+      (b) => `[Server tool use: ${JSON.stringify(b)}]`,
+    ),
   ]
     .filter(Boolean) // strip empty strings to avoid spurious \n\n
     .join("\n\n")
@@ -216,7 +218,11 @@ function mapToolResultContent(
   }
   // Safe cast: AnthropicToolResultBlock content array is Array<TextBlock|ImageBlock|DocumentBlock>,
   // all of which are members of AnthropicUserContentBlock — mapContent handles them correctly.
-  return mapContent(content as Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>)
+  return mapContent(
+    content as Array<
+      AnthropicUserContentBlock | AnthropicAssistantContentBlock
+    >,
+  )
 }
 
 function mapContent(
@@ -431,6 +437,15 @@ function getAnthropicToolUseBlocks(
     type: "tool_use",
     id: toolCall.id,
     name: toolCall.function.name,
-    input: JSON.parse(toolCall.function.arguments) as Record<string, unknown>,
+    input: safeParseJson(toolCall.function.arguments),
   }))
+}
+
+function safeParseJson(json: string): Record<string, unknown> {
+  if (!json) return {}
+  try {
+    return JSON.parse(json) as Record<string, unknown>
+  } catch {
+    return {}
+  }
 }

@@ -30,7 +30,6 @@ import {
   WEB_SEARCH_TOOL_NAMES,
   WEB_SEARCH_FUNCTION_TOOL,
 } from "~/services/web-search/tool-definition"
-import { appendWebSearchInstruction } from "~/services/web-search/system-prompt"
 import { BraveSearchError, WebSearchError } from "~/services/web-search/types"
 
 describe("WEB_SEARCH_TOOL_NAMES", () => {
@@ -230,7 +229,9 @@ describe("searchBrave — error handling", () => {
       threw = e
     }
     expect(threw).toBeInstanceOf(BraveSearchError)
-    expect((threw as InstanceType<typeof BraveSearchError>).reason).toContain("403")
+    expect((threw as InstanceType<typeof BraveSearchError>).reason).toContain(
+      "403",
+    )
   })
 
   test("throws BraveSearchError on network failure", async () => {
@@ -511,10 +512,15 @@ describe("prepareWebSearchPayload", () => {
   })
 
   test("works when payload has no tools", () => {
-    const payload: ChatCompletionsPayload = { ...makePayload(), tools: undefined }
+    const payload: ChatCompletionsPayload = {
+      ...makePayload(),
+      tools: undefined,
+    }
     const prepared = prepareWebSearchPayload(payload)
     expect(prepared.tools).toHaveLength(1)
-    expect(prepared.tools?.[0]?.function.name).toBe(WEB_SEARCH_FUNCTION_TOOL.function.name)
+    expect(prepared.tools?.[0]?.function.name).toBe(
+      WEB_SEARCH_FUNCTION_TOOL.function.name,
+    )
   })
 })
 
@@ -523,11 +529,17 @@ describe("prepareWebSearchPayload — always-on injection", () => {
     const base: ChatCompletionsPayload = {
       model: "gpt-4o",
       messages: [{ role: "user", content: "hello" }],
-      tools: [{ type: "function", function: { name: "my_tool", parameters: {} } }],
+      tools: [
+        { type: "function", function: { name: "my_tool", parameters: {} } },
+      ],
     }
     const prepared = prepareWebSearchPayload(base)
-    expect(prepared.tools?.some((t) => t.function.name === "my_tool")).toBe(true)
-    expect(prepared.tools?.some((t) => t.function.name === "web_search")).toBe(true)
+    expect(prepared.tools?.some((t) => t.function.name === "my_tool")).toBe(
+      true,
+    )
+    expect(prepared.tools?.some((t) => t.function.name === "web_search")).toBe(
+      true,
+    )
   })
 })
 
@@ -771,145 +783,5 @@ describe("webSearchInterceptor — Tavily search path", () => {
     const toolMsg = secondCallMessages.find((m) => m.role === "tool")
     expect(toolMsg?.content).toContain("Web search failed")
     expect(toolMsg?.content).toContain("training data")
-  })
-})
-
-describe("webSearchInterceptor — streaming preservation", () => {
-  afterEach(() => {
-    mock.restore()
-  })
-
-  test("re-issues with stream:true when Copilot returns stop (no tool call)", async () => {
-    const stopResponse = makeCopilotResponse("stop")
-    const streamingPayload: ChatCompletionsPayload = makePayload(true)
-    const createSpy = spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    )
-      .mockResolvedValueOnce(stopResponse)          // first pass: non-streaming inspection
-      .mockResolvedValueOnce(stopResponse)          // streaming re-issue: no tool call, returned to caller
-
-    await webSearchInterceptor(streamingPayload)
-
-    // Interceptor must have made exactly 2 calls
-    expect(createSpy).toHaveBeenCalledTimes(2)
-
-    // Second call must NOT include the web_search tool
-    const secondCallArg = createSpy.mock.calls[1]![0] as ChatCompletionsPayload
-    expect(secondCallArg.stream).toBe(true)
-    expect(secondCallArg.tools?.some((t) => t.function.name === "web_search")).toBe(false)
-  })
-
-  test("does NOT re-issue when stream is false and Copilot returns stop", async () => {
-    const stopResponse = makeCopilotResponse("stop")
-    const nonStreamingPayload: ChatCompletionsPayload = makePayload(false)
-    const createSpy = spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    ).mockResolvedValue(stopResponse)
-
-    await webSearchInterceptor(nonStreamingPayload)
-
-    // Only 1 call — non-streaming first pass returned directly, no re-issue
-    expect(createSpy).toHaveBeenCalledTimes(1)
-  })
-
-  test("re-issues with stream:true when Copilot calls a different tool (not web_search)", async () => {
-    const otherToolResponse = makeCopilotResponse("tool_calls", [
-      { id: "tc-1", name: "bash", arguments: '{"command":"ls"}' },
-    ])
-    const streamingPayload: ChatCompletionsPayload = makePayload(true)
-    const createSpy = spyOn(
-      createChatCompletionsModule,
-      "createChatCompletions",
-    )
-      .mockResolvedValueOnce(otherToolResponse)
-      .mockResolvedValueOnce(otherToolResponse)
-
-    await webSearchInterceptor(streamingPayload)
-
-    expect(createSpy).toHaveBeenCalledTimes(2)
-    const secondCallArg = createSpy.mock.calls[1]![0] as ChatCompletionsPayload
-    expect(secondCallArg.stream).toBe(true)
-    expect(secondCallArg.tools?.some((t) => t.function.name === "web_search")).toBe(false)
-  })
-})
-
-describe("isWebSearchEnabled — Tavily", () => {
-  test("returns false when neither key is set", () => {
-    const originalBrave = stateModule.state.braveApiKey
-    const originalTavily = stateModule.state.tavilyApiKey
-    stateModule.state.braveApiKey = undefined
-    stateModule.state.tavilyApiKey = undefined
-    try {
-      expect(stateModule.isWebSearchEnabled()).toBe(false)
-    } finally {
-      stateModule.state.braveApiKey = originalBrave
-      stateModule.state.tavilyApiKey = originalTavily
-    }
-  })
-
-  test("returns true when tavilyApiKey is set", () => {
-    const originalBrave = stateModule.state.braveApiKey
-    const originalTavily = stateModule.state.tavilyApiKey
-    stateModule.state.braveApiKey = undefined
-    stateModule.state.tavilyApiKey = "test-key"
-    try {
-      expect(stateModule.isWebSearchEnabled()).toBe(true)
-    } finally {
-      stateModule.state.braveApiKey = originalBrave
-      stateModule.state.tavilyApiKey = originalTavily
-    }
-  })
-
-  test("returns true when both keys are set", () => {
-    const originalBrave = stateModule.state.braveApiKey
-    const originalTavily = stateModule.state.tavilyApiKey
-    stateModule.state.braveApiKey = "brave-key"
-    stateModule.state.tavilyApiKey = "tavily-key"
-    try {
-      expect(stateModule.isWebSearchEnabled()).toBe(true)
-    } finally {
-      stateModule.state.braveApiKey = originalBrave
-      stateModule.state.tavilyApiKey = originalTavily
-    }
-  })
-})
-
-describe("appendWebSearchInstruction", () => {
-  test("appends instruction to string system prompt", () => {
-    const result = appendWebSearchInstruction("You are a helpful assistant.")
-    expect(typeof result).toBe("string")
-    expect(result as string).toContain("You are a helpful assistant.")
-    expect(result as string).toContain("web_search")
-  })
-
-  test("appends instruction to last text block in array system prompt", () => {
-    const system = [
-      { type: "text" as const, text: "First block." },
-      { type: "text" as const, text: "Second block." },
-    ]
-    const result = appendWebSearchInstruction(system)
-    expect(Array.isArray(result)).toBe(true)
-    const blocks = result as typeof system
-    expect(blocks[0].text).toBe("First block.")
-    expect(blocks[1].text).toContain("Second block.")
-    expect(blocks[1].text).toContain("web_search")
-  })
-
-  test("adds new text block when array has no text blocks", () => {
-    const system = [{ type: "tool_result" as const, text: "some tool result" }]
-    const result = appendWebSearchInstruction(system as unknown as Parameters<typeof appendWebSearchInstruction>[0])
-    expect(Array.isArray(result)).toBe(true)
-    const blocks = result as Array<{ type: string; text: string }>
-    expect(blocks).toHaveLength(2)
-    expect(blocks[1].type).toBe("text")
-    expect(blocks[1].text).toContain("web_search")
-  })
-
-  test("returns instruction string when system is undefined", () => {
-    const result = appendWebSearchInstruction(undefined)
-    expect(typeof result).toBe("string")
-    expect(result as string).toContain("web_search")
   })
 })

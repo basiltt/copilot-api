@@ -180,16 +180,15 @@ async function handleStreaming(
     pingTimer = undefined
 
     if (isNonStreaming(copilotResponse)) {
-      // Shouldn't happen for a streaming payload, but handle gracefully.
+      // Shouldn't happen for a streaming payload, but handle gracefully by
+      // emitting a proper Anthropic SSE event sequence from the non-streaming
+      // response. Sending just a single "message_start" with the full response
+      // body causes Claude Code to miss tool call details entirely.
       consola.debug(
-        "Non-streaming response from Copilot:",
+        "Non-streaming response from Copilot (unexpected for streaming request):",
         JSON.stringify(copilotResponse).slice(-400),
       )
-      const anthropicResponse = translateToAnthropic(copilotResponse)
-      await stream.writeSSE({
-        event: "message_start",
-        data: JSON.stringify(anthropicResponse),
-      })
+      await emitNonStreamingAsSSE(stream, copilotResponse)
       return
     }
 
@@ -303,3 +302,114 @@ async function pipeStreamToClient(
 const isNonStreaming = (
   response: Awaited<ReturnType<typeof createChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
+
+/**
+ * Emits a proper Anthropic SSE event sequence from a non-streaming Copilot
+ * response. This is needed when Copilot unexpectedly returns a non-streaming
+ * body for a streaming request — sending the full response as a single
+ * "message_start" event causes Claude Code to miss all tool call input details.
+ */
+async function emitNonStreamingAsSSE(
+  stream: SSEStreamingApi,
+  response: ChatCompletionResponse,
+): Promise<void> {
+  const anthropicResponse = translateToAnthropic(response)
+
+  // 1. message_start (without content, stop_reason, stop_sequence)
+  await stream.writeSSE({
+    event: "message_start",
+    data: JSON.stringify({
+      type: "message_start",
+      message: {
+        id: anthropicResponse.id,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: anthropicResponse.model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: anthropicResponse.usage.input_tokens,
+          output_tokens: 0,
+          ...(anthropicResponse.usage.cache_read_input_tokens !== undefined && {
+            cache_read_input_tokens:
+              anthropicResponse.usage.cache_read_input_tokens,
+          }),
+        },
+      },
+    }),
+  })
+
+  // 2. Emit each content block as start + delta + stop
+  for (let i = 0; i < anthropicResponse.content.length; i++) {
+    const block = anthropicResponse.content[i]
+
+    if (block.type === "text") {
+      await stream.writeSSE({
+        event: "content_block_start",
+        data: JSON.stringify({
+          type: "content_block_start",
+          index: i,
+          content_block: { type: "text", text: "" },
+        }),
+      })
+      await stream.writeSSE({
+        event: "content_block_delta",
+        data: JSON.stringify({
+          type: "content_block_delta",
+          index: i,
+          delta: { type: "text_delta", text: block.text },
+        }),
+      })
+    } else if (block.type === "tool_use") {
+      await stream.writeSSE({
+        event: "content_block_start",
+        data: JSON.stringify({
+          type: "content_block_start",
+          index: i,
+          content_block: {
+            type: "tool_use",
+            id: block.id,
+            name: block.name,
+            input: {},
+          },
+        }),
+      })
+      const inputJson = JSON.stringify(block.input)
+      if (inputJson !== "{}") {
+        await stream.writeSSE({
+          event: "content_block_delta",
+          data: JSON.stringify({
+            type: "content_block_delta",
+            index: i,
+            delta: { type: "input_json_delta", partial_json: inputJson },
+          }),
+        })
+      }
+    }
+
+    await stream.writeSSE({
+      event: "content_block_stop",
+      data: JSON.stringify({ type: "content_block_stop", index: i }),
+    })
+  }
+
+  // 3. message_delta + message_stop
+  await stream.writeSSE({
+    event: "message_delta",
+    data: JSON.stringify({
+      type: "message_delta",
+      delta: {
+        stop_reason: anthropicResponse.stop_reason,
+        stop_sequence: anthropicResponse.stop_sequence,
+      },
+      usage: {
+        output_tokens: anthropicResponse.usage.output_tokens,
+      },
+    }),
+  })
+  await stream.writeSSE({
+    event: "message_stop",
+    data: JSON.stringify({ type: "message_stop" }),
+  })
+}

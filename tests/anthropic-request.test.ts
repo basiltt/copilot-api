@@ -1,8 +1,11 @@
 import { describe, test, expect } from "bun:test"
 import { z } from "zod"
 
-import { isTypedTool, type AnthropicMessagesPayload, type AnthropicTool } from "~/routes/messages/anthropic-types"
-
+import {
+  isTypedTool,
+  type AnthropicMessagesPayload,
+  type AnthropicTool,
+} from "~/routes/messages/anthropic-types"
 import { translateToOpenAI } from "~/routes/messages/non-stream-translation"
 
 // Zod schema for a single message in the chat completion request.
@@ -356,7 +359,14 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
         { role: "user", content: "Take a screenshot." },
         {
           role: "assistant",
-          content: [{ type: "tool_use", id: "call_sc", name: "computer", input: { action: "screenshot" } }],
+          content: [
+            {
+              type: "tool_use",
+              id: "call_sc",
+              name: "computer",
+              input: { action: "screenshot" },
+            },
+          ],
         },
         {
           role: "user",
@@ -395,7 +405,14 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
         { role: "user", content: "Run a command." },
         {
           role: "assistant",
-          content: [{ type: "tool_use", id: "call_b", name: "Bash", input: { command: "ls" } }],
+          content: [
+            {
+              type: "tool_use",
+              id: "call_b",
+              name: "Bash",
+              input: { command: "ls" },
+            },
+          ],
         },
         {
           role: "user",
@@ -403,9 +420,7 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
             {
               type: "tool_result",
               tool_use_id: "call_b",
-              content: [
-                { type: "text", text: "file1.txt\nfile2.txt" },
-              ],
+              content: [{ type: "text", text: "file1.txt\nfile2.txt" }],
             },
           ],
         },
@@ -429,7 +444,14 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
             {
               type: "web_search_tool_result",
               tool_use_id: "srv_ws_1",
-              content: [{ type: "web_search_result", url: "https://example.com", title: "Example", encrypted_content: "abc" }],
+              content: [
+                {
+                  type: "web_search_result",
+                  url: "https://example.com",
+                  title: "Example",
+                  encrypted_content: "abc",
+                },
+              ],
             },
           ],
         },
@@ -438,7 +460,10 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
     }
     const result = translateToOpenAI(anthropicPayload)
     const webResultMsg = result.messages.find(
-      (m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("[Web search result:")
+      (m) =>
+        m.role === "user"
+        && typeof m.content === "string"
+        && m.content.includes("[Web search result:"),
     )
     expect(webResultMsg).toBeDefined()
     expect(webResultMsg?.content).toContain("example.com")
@@ -477,9 +502,19 @@ describe("handleAssistantMessage redacted_thinking and server_tool_use (Task 7)"
         {
           role: "assistant",
           content: [
-            { type: "server_tool_use", id: "srv_1", name: "web_search", input: { query: "test" } },
+            {
+              type: "server_tool_use",
+              id: "srv_1",
+              name: "web_search",
+              input: { query: "test" },
+            },
             { type: "text", text: "Let me also call a tool." },
-            { type: "tool_use", id: "call_1", name: "Bash", input: { command: "ls" } },
+            {
+              type: "tool_use",
+              id: "call_1",
+              name: "Bash",
+              input: { command: "ls" },
+            },
           ],
         },
       ],
@@ -698,12 +733,21 @@ describe("isTypedTool discriminator", () => {
   })
 
   test("returns false for a custom tool (has input_schema)", () => {
-    const customTool = { name: "Bash", description: "Run shell commands", input_schema: {} }
+    const customTool = {
+      name: "Bash",
+      description: "Run shell commands",
+      input_schema: {},
+    }
     expect(isTypedTool(customTool)).toBe(false)
   })
 
   test("returns false for custom tool even if it has extra fields", () => {
-    const customTool = { name: "Bash", input_schema: {}, strict: true, cache_control: { type: "ephemeral" } }
+    const customTool = {
+      name: "Bash",
+      input_schema: {},
+      strict: true,
+      cache_control: { type: "ephemeral" },
+    }
     expect(isTypedTool(customTool as AnthropicTool)).toBe(false)
   })
 })

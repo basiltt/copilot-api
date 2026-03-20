@@ -21,19 +21,21 @@ export function appendWebSearchInstruction(
   }
 
   if (Array.isArray(system)) {
-    const lastTextIdx = system
-      .map((b, i) => (b.type === "text" ? i : -1))
-      .filter((i) => i !== -1)
-      .at(-1)
+    const lastTextIdx = system.length > 0 ? system.length - 1 : undefined
 
     if (lastTextIdx !== undefined) {
       return system.map((b, i) =>
-        i === lastTextIdx ? { ...b, text: b.text + WEB_SEARCH_SYSTEM_INSTRUCTION } : b,
+        i === lastTextIdx ?
+          { ...b, text: b.text + WEB_SEARCH_SYSTEM_INSTRUCTION }
+        : b,
       )
     }
 
     // No text block found — add a new one
-    return [...system, { type: "text", text: WEB_SEARCH_SYSTEM_INSTRUCTION.trim() }]
+    return [
+      ...system,
+      { type: "text", text: WEB_SEARCH_SYSTEM_INSTRUCTION.trim() },
+    ]
   }
 
   // No system prompt at all

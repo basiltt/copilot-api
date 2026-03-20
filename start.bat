@@ -34,13 +34,13 @@ if defined TAVILY_API_KEY (
 echo.
 
 echo Starting server on http://localhost:4141
-echo  --burst-count 5 --burst-window 30  ^(max 5 requests per 30s window^)
+:: echo  --burst-count 10 --burst-window 30  ^(max 10 requests per 30s window^)
 echo.
 echo To launch Claude Code, run in a new terminal:
 echo   set ANTHROPIC_BASE_URL=http://localhost:4141 ^& set ANTHROPIC_AUTH_TOKEN=dummy ^& set ANTHROPIC_MODEL=claude-opus-4.6 ^& set ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4.6 ^& set ANTHROPIC_SMALL_FAST_MODEL=gpt-4o-mini ^& set ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-opus-4.6 ^& set DISABLE_NON_ESSENTIAL_MODEL_CALLS=1 ^& set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ^& claude
 echo.
 
 start "" "https://ericc-ch.github.io/copilot-api?endpoint=http://localhost:4141/usage"
-bun run ./src/main.ts start --burst-count 5 --burst-window 30
-
+:: bun run ./src/main.ts start --burst-count 10 --burst-window 30
+bun run ./src/main.ts start 
 pause

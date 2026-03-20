@@ -12,13 +12,38 @@ import { translateToOpenAI } from "./non-stream-translation"
 // Custom tools use the existing flat +346 for the entire tools array.
 // Typed tools add per-tool overhead on top.
 const ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD: Record<string, number> = {
-  "text_editor_20250728": 700,
-  "text_editor_20250429": 700,
-  "text_editor_20250124": 700,
-  "text_editor_20241022": 700,
-  "bash_20250124": 700,
-  "bash_20241022": 700,
+  text_editor_20250728: 700,
+  text_editor_20250429: 700,
+  text_editor_20250124: 700,
+  text_editor_20241022: 700,
+  bash_20250124: 700,
+  bash_20241022: 700,
   // computer_use and web_search: overhead included in beta pricing, not additive
+}
+
+function applyToolTokenOverhead(
+  tokenCount: { input: number; output: number },
+  payload: AnthropicMessagesPayload,
+): void {
+  if (!payload.tools) return
+
+  if (payload.model.startsWith("claude")) {
+    const hasCustomTools = payload.tools.some((t) => !isTypedTool(t))
+    // Preserve existing flat +346 for the custom tools array (unchanged behavior)
+    if (hasCustomTools) {
+      tokenCount.input = tokenCount.input + 346
+    }
+    // Add per-typed-tool overhead for Anthropic-typed tools (new)
+    for (const tool of payload.tools) {
+      if (isTypedTool(tool)) {
+        tokenCount.input =
+          tokenCount.input
+          + (ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD[tool.type] ?? 0)
+      }
+    }
+  } else if (payload.model.startsWith("grok")) {
+    tokenCount.input = tokenCount.input + 480
+  }
 }
 
 /**
@@ -53,22 +78,7 @@ export async function handleCountTokens(c: Context) {
         )
       }
       if (!mcpToolExist) {
-        if (anthropicPayload.model.startsWith("claude")) {
-          const hasCustomTools = anthropicPayload.tools.some((t) => !isTypedTool(t))
-          const typedTools = anthropicPayload.tools.filter(isTypedTool)
-
-          // Preserve existing flat +346 for the custom tools array (unchanged behavior)
-          if (hasCustomTools) {
-            tokenCount.input = tokenCount.input + 346
-          }
-          // Add per-typed-tool overhead for Anthropic-typed tools (new)
-          for (const tool of typedTools) {
-            tokenCount.input =
-              tokenCount.input + (ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD[tool.type] ?? 0)
-          }
-        } else if (anthropicPayload.model.startsWith("grok")) {
-          tokenCount.input = tokenCount.input + 480
-        }
+        applyToolTokenOverhead(tokenCount, anthropicPayload)
       }
     }
 

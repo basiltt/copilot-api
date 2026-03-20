@@ -1,8 +1,16 @@
 import { describe, test, expect } from "bun:test"
+
 import type { ModelsResponse } from "~/services/copilot/get-models"
+
 import { selectModelForTokenCount } from "~/lib/model-selector"
 
-function makeModels(list: Array<{ id: string; max_context_window_tokens?: number; max_prompt_tokens?: number }>): ModelsResponse {
+function makeModels(
+  list: Array<{
+    id: string
+    max_context_window_tokens?: number
+    max_prompt_tokens?: number
+  }>,
+): ModelsResponse {
   return {
     object: "list",
     data: list.map((m) => ({
@@ -31,14 +39,18 @@ function makeModels(list: Array<{ id: string; max_context_window_tokens?: number
 
 describe("selectModelForTokenCount — no overflow", () => {
   test("returns switched: false when tokens within limit", () => {
-    const models = makeModels([{ id: "gpt-4o", max_context_window_tokens: 128000 }])
+    const models = makeModels([
+      { id: "gpt-4o", max_context_window_tokens: 128000 },
+    ])
     const result = selectModelForTokenCount("gpt-4o", models, 1000)
     expect(result.switched).toBe(false)
     expect(result.model).toBe("gpt-4o")
   })
 
   test("returns switched: false when tokens exactly equal limit", () => {
-    const models = makeModels([{ id: "gpt-4o", max_context_window_tokens: 128000 }])
+    const models = makeModels([
+      { id: "gpt-4o", max_context_window_tokens: 128000 },
+    ])
     const result = selectModelForTokenCount("gpt-4o", models, 128000)
     expect(result.switched).toBe(false)
   })
@@ -80,7 +92,9 @@ describe("selectModelForTokenCount — overflow detected", () => {
 
 describe("selectModelForTokenCount — missing data", () => {
   test("returns switched: false when requested model not in list", () => {
-    const models = makeModels([{ id: "other-model", max_context_window_tokens: 128000 }])
+    const models = makeModels([
+      { id: "other-model", max_context_window_tokens: 128000 },
+    ])
     const result = selectModelForTokenCount("unknown-model", models, 999999)
     expect(result.switched).toBe(false)
     expect(result.model).toBe("unknown-model")

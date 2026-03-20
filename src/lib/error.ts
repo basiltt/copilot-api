@@ -26,7 +26,10 @@ export async function forwardError(c: Context, error: unknown) {
     consola.error("HTTP error:", errorJson ?? errorText)
 
     if (errorJson !== null && typeof errorJson === "object") {
-      return c.json(errorJson as Record<string, unknown>, error.response.status as ContentfulStatusCode)
+      return c.json(
+        errorJson as Record<string, unknown>,
+        error.response.status as ContentfulStatusCode,
+      )
     }
     return c.json(
       { error: { message: errorText, type: "error" } },
