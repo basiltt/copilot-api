@@ -203,7 +203,7 @@
 - [ ] **Step 5: Run full test suite to check for regressions**
 
   ```bash
-  bun test
+  bun test  
   ```
 
   Expected: all tests pass.
