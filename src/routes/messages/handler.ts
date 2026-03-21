@@ -237,6 +237,9 @@ async function fetchCopilotResponse(
   const selectedModel = state.models?.data.find(
     (m) => m.id === openAIPayload.model,
   )
+  consola.debug(
+    `[routing] model=${openAIPayload.model} found=${selectedModel !== undefined} requiresResponses=${selectedModel !== undefined && requiresResponsesApi(selectedModel)} endpoints=${JSON.stringify(selectedModel?.supported_endpoints)}`,
+  )
   if (selectedModel !== undefined && requiresResponsesApi(selectedModel)) {
     // createResponsesCompletion returns AsyncIterable<SSEMessage> for streaming,
     // which is structurally compatible with AsyncGenerator<ServerSentEventMessage>

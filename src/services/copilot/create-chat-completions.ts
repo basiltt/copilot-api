@@ -1,3 +1,4 @@
+import consola from "consola"
 import { events } from "fetch-event-stream"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
@@ -8,6 +9,7 @@ import {
   translateToResponsesPayload,
   translateFromResponsesResponse,
   translateFromResponsesStream,
+  createResponsesStreamState,
 } from "./responses-translation"
 
 export const createResponsesCompletion = async (
@@ -50,19 +52,53 @@ export const createResponsesCompletion = async (
   if (payload.stream) {
     const responseId = `resp_${Date.now()}`
     const model = payload.model
+    const streamState = createResponsesStreamState()
 
     async function* streamChunks() {
+      consola.debug("[responses-stream] Starting stream iteration")
+      let eventCount = 0
+      let yieldCount = 0
       for await (const event of events(response)) {
+        eventCount++
+        consola.debug(
+          `[responses-stream] Raw SSE event #${eventCount}:`,
+          JSON.stringify({
+            event: event.event,
+            data: event.data?.slice(0, 200),
+          }),
+        )
         if (!event.data || event.data === "[DONE]") continue
         let parsed: Record<string, unknown>
         try {
           parsed = JSON.parse(event.data) as Record<string, unknown>
         } catch {
+          consola.debug("[responses-stream] Failed to parse event data as JSON")
           continue
         }
-        const chunk = translateFromResponsesStream(parsed, responseId, model)
-        if (chunk) yield chunk
+        consola.debug(
+          `[responses-stream] Parsed event type: ${parsed.type as string}`,
+        )
+        const chunk = translateFromResponsesStream(parsed, {
+          responseId,
+          model,
+          streamState,
+        })
+        if (chunk) {
+          yieldCount++
+          consola.debug(
+            `[responses-stream] Yielding chunk #${yieldCount}:`,
+            JSON.stringify(chunk).slice(0, 200),
+          )
+          yield chunk
+        } else {
+          consola.debug(
+            `[responses-stream] translateFromResponsesStream returned null for type: ${parsed.type as string}`,
+          )
+        }
       }
+      consola.debug(
+        `[responses-stream] Stream ended. Total events: ${eventCount}, yielded: ${yieldCount}`,
+      )
     }
 
     return streamChunks()

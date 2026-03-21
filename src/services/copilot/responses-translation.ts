@@ -213,70 +213,54 @@ export function translateFromResponsesResponse(
  * Translates a single Responses API SSE event into a Chat Completion SSE message.
  * Returns null for event types that have no Chat Completions equivalent.
  */
+/**
+ * Mutable state shared across a single streaming response so that
+ * `response.output_item.added` can hand off the tool-call identity
+ * (call_id + name) to the subsequent `function_call_arguments.delta` chunks.
+ */
+export interface ResponsesStreamState {
+  /** Pending tool-call identities keyed by Responses-API item id. */
+  pendingToolCalls: Record<
+    string,
+    { call_id: string; name: string; sent: boolean }
+  >
+}
+
+export function createResponsesStreamState(): ResponsesStreamState {
+  return { pendingToolCalls: {} }
+}
+
+export interface TranslateStreamOptions {
+  responseId: string
+  model: string
+  streamState: ResponsesStreamState
+}
+
 export function translateFromResponsesStream(
   event: Record<string, unknown>,
-  responseId: string,
-  model: string,
+  options: TranslateStreamOptions,
 ): SSEMessage | null {
+  const { responseId, model, streamState } = options
   const type = event.type as string
 
   if (type === "response.output_text.delta") {
-    return makeChunk(responseId, model, {
-      choices: [
-        {
-          index: 0,
-          delta: { content: event.delta as string },
-          finish_reason: null,
-          logprobs: null,
-        },
-      ],
-    })
+    return makeTextDeltaChunk(responseId, model, event.delta as string)
   }
 
   if (type === "response.output_text.done") {
-    return makeChunk(responseId, model, {
-      choices: [
-        {
-          index: 0,
-          delta: {},
-          finish_reason: "stop",
-          logprobs: null,
-        },
-      ],
-    })
+    return makeFinishChunk(responseId, model, "stop")
+  }
+
+  if (type === "response.output_item.added") {
+    return handleOutputItemAdded(event, streamState)
   }
 
   if (type === "response.function_call_arguments.delta") {
-    return makeChunk(responseId, model, {
-      choices: [
-        {
-          index: 0,
-          delta: {
-            tool_calls: [
-              {
-                index: 0,
-                function: { arguments: event.delta as string },
-              },
-            ],
-          },
-          finish_reason: null,
-          logprobs: null,
-        },
-      ],
-    })
+    return handleFnCallArgsDelta(event, { responseId, model, streamState })
   }
 
   if (type === "response.function_call_arguments.done") {
-    return makeChunk(responseId, model, {
-      choices: [
-        {
-          index: 0,
-          delta: {},
-          finish_reason: "tool_calls",
-          logprobs: null,
-        },
-      ],
-    })
+    return makeFinishChunk(responseId, model, "tool_calls")
   }
 
   if (type === "response.completed") {
@@ -284,6 +268,105 @@ export function translateFromResponsesStream(
   }
 
   return null
+}
+
+/** Stash tool-call identity so argument deltas can reference it later. */
+function handleOutputItemAdded(
+  event: Record<string, unknown>,
+  streamState: ResponsesStreamState,
+): null {
+  const item = event.item as Record<string, unknown> | undefined
+  if (item?.type === "function_call" && item.call_id && item.name) {
+    const itemId = item.id as string
+    streamState.pendingToolCalls[itemId] = {
+      call_id: item.call_id as string,
+      name: item.name as string,
+      sent: false,
+    }
+  }
+  return null
+}
+
+/** Translate a function_call_arguments.delta event into a Chat Completion chunk. */
+function handleFnCallArgsDelta(
+  event: Record<string, unknown>,
+  options: Pick<TranslateStreamOptions, "responseId" | "model" | "streamState">,
+): SSEMessage {
+  const { responseId, model, streamState } = options
+  const itemId = event.item_id as string | undefined
+  const pending =
+    itemId !== undefined ? streamState.pendingToolCalls[itemId] : undefined
+
+  // First delta for this tool call → attach id + name so the Anthropic
+  // translator can open a content_block_start for the tool_use block.
+  if (pending && !pending.sent) {
+    pending.sent = true
+    return makeToolCallChunk(responseId, model, {
+      args: event.delta as string,
+      identity: {
+        id: pending.call_id,
+        type: "function",
+        name: pending.name,
+      },
+    })
+  }
+
+  return makeToolCallChunk(responseId, model, {
+    args: event.delta as string,
+  })
+}
+
+function makeTextDeltaChunk(
+  id: string,
+  model: string,
+  content: string,
+): SSEMessage {
+  return makeChunk(id, model, {
+    choices: [
+      { index: 0, delta: { content }, finish_reason: null, logprobs: null },
+    ],
+  })
+}
+
+function makeFinishChunk(
+  id: string,
+  model: string,
+  finishReason: string,
+): SSEMessage {
+  return makeChunk(id, model, {
+    choices: [
+      { index: 0, delta: {}, finish_reason: finishReason, logprobs: null },
+    ],
+  })
+}
+
+function makeToolCallChunk(
+  id: string,
+  model: string,
+  toolCallData: {
+    args: string
+    identity?: { id: string; type: string; name: string }
+  },
+): SSEMessage {
+  const { args, identity } = toolCallData
+  const toolCall: Record<string, unknown> = {
+    index: 0,
+    ...(identity && { id: identity.id, type: identity.type }),
+    function: {
+      ...(identity && { name: identity.name }),
+      arguments: args,
+    },
+  }
+  return makeChunk(id, model, {
+    choices: [
+      {
+        index: 0,
+        delta: { tool_calls: [toolCall] },
+        finish_reason: null,
+        logprobs: null,
+      },
+    ],
+  })
 }
 
 function makeChunk(

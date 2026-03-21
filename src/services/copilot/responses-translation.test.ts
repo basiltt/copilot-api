@@ -7,6 +7,7 @@ import {
   translateToResponsesPayload,
   translateFromResponsesResponse,
   translateFromResponsesStream,
+  createResponsesStreamState,
   requiresResponsesApi,
 } from "./responses-translation"
 
@@ -250,6 +251,7 @@ describe("translateFromResponsesResponse", () => {
 
 describe("translateFromResponsesStream", () => {
   test("translates output_text delta event to SSE chunk", () => {
+    const state = createResponsesStreamState()
     const event = {
       type: "response.output_text.delta",
       delta: "Hello",
@@ -257,7 +259,11 @@ describe("translateFromResponsesStream", () => {
       output_index: 0,
       content_index: 0,
     }
-    const chunk = translateFromResponsesStream(event, "resp_xyz", "gpt-5.4")
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
     expect(chunk).not.toBeNull()
     if (!chunk) throw new Error("chunk is null")
     const parsed = JSON.parse(chunk.data as string) as {
@@ -277,14 +283,20 @@ describe("translateFromResponsesStream", () => {
   })
 
   test("translates response.completed event to final [DONE] SSE", () => {
+    const state = createResponsesStreamState()
     const event = { type: "response.completed", response: { id: "resp_xyz" } }
-    const chunk = translateFromResponsesStream(event, "resp_xyz", "gpt-5.4")
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
     expect(chunk).not.toBeNull()
     if (!chunk) throw new Error("chunk is null")
     expect(chunk.data).toBe("[DONE]")
   })
 
   test("translates response.output_text.done event to finish_reason stop chunk", () => {
+    const state = createResponsesStreamState()
     const event = {
       type: "response.output_text.done",
       text: "full text",
@@ -292,7 +304,11 @@ describe("translateFromResponsesStream", () => {
       output_index: 0,
       content_index: 0,
     }
-    const chunk = translateFromResponsesStream(event, "resp_xyz", "gpt-5.4")
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
     expect(chunk).not.toBeNull()
     if (!chunk) throw new Error("chunk is null")
     const parsed = JSON.parse(chunk.data as string) as {
@@ -302,14 +318,19 @@ describe("translateFromResponsesStream", () => {
     expect(parsed.choices[0].finish_reason).toBe("stop")
   })
 
-  test("translates function_call delta event to tool_calls delta chunk", () => {
+  test("translates function_call delta event to tool_calls delta chunk (without prior output_item.added)", () => {
+    const state = createResponsesStreamState()
     const event = {
       type: "response.function_call_arguments.delta",
       delta: '{"city":',
       item_id: "call_1",
       output_index: 0,
     }
-    const chunk = translateFromResponsesStream(event, "resp_xyz", "gpt-5.4")
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
     expect(chunk).not.toBeNull()
     if (!chunk) throw new Error("chunk is null")
     const parsed = JSON.parse(chunk.data as string) as {
@@ -323,9 +344,100 @@ describe("translateFromResponsesStream", () => {
     )
   })
 
+  test("attaches call_id and name from output_item.added to first function_call delta", () => {
+    const state = createResponsesStreamState()
+
+    // First, the Responses API sends the output_item.added event with function call metadata
+    const addedEvent = {
+      type: "response.output_item.added",
+      item: {
+        type: "function_call",
+        id: "fc_item_1",
+        call_id: "call_abc123",
+        name: "get_weather",
+        arguments: "",
+      },
+    }
+    const addedResult = translateFromResponsesStream(addedEvent, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(addedResult).toBeNull() // output_item.added itself returns null
+
+    // Then the first arguments delta should include call_id and name
+    const deltaEvent = {
+      type: "response.function_call_arguments.delta",
+      delta: '{"city":',
+      item_id: "fc_item_1",
+      output_index: 0,
+    }
+    const chunk = translateFromResponsesStream(deltaEvent, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(chunk).not.toBeNull()
+    if (!chunk) throw new Error("chunk is null")
+    const parsed = JSON.parse(chunk.data as string) as {
+      choices: Array<{
+        delta: {
+          tool_calls: Array<{
+            index: number
+            id?: string
+            type?: string
+            function: { name?: string; arguments: string }
+          }>
+        }
+      }>
+    }
+    const tc = parsed.choices[0].delta.tool_calls[0]
+    expect(tc.id).toBe("call_abc123")
+    expect(tc.type).toBe("function")
+    expect(tc.function.name).toBe("get_weather")
+    expect(tc.function.arguments).toBe('{"city":')
+
+    // Subsequent deltas should NOT include id/name again
+    const delta2Event = {
+      type: "response.function_call_arguments.delta",
+      delta: '"London"}',
+      item_id: "fc_item_1",
+      output_index: 0,
+    }
+    const chunk2 = translateFromResponsesStream(delta2Event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(chunk2).not.toBeNull()
+    if (!chunk2) throw new Error("chunk2 is null")
+    const parsed2 = JSON.parse(chunk2.data as string) as {
+      choices: Array<{
+        delta: {
+          tool_calls: Array<{
+            index: number
+            id?: string
+            type?: string
+            function: { name?: string; arguments: string }
+          }>
+        }
+      }>
+    }
+    const tc2 = parsed2.choices[0].delta.tool_calls[0]
+    expect(tc2.id).toBeUndefined()
+    expect(tc2.type).toBeUndefined()
+    expect(tc2.function.name).toBeUndefined()
+    expect(tc2.function.arguments).toBe('"London"}')
+  })
+
   test("returns null for unrecognised event types", () => {
+    const state = createResponsesStreamState()
     const event = { type: "response.created", response: {} }
-    const chunk = translateFromResponsesStream(event, "resp_xyz", "gpt-5.4")
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
     expect(chunk).toBeNull()
   })
 })
