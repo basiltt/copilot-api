@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test"
+import consola from "consola"
 import { Hono } from "hono"
 
-import { requestLogger } from "./request-logger"
+import {
+  extractBodyFields,
+  formatDuration,
+  requestLogger,
+} from "./request-logger"
 
 function makeApp(
   handler: (c: import("hono").Context) => Response | Promise<Response>,
@@ -13,16 +18,13 @@ function makeApp(
 }
 
 describe("formatDuration", () => {
-  // Import the helper directly for unit testing
-  test("formats sub-second durations as Xms", async () => {
-    const { formatDuration } = await import("./request-logger")
+  test("formats sub-second durations as Xms", () => {
     expect(formatDuration(0)).toBe("0ms")
     expect(formatDuration(42)).toBe("42ms")
     expect(formatDuration(999)).toBe("999ms")
   })
 
-  test("formats >= 1000ms as X.Xs", async () => {
-    const { formatDuration } = await import("./request-logger")
+  test("formats >= 1000ms as X.Xs", () => {
     expect(formatDuration(1000)).toBe("1.0s")
     expect(formatDuration(1500)).toBe("1.5s")
     expect(formatDuration(45200)).toBe("45.2s")
@@ -31,7 +33,6 @@ describe("formatDuration", () => {
 
 describe("extractBodyFields", () => {
   test("extracts model and stream from valid JSON body", async () => {
-    const { extractBodyFields } = await import("./request-logger")
     const body = JSON.stringify({ model: "gpt-5.4", stream: true })
     const result = await extractBodyFields(
       new Request("http://x", { method: "POST", body }),
@@ -41,7 +42,6 @@ describe("extractBodyFields", () => {
   })
 
   test("returns empty object for non-JSON body", async () => {
-    const { extractBodyFields } = await import("./request-logger")
     const result = await extractBodyFields(
       new Request("http://x", { method: "POST", body: "not json" }),
     )
@@ -50,7 +50,6 @@ describe("extractBodyFields", () => {
   })
 
   test("returns empty object for empty body", async () => {
-    const { extractBodyFields } = await import("./request-logger")
     const result = await extractBodyFields(
       new Request("http://x", { method: "GET" }),
     )
@@ -83,5 +82,39 @@ describe("requestLogger middleware", () => {
       headers: { "content-type": "application/json" },
     })
     expect((parsed as { model: string }).model).toBe("test-model")
+  })
+
+  test("extracts error message from non-2xx JSON response", async () => {
+    const app = makeApp((c) =>
+      c.json({ error: { message: "model not found" } }, 404),
+    )
+
+    // Patch consola.log directly — consola's level in bun test is set to 1 (info),
+    // which drops log-level messages before they reach reporters, so addReporter
+    // doesn't fire. Replacing the bound method on the singleton works instead.
+    const logLines: Array<string> = []
+    const origLog = consola.log.bind(consola)
+    consola.log = (...args: Array<unknown>) => {
+      logLines.push(args.join(" "))
+      origLog(...args)
+    }
+
+    try {
+      const res = await app.request("/test", {
+        method: "POST",
+        body: JSON.stringify({ model: "bad-model" }),
+        headers: { "content-type": "application/json" },
+      })
+      // Response should still pass through unchanged
+      expect(res.status).toBe(404)
+    } finally {
+      // eslint-disable-next-line require-atomic-updates
+      consola.log = origLog
+    }
+
+    // The middleware should have logged a line containing the error message
+    // (the string includes ANSI codes, but the plain text is present as a substring)
+    const logLine = logLines.join("\n")
+    expect(logLine).toContain("model not found")
   })
 })
