@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { Hono } from "hono"
 
+import "~/lib/context-vars"
+
 import {
   extractBodyFields,
   formatDuration,
@@ -97,5 +99,30 @@ describe("requestLogger middleware", () => {
     expect(res.status).toBe(404)
     const body = (await res.json()) as { error: { message: string } }
     expect(body.error.message).toBe("model not found")
+  })
+
+  test("reads tokenCount set by handler via context", async () => {
+    // Verifies the c.set("tokenCount", n) / c.get("tokenCount") round-trip works
+    // across the middleware boundary, which is the mechanism the logger uses to
+    // display token counts in the log line.
+    let readBack: number | undefined
+    const app = new Hono()
+    // Observer middleware wraps requestLogger: runs before and after it
+    app.use(async (c, next) => {
+      await next() // runs requestLogger + handler
+      readBack = c.get("tokenCount")
+    })
+    app.use(requestLogger)
+    app.post("/verify", (c) => {
+      c.set("tokenCount", 999)
+      return c.json({ ok: true })
+    })
+    const res = await app.request("/verify", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-4" }),
+      headers: { "content-type": "application/json" },
+    })
+    expect(res.status).toBe(200)
+    expect(readBack).toBe(999)
   })
 })
