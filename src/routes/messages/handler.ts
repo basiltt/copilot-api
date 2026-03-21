@@ -285,6 +285,7 @@ async function pipeStreamToClient(
     contentBlockIndex: 0,
     contentBlockOpen: false,
     thinkingBlockOpen: false,
+    hasEmittedText: false,
     toolCalls: {},
     thinkingEnabled,
   }

@@ -280,6 +280,8 @@ export interface AnthropicStreamState {
   contentBlockOpen: boolean
   /** Whether the currently open content block is a thinking block. */
   thinkingBlockOpen: boolean
+  /** Whether any visible text content has been emitted in this response. */
+  hasEmittedText: boolean
   toolCalls: {
     [openAIToolIndex: number]: {
       id: string

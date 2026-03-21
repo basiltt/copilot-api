@@ -63,11 +63,16 @@ export function translateChunkToAnthropicEvents(
   }
 
   // Reasoning/thinking content from models like GPT 5.4.
-  // Emit as a thinking block when thinking is enabled, or as regular text
-  // otherwise — either way the user sees progressive output.
+  // Always emit as a regular text block so the content is visible to the user.
+  // Claude Code displays thinking blocks only as brief status labels (e.g.
+  // "Unfurling…", "Cerebrating…") without showing the actual text, which makes
+  // the model appear stuck during long reasoning phases.  Emitting as text
+  // gives the user real-time visibility into the model's reasoning progress.
   if (delta.reasoning_content) {
-    // If a non-thinking block is open, close it first.
-    if (state.contentBlockOpen && !isThinkingBlockOpen(state)) {
+    // If a thinking block is open (from a previous reasoning chunk that was
+    // emitted as text), keep appending to it.  If a tool block is open,
+    // close it first.
+    if (isToolBlockOpen(state)) {
       events.push({
         type: "content_block_stop",
         index: state.contentBlockIndex,
@@ -78,19 +83,11 @@ export function translateChunkToAnthropicEvents(
     }
 
     if (!state.contentBlockOpen) {
-      if (state.thinkingEnabled) {
-        events.push({
-          type: "content_block_start",
-          index: state.contentBlockIndex,
-          content_block: { type: "thinking", thinking: "" },
-        })
-      } else {
-        events.push({
-          type: "content_block_start",
-          index: state.contentBlockIndex,
-          content_block: { type: "text", text: "" },
-        })
-      }
+      events.push({
+        type: "content_block_start",
+        index: state.contentBlockIndex,
+        content_block: { type: "text", text: "" },
+      })
       state.contentBlockOpen = true
       state.thinkingBlockOpen = true
     }
@@ -98,11 +95,9 @@ export function translateChunkToAnthropicEvents(
     events.push({
       type: "content_block_delta",
       index: state.contentBlockIndex,
-      delta:
-        state.thinkingEnabled ?
-          { type: "thinking_delta", thinking: delta.reasoning_content }
-        : { type: "text_delta", text: delta.reasoning_content },
+      delta: { type: "text_delta", text: delta.reasoning_content },
     })
+    state.hasEmittedText = true
   }
 
   if (delta.content) {
@@ -147,6 +142,7 @@ export function translateChunkToAnthropicEvents(
         text: delta.content,
       },
     })
+    state.hasEmittedText = true
   }
 
   if (delta.tool_calls) {
@@ -162,6 +158,35 @@ export function translateChunkToAnthropicEvents(
           state.contentBlockIndex++
           state.contentBlockOpen = false
           state.thinkingBlockOpen = false
+        }
+
+        // When a tool call starts and no visible text has been emitted yet,
+        // inject a brief text block so the user can see what's happening.
+        // Without this, models like GPT 5.4 that go straight to tool use
+        // produce only invisible input_json_delta events — Claude Code
+        // shows a loading animation with no indication of progress.
+        if (!state.hasEmittedText) {
+          events.push(
+            {
+              type: "content_block_start",
+              index: state.contentBlockIndex,
+              content_block: { type: "text", text: "" },
+            },
+            {
+              type: "content_block_delta",
+              index: state.contentBlockIndex,
+              delta: {
+                type: "text_delta",
+                text: `Using tool: ${toolCall.function.name}`,
+              },
+            },
+            {
+              type: "content_block_stop",
+              index: state.contentBlockIndex,
+            },
+          )
+          state.contentBlockIndex++
+          state.hasEmittedText = true
         }
 
         const anthropicBlockIndex = state.contentBlockIndex

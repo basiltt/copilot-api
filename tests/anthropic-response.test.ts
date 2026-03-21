@@ -252,6 +252,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockIndex: 0,
       contentBlockOpen: false,
       thinkingBlockOpen: false,
+      hasEmittedText: false,
       toolCalls: {},
       thinkingEnabled: false,
     }
@@ -353,6 +354,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockIndex: 0,
       contentBlockOpen: false,
       thinkingBlockOpen: false,
+      hasEmittedText: false,
       toolCalls: {},
       thinkingEnabled: false,
     }
