@@ -32,7 +32,8 @@ export async function handleCompletion(c: Context) {
   try {
     if (selectedModel) {
       const tokenCount = await getTokenCount(payload, selectedModel)
-      consola.info("Current token count:", tokenCount)
+      c.set("tokenCount", tokenCount.input)
+      consola.debug("Token count:", tokenCount)
       // Context-overflow guard: auto-switch to largest-context model if needed
       // state.models is non-null here — selectedModel was found from it
       if (state.models) {

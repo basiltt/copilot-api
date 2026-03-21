@@ -59,7 +59,7 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
 
   // Token count stored by handler via c.set("tokenCount", n)
   // Type is known via ContextVariableMap augmentation in src/lib/context-vars.ts
-  const tokenCount = c.get("tokenCount" as never) as number | undefined
+  const tokenCount = c.get("tokenCount")
 
   // On error: try to extract message from response body without consuming it
   let errorMsg = ""
