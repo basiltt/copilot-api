@@ -28,6 +28,16 @@ export function requiresResponsesApi(model: Model): boolean {
 
 // ─── Responses API payload types ─────────────────────────────────────────────
 
+// Tool format for the Responses API — name/description/parameters are top-level,
+// unlike Chat Completions where they are nested inside a `function` object.
+export interface ResponsesTool {
+  type: "function"
+  name: string
+  description?: string
+  parameters?: Record<string, unknown>
+  strict?: boolean
+}
+
 export interface ResponsesPayload {
   model: string
   input: Array<{ role: string; content: unknown }>
@@ -36,7 +46,7 @@ export interface ResponsesPayload {
   temperature?: number
   top_p?: number
   stream?: boolean | null
-  tools?: ChatCompletionsPayload["tools"]
+  tools?: Array<ResponsesTool>
   tool_choice?: ChatCompletionsPayload["tool_choice"]
   text?: { format: { type: string } }
 }
@@ -113,7 +123,17 @@ function buildOptionalScalars(
   if (payload.stream !== null && payload.stream !== undefined)
     out.stream = payload.stream
   if (payload.tools !== null && payload.tools !== undefined)
-    out.tools = payload.tools
+    out.tools = payload.tools.map((tool) => ({
+      type: "function" as const,
+      name: tool.function.name,
+      ...(tool.function.description !== undefined && {
+        description: tool.function.description,
+      }),
+      parameters: tool.function.parameters,
+      ...(tool.function.strict !== undefined && {
+        strict: tool.function.strict,
+      }),
+    }))
   if (payload.tool_choice !== null && payload.tool_choice !== undefined)
     out.tool_choice = payload.tool_choice
   return out

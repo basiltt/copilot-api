@@ -86,7 +86,7 @@ describe("translateToResponsesPayload", () => {
     expect(result.text).toEqual({ format: { type: "json_object" } })
   })
 
-  test("passes through tools unchanged", () => {
+  test("translates tools from Chat Completions format to Responses API format", () => {
     const tools = [
       {
         type: "function" as const,
@@ -103,7 +103,16 @@ describe("translateToResponsesPayload", () => {
       tools,
     }
     const result = translateToResponsesPayload(payload)
-    expect(result.tools).toEqual(tools)
+    // Responses API requires name/description/parameters at the top level,
+    // not nested inside a `function` object like Chat Completions format.
+    expect(result.tools).toEqual([
+      {
+        type: "function",
+        name: "get_weather",
+        description: "Get weather",
+        parameters: { type: "object", properties: {} },
+      },
+    ])
   })
 
   test("passes through tool_choice unchanged", () => {
