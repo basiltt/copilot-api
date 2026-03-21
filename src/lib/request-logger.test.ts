@@ -32,28 +32,46 @@ describe("formatDuration", () => {
   })
 })
 
+// Helper: create a Hono Context from a raw Request so we can unit-test
+// extractBodyFields without spinning up a full server.
+async function makeContext(req: Request): Promise<import("hono").Context> {
+  let capturedCtx!: import("hono").Context
+  const app = new Hono()
+  app.all("/*", (c) => {
+    capturedCtx = c
+    return c.text("ok")
+  })
+  await app.request(req)
+  return capturedCtx
+}
+
 describe("extractBodyFields", () => {
   test("extracts model and stream from valid JSON body", async () => {
     const body = JSON.stringify({ model: "gpt-5.4", stream: true })
-    const result = await extractBodyFields(
-      new Request("http://x", { method: "POST", body }),
+    const ctx = await makeContext(
+      new Request("http://x", {
+        method: "POST",
+        body,
+        headers: { "content-type": "application/json" },
+      }),
     )
+    const result = await extractBodyFields(ctx)
     expect(result.model).toBe("gpt-5.4")
     expect(result.stream).toBe(true)
   })
 
   test("returns empty object for non-JSON body", async () => {
-    const result = await extractBodyFields(
+    const ctx = await makeContext(
       new Request("http://x", { method: "POST", body: "not json" }),
     )
+    const result = await extractBodyFields(ctx)
     expect(result.model).toBeUndefined()
     expect(result.stream).toBeUndefined()
   })
 
   test("returns empty object for empty body", async () => {
-    const result = await extractBodyFields(
-      new Request("http://x", { method: "GET" }),
-    )
+    const ctx = await makeContext(new Request("http://x", { method: "GET" }))
+    const result = await extractBodyFields(ctx)
     expect(result.model).toBeUndefined()
   })
 })

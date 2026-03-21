@@ -1,4 +1,4 @@
-import type { MiddlewareHandler } from "hono"
+import type { Context, MiddlewareHandler } from "hono"
 
 import consola from "consola"
 
@@ -9,14 +9,21 @@ export function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`
 }
 
+/**
+ * Extracts `model` and `stream` from the Hono request context.
+ *
+ * Uses `c.req.json()` instead of `c.req.raw.clone()` so that Hono's internal
+ * body-cache is shared between the middleware and any subsequent handler that
+ * also calls `c.req.json()`.  Reading the raw request body via `.clone()` in
+ * production bypasses this cache and creates a `ReadableStream.tee()` on the
+ * live TCP-socket-backed body, which can corrupt the stream that the handler
+ * later tries to read — especially for large request bodies.
+ */
 export async function extractBodyFields(
-  req: Request,
+  c: Context,
 ): Promise<{ model?: string; stream?: boolean }> {
   try {
-    const cloned = req.clone()
-    const text = await cloned.text()
-    if (!text) return {}
-    const parsed = JSON.parse(text) as Record<string, unknown>
+    const parsed = await c.req.json<Record<string, unknown>>()
     return {
       model: typeof parsed.model === "string" ? parsed.model : undefined,
       stream: typeof parsed.stream === "boolean" ? parsed.stream : undefined,
@@ -48,8 +55,11 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
   const method = c.req.method
   const path = c.req.path
 
-  // Clone body BEFORE next() so handlers can still call c.req.json()
-  const { model, stream } = await extractBodyFields(c.req.raw)
+  // Extract body fields AFTER recording start time but BEFORE next() so the
+  // duration still covers the full round-trip.  Because we use c.req.json()
+  // (Hono's cached body reader) the result is shared with the handler —
+  // no double-read, no stream tee.
+  const { model, stream } = await extractBodyFields(c)
 
   await next()
 
