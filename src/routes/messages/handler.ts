@@ -9,7 +9,6 @@ import { awaitApproval } from "~/lib/approval"
 import { HTTPError } from "~/lib/error"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
-import { getTokenCount } from "~/lib/tokenizer"
 import {
   createChatCompletions,
   createResponsesCompletion,
@@ -60,13 +59,6 @@ const RETRIABLE_ERROR_NAMES = new Set([
   "ConnectionRefused",
 ])
 
-// Ratio of Copilot's real token count to our local tokenizer's estimate.
-// Our local tokenizer (o200k_base) systematically OVERestimates compared to
-// Copilot's tokenizer — a local count of ~190K maps to ~168K on Copilot
-// (ratio ≈ 0.88).  We divide the model's max_prompt_tokens by this ratio
-// to get the effective local-token limit that corresponds to the real limit.
-const LOCAL_TOKENIZER_OVERESTIMATE_RATIO = 0.88
-
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
   await checkBurstLimit(state)
@@ -78,13 +70,12 @@ export async function handleCompletion(c: Context) {
     await awaitApproval()
   }
 
-  // Pre-flight token check: estimate the prompt size and reject early if it
-  // would exceed Copilot's max_prompt_tokens.  Claude Code doesn't call
-  // count_tokens before every request, so it can send prompts that Copilot
-  // will reject.  By checking here we avoid a wasted round trip (which can
-  // take minutes for large payloads) and return a clear error immediately.
-  const promptLimitError = await checkPromptTokenLimit(c, anthropicPayload)
-  if (promptLimitError) return promptLimitError
+  // NOTE: We intentionally do NOT pre-flight reject requests based on local
+  // token estimation.  Returning an Anthropic-formatted "invalid_request_error"
+  // causes Claude Code to auto-compact and retry in a loop — each retry adds
+  // more context, making the prompt even larger.  Instead we let the request
+  // through to Copilot and rely on forwardError to return the raw Copilot
+  // error JSON (not Anthropic format), which Claude Code won't retry.
 
   // For non-streaming requests just fetch and translate synchronously —
   // no SSE connection needed, so no ping mechanism required.
@@ -328,6 +319,24 @@ async function pipeStreamToClient(
         })
       }
     }
+
+    // If the upstream stream ended without ever sending a usable chunk
+    // (e.g. the model returned an empty response or only unsupported
+    // event types), no message_start was emitted and the client sees an
+    // empty SSE connection with no indication of what went wrong.
+    // Emit a synthetic Anthropic error so the UI can surface the problem.
+    if (!streamState.messageStartSent) {
+      consola.warn(
+        "Copilot stream ended without producing any content — emitting error event",
+      )
+      const errorEvent = translateErrorToAnthropicErrorEvent(
+        "The model returned an empty response. This may indicate the model is unavailable or does not support this request.",
+      )
+      await stream.writeSSE({
+        event: errorEvent.type,
+        data: JSON.stringify(errorEvent),
+      })
+    }
   } catch (error) {
     consola.error("Stream error from Copilot:", error)
 
@@ -403,68 +412,6 @@ async function extractStreamingErrorDetails(error: unknown): Promise<{
       : "An unexpected error occurred during streaming.",
     errorType: "api_error",
   }
-}
-
-/**
- * Quick pre-flight check that estimates the prompt token count and returns
- * an Anthropic-formatted error response if it would exceed Copilot's
- * max_prompt_tokens for the requested model.
- *
- * Returns `undefined` when the request is within limits (or when the model
- * metadata isn't available), signalling the caller to proceed normally.
- */
-async function checkPromptTokenLimit(
-  c: Context,
-  anthropicPayload: AnthropicMessagesPayload,
-): Promise<Response | undefined> {
-  const selectedModel = state.models?.data.find(
-    (m) => m.id === anthropicPayload.model,
-  )
-  if (!selectedModel) return undefined
-
-  const maxPromptTokens = selectedModel.capabilities.limits.max_prompt_tokens
-  consola.debug(
-    `[pre-flight] model=${anthropicPayload.model} max_prompt_tokens=${maxPromptTokens}`,
-  )
-  if (!maxPromptTokens) return undefined
-
-  try {
-    const openAIPayload = translateToOpenAI(anthropicPayload)
-    const tokenCount = await getTokenCount(openAIPayload, selectedModel)
-    const estimatedTokens = tokenCount.input + tokenCount.output
-
-    // Our local tokenizer systematically OVERestimates Copilot's count by
-    // ~12 %.  Convert the model's real limit into local-tokenizer space so
-    // we only reject requests that would truly exceed Copilot's limit.
-    // e.g. 168 000 / 0.88 ≈ 190 909 local tokens → ~168K on Copilot.
-    const effectiveLimit = Math.floor(
-      maxPromptTokens / LOCAL_TOKENIZER_OVERESTIMATE_RATIO,
-    )
-
-    if (estimatedTokens > effectiveLimit) {
-      const message = `prompt token count of ${estimatedTokens} exceeds the limit of ${maxPromptTokens}`
-      consola.warn(
-        `Pre-flight token check: ${message} (effective limit: ${effectiveLimit})`,
-      )
-
-      return c.json(
-        {
-          type: "error",
-          error: {
-            type: "invalid_request_error",
-            message,
-          },
-        },
-        400,
-      )
-    }
-  } catch (error) {
-    // Non-critical — if estimation fails just let the request through and let
-    // Copilot be the final arbiter.
-    consola.debug("Pre-flight token check skipped (estimation error):", error)
-  }
-
-  return undefined
 }
 
 /**

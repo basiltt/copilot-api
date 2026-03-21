@@ -4,7 +4,7 @@ export interface AnthropicMessagesPayload {
   model: string
   messages: Array<AnthropicMessage>
   max_tokens: number
-  system?: string | Array<AnthropicTextBlock>
+  system?: string | Array<AnthropicSystemBlock>
   metadata?: {
     user_id?: string
   }
@@ -29,7 +29,22 @@ export interface AnthropicMessagesPayload {
 export interface AnthropicTextBlock {
   type: "text"
   text: string
+  cache_control?: { type: "ephemeral"; ttl?: number }
 }
+
+/**
+ * Catch-all for system-level blocks with unknown `type` values (e.g.
+ * cache_control-only blocks, future block types). Allows `system` arrays
+ * to contain non-text entries without losing type safety on known blocks.
+ */
+export interface AnthropicGenericSystemBlock {
+  type: string
+  [key: string]: unknown
+}
+
+export type AnthropicSystemBlock =
+  | AnthropicTextBlock
+  | AnthropicGenericSystemBlock
 
 export interface AnthropicImageBlock {
   type: "image"

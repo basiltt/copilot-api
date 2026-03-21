@@ -96,7 +96,7 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
 
     expect(isValidAnthropicResponse(anthropicResponse)).toBe(true)
 
-    expect(anthropicResponse.id).toBe("chatcmpl-123")
+    expect(anthropicResponse.id).toBe("msg_chatcmpl-123")
     expect(anthropicResponse.stop_reason).toBe("end_turn")
     expect(anthropicResponse.usage.input_tokens).toBe(9)
     expect(anthropicResponse.content[0].type).toBe("text")

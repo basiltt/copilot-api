@@ -17,6 +17,7 @@ import {
   type AnthropicRedactedThinkingBlock,
   type AnthropicResponse,
   type AnthropicServerToolUseBlock,
+  type AnthropicSystemBlock,
   type AnthropicTextBlock,
   type AnthropicThinkingBlock,
   type AnthropicTool,
@@ -60,7 +61,7 @@ function translateModelName(model: string): string {
 
 function translateAnthropicMessagesToOpenAI(
   anthropicMessages: Array<AnthropicMessage>,
-  system: string | Array<AnthropicTextBlock> | undefined,
+  system: string | Array<AnthropicSystemBlock> | undefined,
 ): Array<Message> {
   const systemMessages = handleSystemPrompt(system)
 
@@ -74,7 +75,7 @@ function translateAnthropicMessagesToOpenAI(
 }
 
 function handleSystemPrompt(
-  system: string | Array<AnthropicTextBlock> | undefined,
+  system: string | Array<AnthropicSystemBlock> | undefined,
 ): Array<Message> {
   if (!system) {
     return []
@@ -83,8 +84,11 @@ function handleSystemPrompt(
   if (typeof system === "string") {
     return [{ role: "system", content: system }]
   } else {
-    const systemText = system.map((block) => block.text).join("\n\n")
-    return [{ role: "system", content: systemText }]
+    const systemText = system
+      .filter((block): block is AnthropicTextBlock => block.type === "text")
+      .map((block) => block.text)
+      .join("\n\n")
+    return systemText ? [{ role: "system", content: systemText }] : []
   }
 }
 

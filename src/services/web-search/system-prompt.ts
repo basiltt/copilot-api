@@ -21,12 +21,15 @@ export function appendWebSearchInstruction(
   }
 
   if (Array.isArray(system)) {
-    const lastTextIdx = system.length > 0 ? system.length - 1 : undefined
+    const lastTextIdx = system.findLastIndex((b) => b.type === "text")
 
-    if (lastTextIdx !== undefined) {
+    if (lastTextIdx !== -1) {
       return system.map((b, i) =>
         i === lastTextIdx ?
-          { ...b, text: b.text + WEB_SEARCH_SYSTEM_INSTRUCTION }
+          {
+            ...b,
+            text: (b as { text: string }).text + WEB_SEARCH_SYSTEM_INSTRUCTION,
+          }
         : b,
       )
     }
@@ -34,7 +37,7 @@ export function appendWebSearchInstruction(
     // No text block found — add a new one
     return [
       ...system,
-      { type: "text", text: WEB_SEARCH_SYSTEM_INSTRUCTION.trim() },
+      { type: "text" as const, text: WEB_SEARCH_SYSTEM_INSTRUCTION.trim() },
     ]
   }
 
