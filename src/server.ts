@@ -2,8 +2,8 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 
 import "~/lib/context-vars"
+import { requestLogger } from "~/lib/request-logger"
 
-import { requestLogger } from "./lib/request-logger"
 import { completionRoutes } from "./routes/chat-completions/route"
 import { embeddingRoutes } from "./routes/embeddings/route"
 import { messageRoutes } from "./routes/messages/route"
