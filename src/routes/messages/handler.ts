@@ -93,20 +93,29 @@ async function handleNonStreaming(
   try {
     response = await fetchCopilotResponse(anthropicPayload)
   } catch (error) {
-    if (error instanceof HTTPError) throw error
-    consola.error("Copilot connection error (fetch-level):", error)
+    // Translate ALL errors into Anthropic-compatible error responses.
+    // Previously, HTTPErrors were re-thrown to forwardError which returned
+    // raw Copilot JSON — Claude Code couldn't parse those and treated them
+    // as fatal errors.
+    const { errorMessage, errorType } =
+      await extractStreamingErrorDetails(error)
+
+    if (error instanceof HTTPError) {
+      consola.error("Copilot HTTP error:", error)
+    } else {
+      consola.error("Copilot connection error (fetch-level):", error)
+    }
+
+    const status = error instanceof HTTPError ? error.response.status : 500
     return c.json(
       {
         type: "error",
         error: {
-          type: "api_error",
-          message:
-            error instanceof Error ?
-              error.message
-            : "An unexpected error occurred.",
+          type: errorType,
+          message: errorMessage,
         },
       },
-      500,
+      status as import("hono/utils/http-status").ContentfulStatusCode,
     )
   }
 
@@ -190,11 +199,7 @@ async function handleStreaming(
         "Non-streaming response from Copilot (unexpected for streaming request):",
         JSON.stringify(copilotResponse).slice(-400),
       )
-      await emitNonStreamingAsSSE(
-        stream,
-        copilotResponse,
-        anthropicPayload.thinking?.type === "enabled",
-      )
+      await emitNonStreamingAsSSE(stream, copilotResponse)
       return
     }
 
@@ -210,7 +215,15 @@ async function handleStreaming(
       consola.error("Copilot connection error (fetch-level):", error)
     }
 
-    const errorEvent = translateErrorToAnthropicErrorEvent()
+    // Extract the actual error details so Claude Code gets a meaningful
+    // message and can decide whether to retry (e.g. prompt too large → truncate).
+    const { errorMessage, errorType } =
+      await extractStreamingErrorDetails(error)
+
+    const errorEvent = translateErrorToAnthropicErrorEvent(
+      errorMessage,
+      errorType,
+    )
     await stream.writeSSE({
       event: errorEvent.type,
       data: JSON.stringify(errorEvent),
@@ -268,7 +281,6 @@ async function pipeStreamToClient(
     contentBlockOpen: false,
     toolCalls: {},
     thinkingEnabled,
-    thinkingBlockEmitted: false,
   }
 
   // Ping while waiting between chunks to keep the connection alive.
@@ -315,7 +327,11 @@ async function pipeStreamToClient(
       })
     }
 
-    const errorEvent = translateErrorToAnthropicErrorEvent()
+    const errorMessage =
+      error instanceof Error ?
+        error.message
+      : "An unexpected error occurred during streaming."
+    const errorEvent = translateErrorToAnthropicErrorEvent(errorMessage)
     await stream.writeSSE({
       event: errorEvent.type,
       data: JSON.stringify(errorEvent),
@@ -330,39 +346,49 @@ const isNonStreaming = (
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
 
 /**
- * Emits a synthetic thinking content block (start → delta → stop) on the SSE
- * stream.  Claude Code uses thinking blocks for its progress/status UI; since
- * Copilot never returns them, we synthesize an empty one when the original
- * request had thinking enabled.
- *
- * Returns the number of blocks emitted (0 or 1), to be used as an index offset
- * for subsequent content blocks.
+ * Maps an HTTP status code to the corresponding Anthropic error type.
+ * Claude Code uses the error type to decide whether a request can be retried.
  */
-async function emitSyntheticThinkingBlock(
-  stream: SSEStreamingApi,
-  startIndex: number,
-): Promise<number> {
-  await stream.writeSSE({
-    event: "content_block_start",
-    data: JSON.stringify({
-      type: "content_block_start",
-      index: startIndex,
-      content_block: { type: "thinking", thinking: "" },
-    }),
-  })
-  await stream.writeSSE({
-    event: "content_block_delta",
-    data: JSON.stringify({
-      type: "content_block_delta",
-      index: startIndex,
-      delta: { type: "thinking_delta", thinking: "" },
-    }),
-  })
-  await stream.writeSSE({
-    event: "content_block_stop",
-    data: JSON.stringify({ type: "content_block_stop", index: startIndex }),
-  })
-  return 1
+function mapStatusToAnthropicErrorType(status: number): string {
+  if (status === 429) return "rate_limit_error"
+  if (status >= 400 && status < 500) return "invalid_request_error"
+  if (status >= 500) return "api_error"
+  return "api_error"
+}
+
+/**
+ * Extracts a meaningful error message and Anthropic-compatible error type
+ * from a Copilot error.  For HTTPErrors this reads the response body to
+ * get the Copilot-provided message; for network errors it falls back to
+ * the generic Error message.
+ */
+async function extractStreamingErrorDetails(error: unknown): Promise<{
+  errorMessage: string
+  errorType: string
+}> {
+  if (error instanceof HTTPError) {
+    const errorType = mapStatusToAnthropicErrorType(error.response.status)
+    try {
+      const cloned = error.response.clone()
+      const text = await cloned.text()
+      const parsed = JSON.parse(text) as Record<string, unknown>
+      const errorObj = parsed.error as Record<string, unknown> | undefined
+      if (typeof errorObj?.message === "string") {
+        return { errorMessage: errorObj.message, errorType }
+      }
+      return { errorMessage: text.slice(0, 200), errorType }
+    } catch {
+      return { errorMessage: error.message, errorType }
+    }
+  }
+
+  return {
+    errorMessage:
+      error instanceof Error ?
+        error.message
+      : "An unexpected error occurred during streaming.",
+    errorType: "api_error",
+  }
 }
 
 /**
@@ -374,7 +400,6 @@ async function emitSyntheticThinkingBlock(
 async function emitNonStreamingAsSSE(
   stream: SSEStreamingApi,
   response: ChatCompletionResponse,
-  thinkingEnabled: boolean = false,
 ): Promise<void> {
   const anthropicResponse = translateToAnthropic(response)
 
@@ -403,15 +428,10 @@ async function emitNonStreamingAsSSE(
     }),
   })
 
-  // 1b. Emit a synthetic thinking block when the original request had
-  // thinking enabled.  This lets Claude Code's UI show its progress indicators.
-  const indexOffset =
-    thinkingEnabled ? await emitSyntheticThinkingBlock(stream, 0) : 0
-
   // 2. Emit each content block as start + delta + stop
   for (let i = 0; i < anthropicResponse.content.length; i++) {
     const block = anthropicResponse.content[i]
-    const blockIndex = i + indexOffset
+    const blockIndex = i
 
     if (block.type === "text") {
       await stream.writeSSE({

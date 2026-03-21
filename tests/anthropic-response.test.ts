@@ -253,7 +253,6 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockOpen: false,
       toolCalls: {},
       thinkingEnabled: false,
-      thinkingBlockEmitted: false,
     }
     const translatedStream = openAIStream.flatMap((chunk) =>
       translateChunkToAnthropicEvents(chunk, streamState),
@@ -354,7 +353,6 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockOpen: false,
       toolCalls: {},
       thinkingEnabled: false,
-      thinkingBlockEmitted: false,
     }
     const translatedStream = openAIStream.flatMap((chunk) =>
       translateChunkToAnthropicEvents(chunk, streamState),

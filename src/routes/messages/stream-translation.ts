@@ -57,36 +57,6 @@ export function translateChunkToAnthropicEvents(
     state.messageStartSent = true
   }
 
-  // Emit a synthetic thinking block before the first real content when the
-  // original request had thinking enabled.  Claude Code uses the presence of
-  // a thinking content block to render its progress/status UI.  Since Copilot
-  // never returns thinking blocks, we synthesize an empty one so the UI
-  // behaves as expected.
-  if (
-    state.thinkingEnabled
-    && !state.thinkingBlockEmitted
-    && (delta.content || delta.tool_calls)
-  ) {
-    events.push(
-      {
-        type: "content_block_start",
-        index: state.contentBlockIndex,
-        content_block: { type: "thinking", thinking: "" },
-      },
-      {
-        type: "content_block_delta",
-        index: state.contentBlockIndex,
-        delta: { type: "thinking_delta", thinking: "" },
-      },
-      {
-        type: "content_block_stop",
-        index: state.contentBlockIndex,
-      },
-    )
-    state.contentBlockIndex++
-    state.thinkingBlockEmitted = true
-  }
-
   if (delta.content) {
     if (isToolBlockOpen(state)) {
       // A tool block was open, so close it before starting a text block.
@@ -209,12 +179,15 @@ export function translateChunkToAnthropicEvents(
   return events
 }
 
-export function translateErrorToAnthropicErrorEvent(): AnthropicStreamEventData {
+export function translateErrorToAnthropicErrorEvent(
+  message: string = "An unexpected error occurred during streaming.",
+  errorType: string = "api_error",
+): AnthropicStreamEventData {
   return {
     type: "error",
     error: {
-      type: "api_error",
-      message: "An unexpected error occurred during streaming.",
+      type: errorType,
+      message,
     },
   }
 }

@@ -84,7 +84,12 @@ export async function handleCountTokens(c: Context) {
 
     let finalTokenCount = tokenCount.input + tokenCount.output
     if (anthropicPayload.model.startsWith("claude")) {
-      finalTokenCount = Math.round(finalTokenCount * 1.15)
+      // Scale token count so Claude Code's context-window compaction kicks in
+      // at the right time.  Copilot caps claude-opus at ~168K tokens while
+      // Claude Code thinks the model supports ~200K.  A 1.2× multiplier maps
+      // 168K actual → ~202K reported, triggering compaction before Copilot
+      // rejects the request with model_max_prompt_tokens_exceeded.
+      finalTokenCount = Math.round(finalTokenCount * 1.2)
     } else if (anthropicPayload.model.startsWith("grok")) {
       finalTokenCount = Math.round(finalTokenCount * 1.03)
     }
