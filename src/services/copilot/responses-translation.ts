@@ -351,6 +351,23 @@ export function translateFromResponsesStream(
     return null
   }
 
+  // Reasoning summary text deltas — GPT 5.4 and other reasoning models emit
+  // these while "thinking". Translate them to reasoning_content so the
+  // Anthropic stream translator can emit them as thinking blocks, giving the
+  // user visible progress during the model's reasoning phase.
+  if (type === "response.reasoning_summary_text.delta") {
+    return makeReasoningDeltaChunk(responseId, model, event.delta as string)
+  }
+
+  // Lifecycle events for reasoning summary — no content to forward.
+  if (
+    type === "response.reasoning_summary_text.done"
+    || type === "response.reasoning_summary_part.added"
+    || type === "response.reasoning_summary_part.done"
+  ) {
+    return null
+  }
+
   if (type === "response.output_item.added") {
     return handleOutputItemAdded(event, streamState)
   }
@@ -441,6 +458,23 @@ function makeTextDeltaChunk(
   return makeChunk(id, model, {
     choices: [
       { index: 0, delta: { content }, finish_reason: null, logprobs: null },
+    ],
+  })
+}
+
+function makeReasoningDeltaChunk(
+  id: string,
+  model: string,
+  reasoningContent: string,
+): SSEMessage {
+  return makeChunk(id, model, {
+    choices: [
+      {
+        index: 0,
+        delta: { reasoning_content: reasoningContent },
+        finish_reason: null,
+        logprobs: null,
+      },
     ],
   })
 }

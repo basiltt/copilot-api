@@ -16,6 +16,11 @@ function isToolBlockOpen(state: AnthropicStreamState): boolean {
   )
 }
 
+/** Whether the currently open block is a thinking block. */
+function isThinkingBlockOpen(state: AnthropicStreamState): boolean {
+  return state.contentBlockOpen && state.thinkingBlockOpen
+}
+
 // eslint-disable-next-line max-lines-per-function, complexity
 export function translateChunkToAnthropicEvents(
   chunk: ChatCompletionChunk,
@@ -57,7 +62,61 @@ export function translateChunkToAnthropicEvents(
     state.messageStartSent = true
   }
 
+  // Reasoning/thinking content from models like GPT 5.4.
+  // Emit as a thinking block when thinking is enabled, or as regular text
+  // otherwise — either way the user sees progressive output.
+  if (delta.reasoning_content) {
+    // If a non-thinking block is open, close it first.
+    if (state.contentBlockOpen && !isThinkingBlockOpen(state)) {
+      events.push({
+        type: "content_block_stop",
+        index: state.contentBlockIndex,
+      })
+      state.contentBlockIndex++
+      state.contentBlockOpen = false
+      state.thinkingBlockOpen = false
+    }
+
+    if (!state.contentBlockOpen) {
+      if (state.thinkingEnabled) {
+        events.push({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "thinking", thinking: "" },
+        })
+      } else {
+        events.push({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "text", text: "" },
+        })
+      }
+      state.contentBlockOpen = true
+      state.thinkingBlockOpen = true
+    }
+
+    events.push({
+      type: "content_block_delta",
+      index: state.contentBlockIndex,
+      delta:
+        state.thinkingEnabled ?
+          { type: "thinking_delta", thinking: delta.reasoning_content }
+        : { type: "text_delta", text: delta.reasoning_content },
+    })
+  }
+
   if (delta.content) {
+    // If a thinking block is open, close it before starting a text block.
+    if (isThinkingBlockOpen(state)) {
+      events.push({
+        type: "content_block_stop",
+        index: state.contentBlockIndex,
+      })
+      state.contentBlockIndex++
+      state.contentBlockOpen = false
+      state.thinkingBlockOpen = false
+    }
+
     if (isToolBlockOpen(state)) {
       // A tool block was open, so close it before starting a text block.
       events.push({
@@ -102,6 +161,7 @@ export function translateChunkToAnthropicEvents(
           })
           state.contentBlockIndex++
           state.contentBlockOpen = false
+          state.thinkingBlockOpen = false
         }
 
         const anthropicBlockIndex = state.contentBlockIndex

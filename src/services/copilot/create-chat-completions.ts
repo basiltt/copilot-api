@@ -186,6 +186,8 @@ export interface ChatCompletionChunk {
 
 interface Delta {
   content?: string | null
+  /** Reasoning/thinking content from models that support it (e.g. GPT 5.4). */
+  reasoning_content?: string | null
   role?: "user" | "assistant" | "system" | "tool"
   tool_calls?: Array<{
     index: number

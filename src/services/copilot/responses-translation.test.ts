@@ -544,3 +544,77 @@ describe("translateFromResponsesStream (tool calls)", () => {
     expect(chunk).toBeNull()
   })
 })
+
+// ─── translateFromResponsesStream (reasoning) ─────────────────────────────
+
+describe("translateFromResponsesStream (reasoning)", () => {
+  test("translates reasoning_summary_text.delta to chunk with reasoning_content", () => {
+    const state = createResponsesStreamState()
+    const event = {
+      type: "response.reasoning_summary_text.delta",
+      delta: "Let me think about this...",
+      item_id: "item_1",
+      output_index: 0,
+    }
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(chunk).not.toBeNull()
+    if (!chunk) throw new Error("chunk is null")
+    const parsed = JSON.parse(chunk.data as string) as {
+      choices: Array<{
+        delta: { reasoning_content?: string; content?: string }
+        finish_reason: string | null
+      }>
+    }
+    expect(parsed.choices[0].delta.reasoning_content).toBe(
+      "Let me think about this...",
+    )
+    expect(parsed.choices[0].delta.content).toBeUndefined()
+    expect(parsed.choices[0].finish_reason).toBeNull()
+  })
+
+  test("reasoning_summary_text.done returns null", () => {
+    const state = createResponsesStreamState()
+    const event = {
+      type: "response.reasoning_summary_text.done",
+      text: "full reasoning",
+    }
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(chunk).toBeNull()
+  })
+
+  test("reasoning_summary_part.added returns null", () => {
+    const state = createResponsesStreamState()
+    const event = {
+      type: "response.reasoning_summary_part.added",
+      item: {},
+    }
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(chunk).toBeNull()
+  })
+
+  test("reasoning_summary_part.done returns null", () => {
+    const state = createResponsesStreamState()
+    const event = {
+      type: "response.reasoning_summary_part.done",
+      item: {},
+    }
+    const chunk = translateFromResponsesStream(event, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(chunk).toBeNull()
+  })
+})
