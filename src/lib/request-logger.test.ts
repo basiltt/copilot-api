@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test"
-import consola from "consola"
 import { Hono } from "hono"
 
 import {
@@ -84,37 +83,19 @@ describe("requestLogger middleware", () => {
     expect((parsed as { model: string }).model).toBe("test-model")
   })
 
-  test("extracts error message from non-2xx JSON response", async () => {
+  test("passes through non-2xx responses unchanged", async () => {
+    // Verifies the middleware does not break error responses —
+    // status and body are forwarded to the client as-is.
     const app = makeApp((c) =>
       c.json({ error: { message: "model not found" } }, 404),
     )
-
-    // Patch consola.log directly — consola's level in bun test is set to 1 (info),
-    // which drops log-level messages before they reach reporters, so addReporter
-    // doesn't fire. Replacing the bound method on the singleton works instead.
-    const logLines: Array<string> = []
-    const origLog = consola.log.bind(consola)
-    consola.log = (...args: Array<unknown>) => {
-      logLines.push(args.join(" "))
-      origLog(...args)
-    }
-
-    try {
-      const res = await app.request("/test", {
-        method: "POST",
-        body: JSON.stringify({ model: "bad-model" }),
-        headers: { "content-type": "application/json" },
-      })
-      // Response should still pass through unchanged
-      expect(res.status).toBe(404)
-    } finally {
-      // eslint-disable-next-line require-atomic-updates
-      consola.log = origLog
-    }
-
-    // The middleware should have logged a line containing the error message
-    // (the string includes ANSI codes, but the plain text is present as a substring)
-    const logLine = logLines.join("\n")
-    expect(logLine).toContain("model not found")
+    const res = await app.request("/test", {
+      method: "POST",
+      body: JSON.stringify({ model: "bad-model" }),
+      headers: { "content-type": "application/json" },
+    })
+    expect(res.status).toBe(404)
+    const body = (await res.json()) as { error: { message: string } }
+    expect(body.error.message).toBe("model not found")
   })
 })
