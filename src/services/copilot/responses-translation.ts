@@ -40,7 +40,7 @@ export interface ResponsesTool {
 
 export interface ResponsesPayload {
   model: string
-  input: Array<{ role: string; content: unknown }>
+  input: Array<ResponsesInputItem>
   instructions?: string
   max_output_tokens?: number
   temperature?: number
@@ -50,6 +50,15 @@ export interface ResponsesPayload {
   tool_choice?: ChatCompletionsPayload["tool_choice"]
   text?: { format: { type: string } }
 }
+
+// Responses API accepts three kinds of input items:
+// 1. A message (user/assistant/developer with content)
+// 2. A function_call (assistant deciding to call a tool)
+// 3. A function_call_output (tool result)
+type ResponsesInputItem =
+  | { role: string; content: unknown }
+  | { type: "function_call"; call_id: string; name: string; arguments: string }
+  | { type: "function_call_output"; call_id: string; output: string }
 
 // ─── Responses API response types ────────────────────────────────────────────
 
@@ -90,11 +99,83 @@ export function translateToResponsesPayload(
 
   return {
     model: payload.model,
-    input: otherMessages.map((m) => ({ role: m.role, content: m.content })),
+    input: translateMessagesToResponsesInput(otherMessages),
     ...buildSystemInstruction(systemMsg),
     ...buildOptionalScalars(payload),
     ...buildTextFormat(payload.response_format),
   }
+}
+
+/**
+ * Translates OpenAI Chat Completions messages into the Responses API input format.
+ *
+ * Key differences:
+ * - Assistant messages with tool_calls → one or more `function_call` items
+ * - Tool result messages (role: "tool") → `function_call_output` items
+ * - Null content on assistant messages → empty string (Responses API rejects null)
+ */
+function translateMessagesToResponsesInput(
+  messages: Array<import("./create-chat-completions").Message>,
+): Array<ResponsesInputItem> {
+  const items: Array<ResponsesInputItem> = []
+
+  for (const msg of messages) {
+    // Tool result messages → function_call_output
+    if (msg.role === "tool" && msg.tool_call_id) {
+      let output: string
+      if (typeof msg.content === "string") {
+        output = msg.content
+      } else if (msg.content !== null) {
+        output = JSON.stringify(msg.content)
+      } else {
+        output = ""
+      }
+      items.push({
+        type: "function_call_output",
+        call_id: msg.tool_call_id,
+        output,
+      })
+      continue
+    }
+
+    // Assistant messages with tool_calls → emit function_call items
+    // (plus a text message if the assistant also produced content)
+    if (
+      msg.role === "assistant"
+      && msg.tool_calls
+      && msg.tool_calls.length > 0
+    ) {
+      // If the assistant also has text content, emit it as a message first
+      if (msg.content !== null && msg.content !== "") {
+        items.push({
+          role: msg.role,
+          content:
+            typeof msg.content === "string" ?
+              msg.content
+            : JSON.stringify(msg.content),
+        })
+      }
+
+      // Emit each tool call as a function_call input item
+      for (const tc of msg.tool_calls) {
+        items.push({
+          type: "function_call",
+          call_id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        })
+      }
+      continue
+    }
+
+    // Regular messages — ensure content is never null
+    items.push({
+      role: msg.role,
+      content: msg.content ?? "",
+    })
+  }
+
+  return items
 }
 
 function buildSystemInstruction(
@@ -217,17 +298,32 @@ export function translateFromResponsesResponse(
  * Mutable state shared across a single streaming response so that
  * `response.output_item.added` can hand off the tool-call identity
  * (call_id + name) to the subsequent `function_call_arguments.delta` chunks.
+ *
+ * IDs from the Copilot API may be encrypted/opaque, so `item.id` from
+ * `output_item.added` will NOT match `item_id` from the delta events.
+ * We therefore use a FIFO queue: the Responses API always sends
+ * `output_item.added` before its corresponding `function_call_arguments.delta`
+ * events, so we push identity info onto the queue and shift it off when the
+ * first delta for a new tool call arrives.
  */
 export interface ResponsesStreamState {
-  /** Pending tool-call identities keyed by Responses-API item id. */
-  pendingToolCalls: Record<
-    string,
-    { call_id: string; name: string; sent: boolean }
-  >
+  /** FIFO queue of tool-call identities waiting to be attached to deltas. */
+  pendingToolCalls: Array<{ call_id: string; name: string }>
+  /** Whether the current tool call's first delta has already been sent. */
+  currentToolCallSent: boolean
+  /** Whether any tool calls were seen during this response (for finish_reason). */
+  hasToolCalls: boolean
+  /** Whether any text content was seen during this response. */
+  hasTextContent: boolean
 }
 
 export function createResponsesStreamState(): ResponsesStreamState {
-  return { pendingToolCalls: {} }
+  return {
+    pendingToolCalls: [],
+    currentToolCallSent: false,
+    hasToolCalls: false,
+    hasTextContent: false,
+  }
 }
 
 export interface TranslateStreamOptions {
@@ -244,11 +340,15 @@ export function translateFromResponsesStream(
   const type = event.type as string
 
   if (type === "response.output_text.delta") {
+    streamState.hasTextContent = true
     return makeTextDeltaChunk(responseId, model, event.delta as string)
   }
 
   if (type === "response.output_text.done") {
-    return makeFinishChunk(responseId, model, "stop")
+    // Don't emit a finish chunk here — the response may contain more output
+    // items (e.g. tool calls after text). The finish chunk is emitted once
+    // on `response.completed` when the entire response is done.
+    return null
   }
 
   if (type === "response.output_item.added") {
@@ -260,11 +360,23 @@ export function translateFromResponsesStream(
   }
 
   if (type === "response.function_call_arguments.done") {
-    return makeFinishChunk(responseId, model, "tool_calls")
+    // Reset so the next tool call can pick up its identity from the queue.
+    // Don't emit a finish chunk here — the response may contain more tool
+    // calls. The finish chunk is emitted once on `response.completed`.
+    streamState.currentToolCallSent = false
+    return null
   }
 
   if (type === "response.completed") {
-    return { data: "[DONE]" }
+    // Emit the final finish chunk with the appropriate finish_reason,
+    // then signal end-of-stream. This is the ONLY place we emit
+    // finish_reason, ensuring the Anthropic message_delta + message_stop
+    // sequence is sent exactly once per response.
+    return makeFinishChunk(
+      responseId,
+      model,
+      streamState.hasToolCalls ? "tool_calls" : "stop",
+    )
   }
 
   return null
@@ -276,13 +388,15 @@ function handleOutputItemAdded(
   streamState: ResponsesStreamState,
 ): null {
   const item = event.item as Record<string, unknown> | undefined
-  if (item?.type === "function_call" && item.call_id && item.name) {
-    const itemId = item.id as string
-    streamState.pendingToolCalls[itemId] = {
+  // The Copilot API may encrypt/obfuscate field values, but `call_id` is
+  // consistently readable. Accept the item if it has a `call_id` — the `type`
+  // field may not always be present or may be obfuscated.
+  if (item && item.call_id) {
+    streamState.pendingToolCalls.push({
       call_id: item.call_id as string,
-      name: item.name as string,
-      sent: false,
-    }
+      name: typeof item.name === "string" ? item.name : "function",
+    })
+    streamState.hasToolCalls = true
   }
   return null
 }
@@ -293,14 +407,17 @@ function handleFnCallArgsDelta(
   options: Pick<TranslateStreamOptions, "responseId" | "model" | "streamState">,
 ): SSEMessage {
   const { responseId, model, streamState } = options
-  const itemId = event.item_id as string | undefined
-  const pending =
-    itemId !== undefined ? streamState.pendingToolCalls[itemId] : undefined
 
-  // First delta for this tool call → attach id + name so the Anthropic
-  // translator can open a content_block_start for the tool_use block.
-  if (pending && !pending.sent) {
-    pending.sent = true
+  // If there's a pending tool call identity and we haven't attached it yet,
+  // this is the first delta for a new tool call → attach id + name.
+  if (
+    streamState.pendingToolCalls.length > 0
+    && !streamState.currentToolCallSent
+  ) {
+    // Safe to shift — length check above guarantees at least one element.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    const pending = streamState.pendingToolCalls.shift()!
+    streamState.currentToolCallSent = true
     return makeToolCallChunk(responseId, model, {
       args: event.delta as string,
       identity: {

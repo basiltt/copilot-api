@@ -149,6 +149,69 @@ describe("translateToResponsesPayload", () => {
     expect(result).not.toHaveProperty("temperature")
     expect(result).not.toHaveProperty("text")
   })
+
+  test("translates assistant messages with tool_calls into function_call items", () => {
+    const payload: ChatCompletionsPayload = {
+      model: "gpt-5.4",
+      messages: [
+        { role: "user", content: "What is the weather?" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_abc123",
+              type: "function",
+              function: {
+                name: "get_weather",
+                arguments: '{"city":"London"}',
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_abc123",
+          content: '{"temp": 15}',
+        },
+        { role: "user", content: "Thanks!" },
+      ],
+    }
+    const result = translateToResponsesPayload(payload)
+    // Should produce: user msg, function_call item, function_call_output, user msg
+    expect(result.input).toEqual([
+      { role: "user", content: "What is the weather?" },
+      {
+        type: "function_call",
+        call_id: "call_abc123",
+        name: "get_weather",
+        arguments: '{"city":"London"}',
+      },
+      {
+        type: "function_call_output",
+        call_id: "call_abc123",
+        output: '{"temp": 15}',
+      },
+      { role: "user", content: "Thanks!" },
+    ])
+  })
+
+  test("converts null content on regular messages to empty string", () => {
+    const payload: ChatCompletionsPayload = {
+      model: "gpt-5.4",
+      messages: [
+        { role: "user", content: "Hi" },
+        { role: "assistant", content: null },
+        { role: "user", content: "Hello again" },
+      ],
+    }
+    const result = translateToResponsesPayload(payload)
+    expect(result.input).toEqual([
+      { role: "user", content: "Hi" },
+      { role: "assistant", content: "" },
+      { role: "user", content: "Hello again" },
+    ])
+  })
 })
 
 // ─── translateFromResponsesResponse ───────────────────────────────────────
@@ -282,7 +345,7 @@ describe("translateFromResponsesStream", () => {
     expect(parsed.choices[0].finish_reason).toBeNull()
   })
 
-  test("translates response.completed event to final [DONE] SSE", () => {
+  test("translates response.completed event to finish chunk (not [DONE])", () => {
     const state = createResponsesStreamState()
     const event = { type: "response.completed", response: { id: "resp_xyz" } }
     const chunk = translateFromResponsesStream(event, {
@@ -292,10 +355,47 @@ describe("translateFromResponsesStream", () => {
     })
     expect(chunk).not.toBeNull()
     if (!chunk) throw new Error("chunk is null")
-    expect(chunk.data).toBe("[DONE]")
+    // response.completed now emits a finish chunk with finish_reason
+    const parsed = JSON.parse(chunk.data as string) as {
+      choices: Array<{ delta: Record<string, unknown>; finish_reason: string }>
+    }
+    expect(parsed.choices[0].delta).toEqual({})
+    // No tool calls seen → finish_reason is "stop"
+    expect(parsed.choices[0].finish_reason).toBe("stop")
   })
 
-  test("translates response.output_text.done event to finish_reason stop chunk", () => {
+  test("response.completed emits tool_calls finish_reason when tool calls were present", () => {
+    const state = createResponsesStreamState()
+
+    // Simulate a tool call being added
+    const addedEvent = {
+      type: "response.output_item.added",
+      item: { call_id: "call_123", name: "my_tool" },
+    }
+    translateFromResponsesStream(addedEvent, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+
+    const completedEvent = {
+      type: "response.completed",
+      response: { id: "resp_xyz" },
+    }
+    const chunk = translateFromResponsesStream(completedEvent, {
+      responseId: "resp_xyz",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(chunk).not.toBeNull()
+    if (!chunk) throw new Error("chunk is null")
+    const parsed = JSON.parse(chunk.data as string) as {
+      choices: Array<{ delta: Record<string, unknown>; finish_reason: string }>
+    }
+    expect(parsed.choices[0].finish_reason).toBe("tool_calls")
+  })
+
+  test("response.output_text.done returns null (finish emitted on response.completed)", () => {
     const state = createResponsesStreamState()
     const event = {
       type: "response.output_text.done",
@@ -309,15 +409,15 @@ describe("translateFromResponsesStream", () => {
       model: "gpt-5.4",
       streamState: state,
     })
-    expect(chunk).not.toBeNull()
-    if (!chunk) throw new Error("chunk is null")
-    const parsed = JSON.parse(chunk.data as string) as {
-      choices: Array<{ delta: Record<string, unknown>; finish_reason: string }>
-    }
-    expect(parsed.choices[0].delta).toEqual({})
-    expect(parsed.choices[0].finish_reason).toBe("stop")
+    // output_text.done no longer emits a finish chunk — that happens
+    // on response.completed so multi-output-item responses work correctly.
+    expect(chunk).toBeNull()
   })
+})
 
+// ─── translateFromResponsesStream (tool calls) ───────────────────────────
+
+describe("translateFromResponsesStream (tool calls)", () => {
   test("translates function_call delta event to tool_calls delta chunk (without prior output_item.added)", () => {
     const state = createResponsesStreamState()
     const event = {
@@ -347,12 +447,14 @@ describe("translateFromResponsesStream", () => {
   test("attaches call_id and name from output_item.added to first function_call delta", () => {
     const state = createResponsesStreamState()
 
-    // First, the Responses API sends the output_item.added event with function call metadata
+    // First, the Responses API sends the output_item.added event with function call metadata.
+    // Note: item.id is an opaque encrypted string that will NOT match the item_id
+    // on delta events — this mirrors real Copilot API behavior.
     const addedEvent = {
       type: "response.output_item.added",
       item: {
         type: "function_call",
-        id: "fc_item_1",
+        id: "encrypted_item_id_abc",
         call_id: "call_abc123",
         name: "get_weather",
         arguments: "",
@@ -365,11 +467,12 @@ describe("translateFromResponsesStream", () => {
     })
     expect(addedResult).toBeNull() // output_item.added itself returns null
 
-    // Then the first arguments delta should include call_id and name
+    // Then the first arguments delta should include call_id and name,
+    // even though its item_id differs from the output_item.added item.id.
     const deltaEvent = {
       type: "response.function_call_arguments.delta",
       delta: '{"city":',
-      item_id: "fc_item_1",
+      item_id: "different_encrypted_item_id_xyz",
       output_index: 0,
     }
     const chunk = translateFromResponsesStream(deltaEvent, {
@@ -401,7 +504,7 @@ describe("translateFromResponsesStream", () => {
     const delta2Event = {
       type: "response.function_call_arguments.delta",
       delta: '"London"}',
-      item_id: "fc_item_1",
+      item_id: "different_encrypted_item_id_xyz",
       output_index: 0,
     }
     const chunk2 = translateFromResponsesStream(delta2Event, {

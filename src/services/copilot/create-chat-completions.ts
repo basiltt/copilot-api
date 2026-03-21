@@ -99,6 +99,11 @@ export const createResponsesCompletion = async (
       consola.debug(
         `[responses-stream] Stream ended. Total events: ${eventCount}, yielded: ${yieldCount}`,
       )
+      // Emit the [DONE] sentinel after all Responses API events have been
+      // processed. The finish chunk (with finish_reason) is emitted by
+      // translateFromResponsesStream on `response.completed`; this [DONE]
+      // tells pipeStreamToClient to stop iterating.
+      yield { data: "[DONE]" }
     }
 
     return streamChunks()
