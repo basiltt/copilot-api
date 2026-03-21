@@ -62,9 +62,11 @@ export async function handleCountTokens(c: Context) {
     )
 
     if (!selectedModel) {
-      consola.warn("Model not found, returning default token count")
+      consola.warn(
+        `Model '${anthropicPayload.model}' not found in cached models, returning high token count to trigger compaction`,
+      )
       return c.json({
-        input_tokens: 1,
+        input_tokens: 200_000,
       })
     }
 
@@ -101,8 +103,13 @@ export async function handleCountTokens(c: Context) {
     })
   } catch (error) {
     consola.error("Error counting tokens:", error)
+    // Return a high token count on error so Claude Code's context-window
+    // compaction kicks in.  Returning 1 would make Claude Code think the
+    // context is nearly empty, so it would never compact and the next
+    // completion request would be rejected by Copilot for exceeding the
+    // prompt token limit.
     return c.json({
-      input_tokens: 1,
+      input_tokens: 200_000,
     })
   }
 }

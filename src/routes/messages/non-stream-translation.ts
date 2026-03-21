@@ -159,26 +159,27 @@ function handleAssistantMessage(
     (block): block is AnthropicTextBlock => block.type === "text",
   )
 
-  const thinkingBlocks = message.content.filter(
-    (block): block is AnthropicThinkingBlock => block.type === "thinking",
-  )
-
   const serverToolUseBlocks = message.content.filter(
     (block): block is AnthropicServerToolUseBlock =>
       block.type === "server_tool_use",
   )
 
-  // redacted_thinking has no OpenAI equivalent — strip it; server_tool_use is serialised to text by mapContent
+  // Strip thinking + redacted_thinking — Copilot doesn't understand them and
+  // they massively inflate the prompt token count (thinking blocks from Claude
+  // Code's internal reasoning can be thousands of tokens each).
   const visibleBlocks = message.content.filter(
-    (block): block is Exclude<typeof block, AnthropicRedactedThinkingBlock> =>
-      block.type !== "redacted_thinking",
+    (
+      block,
+    ): block is Exclude<
+      typeof block,
+      AnthropicRedactedThinkingBlock | AnthropicThinkingBlock
+    > => block.type !== "redacted_thinking" && block.type !== "thinking",
   )
 
-  // Combine text, thinking, and server_tool_use blocks for Branch 1 (tool_calls path)
-  // OpenAI doesn't have separate thinking or server_tool_use blocks
+  // Combine text and server_tool_use blocks for Branch 1 (tool_calls path)
+  // OpenAI doesn't have separate server_tool_use blocks
   const allTextContent = [
     ...textBlocks.map((b) => b.text),
-    ...thinkingBlocks.map((b) => b.thinking),
     ...serverToolUseBlocks.map(
       (b) => `[Server tool use: ${JSON.stringify(b)}]`,
     ),
@@ -243,13 +244,11 @@ function mapContent(
       .filter(
         (block) =>
           block.type === "text"
-          || block.type === "thinking"
           || block.type === "document" // user messages: PDF → placeholder
           || block.type === "server_tool_use", // assistant messages: serialise to JSON
       )
       .map((block) => {
         if (block.type === "text") return block.text
-        if (block.type === "thinking") return block.thinking
         if (block.type === "document")
           return "[Document: PDF content not displayable]"
         // server_tool_use
@@ -263,11 +262,6 @@ function mapContent(
     switch (block.type) {
       case "text": {
         contentParts.push({ type: "text", text: block.text })
-
-        break
-      }
-      case "thinking": {
-        contentParts.push({ type: "text", text: block.thinking })
 
         break
       }
