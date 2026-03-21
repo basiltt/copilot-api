@@ -11,9 +11,11 @@ import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
 import {
   createChatCompletions,
+  createResponsesCompletion,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
+import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 import {
   prepareWebSearchPayload,
   webSearchInterceptor,
@@ -231,6 +233,19 @@ async function fetchCopilotResponse(
     "Translated OpenAI request payload:",
     JSON.stringify(openAIPayload),
   )
+
+  const selectedModel = state.models?.data.find(
+    (m) => m.id === openAIPayload.model,
+  )
+  if (selectedModel !== undefined && requiresResponsesApi(selectedModel)) {
+    // createResponsesCompletion returns AsyncIterable<SSEMessage> for streaming,
+    // which is structurally compatible with AsyncGenerator<ServerSentEventMessage>
+    // at runtime — both support for-await-of. Cast to align with the return type.
+    return createResponsesCompletion(openAIPayload) as ReturnType<
+      typeof createChatCompletions
+    >
+  }
+
   return createChatCompletions(openAIPayload)
 }
 
