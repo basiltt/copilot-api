@@ -48,6 +48,17 @@ function colorStatus(status: number): string {
   return status < 400 ? `${GREEN}${s}${R}` : `${RED}${s}${R}`
 }
 
+/**
+ * Pads a string to the given width. ANSI escape codes are excluded from the
+ * width calculation so coloured strings align correctly in the terminal.
+ */
+function pad(str: string, width: number): string {
+  // eslint-disable-next-line no-control-regex
+  const visible = str.replaceAll(/\x1b\[[0-9;]*m/g, "")
+  const diff = width - visible.length
+  return diff > 0 ? str + " ".repeat(diff) : str
+}
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 export const requestLogger: MiddlewareHandler = async (c, next) => {
@@ -87,26 +98,27 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
   }
 
   const prefix = ok ? `${CYAN}◀${R}` : `${RED}✕${R}`
-  const methodStr = `${DIM}${method}${R}`
-  const pathStr = `${CYAN}${path}${R}`
-  const modelStr = model ? `${YELLOW}${model}${R}` : ""
-  const streamStr = stream === true ? `${BLUE}stream${R}` : ""
+  const methodStr = pad(`${DIM}${method}${R}`, 6)
+  const pathStr = pad(`${CYAN}${path}${R}`, 20)
+  const modelStr = pad(model ? `${YELLOW}${model}${R}` : "", 20)
+  const streamStr = pad(stream === true ? `${BLUE}stream${R}` : "", 6)
+  const statusStr = pad(colorStatus(status), 3)
+  const durationStr = pad(formatDuration(duration), 7)
   const tokenStr = tokenCount !== undefined ? `${DIM}in:${tokenCount}${R}` : ""
-  const statusStr = colorStatus(status)
-  const durationStr = formatDuration(duration)
   const errorStr = errorMsg ? `${RED}${errorMsg}${R}` : ""
 
-  const parts = [
+  const line = [
     prefix,
     methodStr,
     pathStr,
     modelStr,
     streamStr,
-    tokenStr,
     statusStr,
     durationStr,
-    errorStr,
-  ].filter(Boolean)
+  ].join(" ")
 
-  consola.log(parts.join("  "))
+  // Append optional trailing fields only when present (no trailing whitespace)
+  const trailing = [tokenStr, errorStr].filter(Boolean).join(" ")
+
+  consola.log(trailing ? `${line} ${trailing}` : line)
 }
