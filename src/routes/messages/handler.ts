@@ -190,11 +190,16 @@ async function handleStreaming(
         "Non-streaming response from Copilot (unexpected for streaming request):",
         JSON.stringify(copilotResponse).slice(-400),
       )
-      await emitNonStreamingAsSSE(stream, copilotResponse)
+      await emitNonStreamingAsSSE(
+        stream,
+        copilotResponse,
+        anthropicPayload.thinking?.type === "enabled",
+      )
       return
     }
 
-    await pipeStreamToClient(stream, copilotResponse)
+    const thinkingEnabled = anthropicPayload.thinking?.type === "enabled"
+    await pipeStreamToClient(stream, copilotResponse, thinkingEnabled)
   } catch (error) {
     clearInterval(pingTimer)
     pingTimer = undefined
@@ -255,12 +260,15 @@ async function fetchCopilotResponse(
 async function pipeStreamToClient(
   stream: SSEStreamingApi,
   response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
+  thinkingEnabled: boolean,
 ): Promise<void> {
   const streamState: AnthropicStreamState = {
     messageStartSent: false,
     contentBlockIndex: 0,
     contentBlockOpen: false,
     toolCalls: {},
+    thinkingEnabled,
+    thinkingBlockEmitted: false,
   }
 
   // Ping while waiting between chunks to keep the connection alive.
@@ -322,6 +330,42 @@ const isNonStreaming = (
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
 
 /**
+ * Emits a synthetic thinking content block (start → delta → stop) on the SSE
+ * stream.  Claude Code uses thinking blocks for its progress/status UI; since
+ * Copilot never returns them, we synthesize an empty one when the original
+ * request had thinking enabled.
+ *
+ * Returns the number of blocks emitted (0 or 1), to be used as an index offset
+ * for subsequent content blocks.
+ */
+async function emitSyntheticThinkingBlock(
+  stream: SSEStreamingApi,
+  startIndex: number,
+): Promise<number> {
+  await stream.writeSSE({
+    event: "content_block_start",
+    data: JSON.stringify({
+      type: "content_block_start",
+      index: startIndex,
+      content_block: { type: "thinking", thinking: "" },
+    }),
+  })
+  await stream.writeSSE({
+    event: "content_block_delta",
+    data: JSON.stringify({
+      type: "content_block_delta",
+      index: startIndex,
+      delta: { type: "thinking_delta", thinking: "" },
+    }),
+  })
+  await stream.writeSSE({
+    event: "content_block_stop",
+    data: JSON.stringify({ type: "content_block_stop", index: startIndex }),
+  })
+  return 1
+}
+
+/**
  * Emits a proper Anthropic SSE event sequence from a non-streaming Copilot
  * response. This is needed when Copilot unexpectedly returns a non-streaming
  * body for a streaming request — sending the full response as a single
@@ -330,6 +374,7 @@ const isNonStreaming = (
 async function emitNonStreamingAsSSE(
   stream: SSEStreamingApi,
   response: ChatCompletionResponse,
+  thinkingEnabled: boolean = false,
 ): Promise<void> {
   const anthropicResponse = translateToAnthropic(response)
 
@@ -358,16 +403,22 @@ async function emitNonStreamingAsSSE(
     }),
   })
 
+  // 1b. Emit a synthetic thinking block when the original request had
+  // thinking enabled.  This lets Claude Code's UI show its progress indicators.
+  const indexOffset =
+    thinkingEnabled ? await emitSyntheticThinkingBlock(stream, 0) : 0
+
   // 2. Emit each content block as start + delta + stop
   for (let i = 0; i < anthropicResponse.content.length; i++) {
     const block = anthropicResponse.content[i]
+    const blockIndex = i + indexOffset
 
     if (block.type === "text") {
       await stream.writeSSE({
         event: "content_block_start",
         data: JSON.stringify({
           type: "content_block_start",
-          index: i,
+          index: blockIndex,
           content_block: { type: "text", text: "" },
         }),
       })
@@ -375,7 +426,7 @@ async function emitNonStreamingAsSSE(
         event: "content_block_delta",
         data: JSON.stringify({
           type: "content_block_delta",
-          index: i,
+          index: blockIndex,
           delta: { type: "text_delta", text: block.text },
         }),
       })
@@ -384,7 +435,7 @@ async function emitNonStreamingAsSSE(
         event: "content_block_start",
         data: JSON.stringify({
           type: "content_block_start",
-          index: i,
+          index: blockIndex,
           content_block: {
             type: "tool_use",
             id: block.id,
@@ -399,7 +450,7 @@ async function emitNonStreamingAsSSE(
           event: "content_block_delta",
           data: JSON.stringify({
             type: "content_block_delta",
-            index: i,
+            index: blockIndex,
             delta: { type: "input_json_delta", partial_json: inputJson },
           }),
         })
@@ -408,7 +459,7 @@ async function emitNonStreamingAsSSE(
 
     await stream.writeSSE({
       event: "content_block_stop",
-      data: JSON.stringify({ type: "content_block_stop", index: i }),
+      data: JSON.stringify({ type: "content_block_stop", index: blockIndex }),
     })
   }
 

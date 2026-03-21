@@ -270,4 +270,8 @@ export interface AnthropicStreamState {
       anthropicBlockIndex: number
     }
   }
+  /** Whether the original request included thinking: { type: "enabled" }. */
+  thinkingEnabled: boolean
+  /** Whether the synthetic thinking block has already been emitted. */
+  thinkingBlockEmitted: boolean
 }
