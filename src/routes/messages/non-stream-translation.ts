@@ -27,7 +27,7 @@ import {
   type AnthropicWebSearchToolResultBlock,
   isTypedTool,
 } from "./anthropic-types"
-import { mapOpenAIStopReasonToAnthropic } from "./utils"
+import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
 
 // Payload translation
 
@@ -384,7 +384,7 @@ export function translateToAnthropic(
   // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
 
   return {
-    id: response.id,
+    id: toAnthropicMessageId(response.id),
     type: "message",
     role: "assistant",
     model: response.model,

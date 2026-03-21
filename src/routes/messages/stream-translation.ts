@@ -4,7 +4,7 @@ import {
   type AnthropicStreamEventData,
   type AnthropicStreamState,
 } from "./anthropic-types"
-import { mapOpenAIStopReasonToAnthropic } from "./utils"
+import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
 
 function isToolBlockOpen(state: AnthropicStreamState): boolean {
   if (!state.contentBlockOpen) {
@@ -34,7 +34,7 @@ export function translateChunkToAnthropicEvents(
     events.push({
       type: "message_start",
       message: {
-        id: chunk.id,
+        id: toAnthropicMessageId(chunk.id),
         type: "message",
         role: "assistant",
         content: [],
