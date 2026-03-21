@@ -48,6 +48,7 @@ export interface Model {
   preview: boolean
   vendor: string
   version: string
+  supported_endpoints?: Array<string>
   policy?: {
     state: string
     terms: string

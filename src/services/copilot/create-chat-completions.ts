@@ -4,6 +4,76 @@ import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
+import {
+  translateToResponsesPayload,
+  translateFromResponsesResponse,
+  translateFromResponsesStream,
+} from "./responses-translation"
+
+export const createResponsesCompletion = async (
+  payload: ChatCompletionsPayload,
+): Promise<
+  ChatCompletionResponse | AsyncIterable<import("hono/streaming").SSEMessage>
+> => {
+  if (!state.copilotToken) throw new Error("Copilot token not found")
+
+  const enableVision = payload.messages.some(
+    (x) =>
+      typeof x.content !== "string"
+      && x.content?.some((x) => x.type === "image_url"),
+  )
+
+  const isAgentCall = payload.messages.some((msg) =>
+    ["assistant", "tool"].includes(msg.role),
+  )
+
+  const headers: Record<string, string> = {
+    ...copilotHeaders(state, enableVision),
+    "X-Initiator": isAgentCall ? "agent" : "user",
+  }
+
+  const responsesPayload = translateToResponsesPayload(payload)
+
+  const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(responsesPayload),
+    signal: AbortSignal.timeout(10 * 60 * 1000),
+    // @ts-expect-error — Bun-specific option
+    timeout: false,
+  })
+
+  if (!response.ok) {
+    throw new HTTPError("Failed to create responses completion", response)
+  }
+
+  if (payload.stream) {
+    const responseId = `resp_${Date.now()}`
+    const model = payload.model
+
+    async function* streamChunks() {
+      for await (const event of events(response)) {
+        if (!event.data || event.data === "[DONE]") continue
+        let parsed: Record<string, unknown>
+        try {
+          parsed = JSON.parse(event.data) as Record<string, unknown>
+        } catch {
+          continue
+        }
+        const chunk = translateFromResponsesStream(parsed, responseId, model)
+        if (chunk) yield chunk
+      }
+    }
+
+    return streamChunks()
+  }
+
+  const data = await response.json()
+  return translateFromResponsesResponse(
+    data as Parameters<typeof translateFromResponsesResponse>[0],
+  )
+}
+
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
 ) => {

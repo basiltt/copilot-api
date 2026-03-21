@@ -11,9 +11,11 @@ import { getTokenCount } from "~/lib/tokenizer"
 import { isNullish } from "~/lib/utils"
 import {
   createChatCompletions,
+  createResponsesCompletion,
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
 } from "~/services/copilot/create-chat-completions"
+import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
@@ -65,7 +67,13 @@ export async function handleCompletion(c: Context) {
     consola.debug("Set max_tokens to:", JSON.stringify(payload.max_tokens))
   }
 
-  const response = await createChatCompletions(payload)
+  const usesResponsesApi =
+    selectedModel !== undefined && requiresResponsesApi(selectedModel)
+
+  const response =
+    usesResponsesApi ?
+      await createResponsesCompletion(payload)
+    : await createChatCompletions(payload)
 
   if (isNonStreaming(response)) {
     consola.debug("Non-streaming response:", JSON.stringify(response))
@@ -82,5 +90,7 @@ export async function handleCompletion(c: Context) {
 }
 
 const isNonStreaming = (
-  response: Awaited<ReturnType<typeof createChatCompletions>>,
+  response:
+    | Awaited<ReturnType<typeof createChatCompletions>>
+    | Awaited<ReturnType<typeof createResponsesCompletion>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")

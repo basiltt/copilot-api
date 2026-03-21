@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(bun test:*)",
-      "Bash(bun run:*)"
+      "Bash(bun run:*)",
+      "Skill(update-config)",
+      "Skill(update-config:*)"
     ]
   }
 }
