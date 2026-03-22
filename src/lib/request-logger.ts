@@ -1,7 +1,5 @@
 import type { Context, MiddlewareHandler } from "hono"
 
-import consola from "consola"
-
 // ─── Pure helpers (exported for testing) ─────────────────────────────────────
 
 export function formatDuration(ms: number): string {
@@ -97,17 +95,20 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
     }
   }
 
+  const now = new Date()
+  const timeStr = pad(`${DIM}${now.toLocaleTimeString()}${R}`, 11)
   const prefix = ok ? `${CYAN}◀${R}` : `${RED}✕${R}`
-  const methodStr = pad(`${DIM}${method}${R}`, 6)
-  const pathStr = pad(`${CYAN}${path}${R}`, 20)
-  const modelStr = pad(model ? `${YELLOW}${model}${R}` : "", 20)
+  const methodStr = pad(`${DIM}${method}${R}`, 4)
+  const pathStr = pad(`${CYAN}${path}${R}`, 27)
+  const modelStr = pad(model ? `${YELLOW}${model}${R}` : "", 18)
   const streamStr = pad(stream === true ? `${BLUE}stream${R}` : "", 6)
   const statusStr = pad(colorStatus(status), 3)
-  const durationStr = pad(formatDuration(duration), 7)
+  const durationStr = pad(formatDuration(duration), 6)
   const tokenStr = tokenCount !== undefined ? `${DIM}in:${tokenCount}${R}` : ""
   const errorStr = errorMsg ? `${RED}${errorMsg}${R}` : ""
 
   const line = [
+    timeStr,
     prefix,
     methodStr,
     pathStr,
@@ -120,5 +121,6 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
   // Append optional trailing fields only when present (no trailing whitespace)
   const trailing = [tokenStr, errorStr].filter(Boolean).join(" ")
 
-  consola.log(trailing ? `${line} ${trailing}` : line)
+  // Use process.stdout directly to avoid consola adding its own timestamp
+  process.stdout.write(`${trailing ? `${line} ${trailing}` : line}\n`)
 }

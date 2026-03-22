@@ -137,7 +137,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     `🌐 Usage Viewer: https://ericc-ch.github.io/copilot-api?endpoint=${serverUrl}/usage`,
   )
 
-  serve({
+  const srvxServer = serve({
     fetch: server.fetch as ServerHandler,
     port: options.port,
     // Copilot responses can take several minutes for long generations;
@@ -145,6 +145,9 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     // srvx forwards the `bun` object directly to Bun.serve as extra options.
     bun: { idleTimeout: 0 },
   })
+
+  // Add visual separation after srvx prints its "Listening on:" line
+  void srvxServer.ready().then(() => console.log())
 }
 
 export const start = defineCommand({
