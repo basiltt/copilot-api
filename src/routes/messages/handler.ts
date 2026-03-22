@@ -26,6 +26,10 @@ import {
   type AnthropicStreamState,
 } from "./anthropic-types"
 import {
+  CompactionNeededError,
+  fetchWithImageStripping,
+} from "./image-stripping"
+import {
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
@@ -98,14 +102,32 @@ async function handleNonStreaming(
   let response: Awaited<ReturnType<typeof createChatCompletions>>
 
   try {
-    response = await fetchCopilotResponse(anthropicPayload)
+    response = await fetchWithImageStripping(
+      fetchCopilotResponse,
+      anthropicPayload,
+    )
   } catch (error) {
-    // Re-throw HTTPErrors so they bubble up to the route-level forwardError
-    // handler, which returns the raw Copilot error JSON with the original
-    // HTTP status code.  Returning an Anthropic-formatted error with type
-    // "invalid_request_error" causes Claude Code to auto-compact and retry
-    // in a loop when the prompt exceeds Copilot's token limit — each retry
-    // adds more context, making the prompt even larger.
+    // 413 cascade exhausted — all images stripped, still too large.
+    // Return invalid_request_error to trigger Claude Code auto-compaction.
+    // This is safe because images are already gone and compaction will
+    // reduce the text content, producing a convergently smaller request.
+    if (error instanceof CompactionNeededError) {
+      return c.json(
+        {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message:
+              "Request too large. Conversation context exceeds model limit.",
+          },
+        },
+        413,
+      )
+    }
+
+    // Re-throw non-413 HTTPErrors so they bubble up to the route-level
+    // forwardError handler, which returns the raw Copilot error JSON with
+    // the original HTTP status code.
     if (error instanceof HTTPError) throw error
 
     consola.error("Copilot connection error (fetch-level):", error)
