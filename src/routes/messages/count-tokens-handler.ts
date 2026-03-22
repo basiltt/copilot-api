@@ -5,8 +5,24 @@ import consola from "consola"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 
-import { type AnthropicMessagesPayload, isTypedTool } from "./anthropic-types"
+import {
+  type AnthropicMessagesPayload,
+  type AnthropicUserContentBlock,
+  isTypedTool,
+} from "./anthropic-types"
 import { translateToOpenAI } from "./non-stream-translation"
+
+// Base64 image data inflates the HTTP body far more than the tokenizer
+// reflects.  The tokenizer encodes the data URL as text tokens (~3-4
+// bytes per token), but Copilot's 413 limit is based on the raw HTTP
+// body size.  To make Claude Code compact before 413 fires, we add a
+// synthetic token overhead proportional to each image's base64 length.
+//
+// Empirical tuning: each base64 character contributes ~1 byte to the
+// JSON body.  We approximate 1 "virtual token" per 2 base64 characters.
+// This is intentionally aggressive — better to compact slightly early
+// than to hit 413 on every request and retry.
+const IMAGE_BYTES_PER_VIRTUAL_TOKEN = 2
 
 // Token overhead for Anthropic-typed tools (per Anthropic pricing docs).
 // Custom tools use the existing flat +346 for the entire tools array.
@@ -46,6 +62,53 @@ function applyToolTokenOverhead(
   }
 }
 
+/** Collect base64 data lengths from a content block array. */
+function collectImageDataLengths(
+  blocks: Array<AnthropicUserContentBlock>,
+): number {
+  let totalLength = 0
+  for (const block of blocks) {
+    if (block.type === "image") {
+      totalLength += block.source.data.length
+    }
+    if (block.type === "tool_result" && Array.isArray(block.content)) {
+      for (const nested of block.content) {
+        if (nested.type === "image") {
+          totalLength += nested.source.data.length
+        }
+      }
+    }
+  }
+  return totalLength
+}
+
+/**
+ * Estimates additional token overhead for base64 images in the payload.
+ *
+ * The tokenizer counts base64 data URLs as text tokens, but massively
+ * underestimates their contribution to HTTP body size (which is what
+ * triggers Copilot's 413 limit).  This function walks the Anthropic
+ * payload and adds virtual tokens proportional to the raw base64 data
+ * length, so Claude Code compacts the conversation before 413 fires.
+ */
+function estimateImageTokenOverhead(payload: AnthropicMessagesPayload): number {
+  let totalBase64Length = 0
+
+  for (const message of payload.messages) {
+    if (message.role !== "user") continue
+    if (typeof message.content === "string") continue
+    totalBase64Length += collectImageDataLengths(message.content)
+  }
+
+  if (totalBase64Length === 0) return 0
+
+  const overhead = Math.ceil(totalBase64Length / IMAGE_BYTES_PER_VIRTUAL_TOKEN)
+  consola.debug(
+    `Image token overhead: ${overhead} virtual tokens (${totalBase64Length} base64 chars across payload)`,
+  )
+  return overhead
+}
+
 /**
  * Handles token counting for Anthropic messages
  */
@@ -83,6 +146,10 @@ export async function handleCountTokens(c: Context) {
         applyToolTokenOverhead(tokenCount, anthropicPayload)
       }
     }
+
+    // Add virtual token overhead for base64 images so Claude Code
+    // compacts before the HTTP body exceeds Copilot's 413 size limit.
+    tokenCount.input += estimateImageTokenOverhead(anthropicPayload)
 
     let finalTokenCount = tokenCount.input + tokenCount.output
     if (anthropicPayload.model.startsWith("claude")) {
