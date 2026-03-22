@@ -1,3 +1,7 @@
+import consola from "consola"
+
+import { HTTPError } from "~/lib/error"
+
 import type { AnthropicMessagesPayload } from "./anthropic-types"
 
 /**
@@ -35,7 +39,7 @@ function collectToolResultImages(
  * Returns the cloned (possibly mutated) payload and the count of images
  * actually replaced.
  */
-export function stripImages(
+function stripImages(
   payload: AnthropicMessagesPayload,
   keepLast: boolean,
 ): { payload: AnthropicMessagesPayload; strippedCount: number } {
@@ -84,4 +88,63 @@ export function stripImages(
   }
 
   return { payload: cloned, strippedCount: toStrip.length }
+}
+
+/**
+ * Wraps a Copilot fetch function with progressive 413 retry logic.
+ *
+ * Cascade:
+ *   1. Try original request
+ *   2. On 413 with 2+ images: strip older images, keep last, retry
+ *   3. On 413: strip ALL images, retry
+ *   4. On 413 with no images left: throw CompactionNeededError
+ *
+ * Non-413 HTTPErrors and non-HTTP errors propagate immediately.
+ */
+export async function fetchWithImageStripping<T>(
+  fetchFn: (payload: AnthropicMessagesPayload) => Promise<T>,
+  anthropicPayload: AnthropicMessagesPayload,
+): Promise<T> {
+  // Stage 1: Try original request
+  try {
+    return await fetchFn(anthropicPayload)
+  } catch (error) {
+    if (!is413(error)) throw error
+  }
+
+  // Stage 2: Strip older images, keep most recent
+  const stage2 = stripImages(anthropicPayload, true)
+  if (stage2.strippedCount > 0) {
+    consola.warn(
+      `Request too large (413), retrying with older images stripped (keeping last image). Removed ${stage2.strippedCount} image(s).`,
+    )
+    try {
+      return await fetchFn(stage2.payload)
+    } catch (error) {
+      if (!is413(error)) throw error
+    }
+  }
+
+  // Stage 3: Strip ALL images (always from original payload)
+  const stage3 = stripImages(anthropicPayload, false)
+  if (stage3.strippedCount > 0) {
+    consola.warn(
+      `Still too large (413), retrying with all images stripped. Removed ${stage3.strippedCount} image(s).`,
+    )
+    try {
+      return await fetchFn(stage3.payload)
+    } catch (error) {
+      if (!is413(error)) throw error
+    }
+  }
+
+  // Stage 4: No images left, request is still too large — trigger compaction
+  consola.warn(
+    "Still too large (413) even without images, triggering auto-compaction",
+  )
+  throw new CompactionNeededError()
+}
+
+function is413(error: unknown): boolean {
+  return error instanceof HTTPError && error.response.status === 413
 }
