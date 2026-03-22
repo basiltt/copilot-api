@@ -2,7 +2,12 @@ import consola from "consola"
 
 import { HTTPError } from "~/lib/error"
 
-import type { AnthropicMessagesPayload } from "./anthropic-types"
+import type {
+  AnthropicDocumentBlock,
+  AnthropicImageBlock,
+  AnthropicMessagesPayload,
+  AnthropicTextBlock,
+} from "./anthropic-types"
 
 /**
  * Thrown when the 413 retry cascade is exhausted (all images stripped,
@@ -17,16 +22,27 @@ export class CompactionNeededError extends Error {
 }
 
 /** Reference to a single image block within its parent array. */
-type ImageRef = { parent: Array<unknown>; index: number }
+type ImageRef = {
+  parent: Array<unknown>
+  index: number
+  base64Length: number
+}
 
 /** Collects image refs from a tool_result's nested content array. */
 function collectToolResultImages(
-  content: Array<{ type: string }>,
+  content: Array<
+    AnthropicTextBlock | AnthropicImageBlock | AnthropicDocumentBlock
+  >,
   refs: Array<ImageRef>,
 ): void {
   for (let j = 0; j < content.length; j++) {
-    if (content[j].type === "image") {
-      refs.push({ parent: content as Array<unknown>, index: j })
+    const nested = content[j]
+    if (nested.type === "image") {
+      refs.push({
+        parent: content as Array<unknown>,
+        index: j,
+        base64Length: nested.source.data.length,
+      })
     }
   }
 }
@@ -36,13 +52,17 @@ function collectToolResultImages(
  * placeholders. When `keepLast` is true and 2+ images exist, the last
  * image (most recent in conversation order) is preserved.
  *
- * Returns the cloned (possibly mutated) payload and the count of images
- * actually replaced.
+ * Returns the cloned (possibly mutated) payload, the count of images
+ * actually replaced, and the total base64 character count removed.
  */
 function stripImages(
   payload: AnthropicMessagesPayload,
   keepLast: boolean,
-): { payload: AnthropicMessagesPayload; strippedCount: number } {
+): {
+  payload: AnthropicMessagesPayload
+  strippedCount: number
+  strippedBase64Chars: number
+} {
   // Deep-clone to avoid mutating the original
   const cloned = structuredClone(payload)
 
@@ -64,6 +84,7 @@ function stripImages(
         imageRefs.push({
           parent: message.content as Array<unknown>,
           index: i,
+          base64Length: block.source.data.length,
         })
       }
 
@@ -83,11 +104,20 @@ function stripImages(
     text: "[Image removed to reduce request size]",
   }
 
+  let strippedBase64Chars = 0
   for (const ref of toStrip) {
+    strippedBase64Chars += ref.base64Length
     ref.parent[ref.index] = placeholder
   }
 
-  return { payload: cloned, strippedCount: toStrip.length }
+  return { payload: cloned, strippedCount: toStrip.length, strippedBase64Chars }
+}
+
+/** Result of fetchWithImageStripping, includes stripped image metadata. */
+export interface ImageStrippingResult<T> {
+  response: T
+  /** Total base64 characters removed from the payload before sending. */
+  strippedBase64Chars: number
 }
 
 /**
@@ -99,6 +129,9 @@ function stripImages(
  * avoid a wasted 413 round-trip.  If a 413 still occurs, the cascade
  * continues by stripping all images, then triggering compaction.
  *
+ * Returns the response along with metadata about how many base64
+ * characters were stripped, so the caller can inflate usage tokens.
+ *
  * Cascade:
  *   1. Proactively strip older images if 2+ exist, then send
  *   2. On 413: strip ALL images, retry
@@ -109,13 +142,14 @@ function stripImages(
 export async function fetchWithImageStripping<T>(
   fetchFn: (payload: AnthropicMessagesPayload) => Promise<T>,
   anthropicPayload: AnthropicMessagesPayload,
-): Promise<T> {
+): Promise<ImageStrippingResult<T>> {
   // Proactive strip: if 2+ images exist, strip older ones before sending.
   // This avoids a guaranteed 413 round-trip when the conversation has
   // accumulated many screenshots over time.
   const preStrip = stripImages(anthropicPayload, true)
   const effectivePayload =
     preStrip.strippedCount > 0 ? preStrip.payload : anthropicPayload
+  let totalStrippedChars = preStrip.strippedBase64Chars
 
   if (preStrip.strippedCount > 0) {
     consola.info(
@@ -125,19 +159,22 @@ export async function fetchWithImageStripping<T>(
 
   // Stage 1: Try with (possibly pre-stripped) payload
   try {
-    return await fetchFn(effectivePayload)
+    const response = await fetchFn(effectivePayload)
+    return { response, strippedBase64Chars: totalStrippedChars }
   } catch (error) {
     if (!is413(error)) throw error
   }
 
   // Stage 2: Strip ALL images (from original payload)
   const stage2 = stripImages(anthropicPayload, false)
+  totalStrippedChars = stage2.strippedBase64Chars
   if (stage2.strippedCount > 0) {
     consola.warn(
       `Request too large (413), retrying with all images stripped. Removed ${stage2.strippedCount} image(s).`,
     )
     try {
-      return await fetchFn(stage2.payload)
+      const response = await fetchFn(stage2.payload)
+      return { response, strippedBase64Chars: totalStrippedChars }
     } catch (error) {
       if (!is413(error)) throw error
     }

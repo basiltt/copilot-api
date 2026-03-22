@@ -23,11 +23,13 @@ import {
 
 import {
   type AnthropicMessagesPayload,
+  type AnthropicStreamEventData,
   type AnthropicStreamState,
 } from "./anthropic-types"
 import {
   CompactionNeededError,
   fetchWithImageStripping,
+  type ImageStrippingResult,
 } from "./image-stripping"
 import {
   translateToAnthropic,
@@ -95,14 +97,49 @@ export async function handleCompletion(c: Context) {
   return streamSSE(c, (stream) => handleStreaming(stream, anthropicPayload))
 }
 
+/**
+ * Estimates the token cost of stripped base64 image data.
+ * Used to inflate response `input_tokens` so Claude Code sees the true
+ * context size and triggers compaction when images accumulate.
+ *
+ * Rough heuristic: base64 encodes ~3/4 bytes per character, and typical
+ * tokenizers produce ~1 token per 3-4 base64 characters.  We use 1 token
+ * per 2 characters (intentionally aggressive) to ensure compaction fires.
+ */
+function estimateTokensForBase64Chars(base64Chars: number): number {
+  return Math.ceil(base64Chars / 2)
+}
+
+/**
+ * Inflates `input_tokens` in `message_start` and `message_delta` SSE events
+ * to account for base64 images that were stripped before sending to Copilot.
+ * Mutates the event in-place.
+ */
+function inflateEventInputTokens(
+  event: AnthropicStreamEventData,
+  overhead: number,
+): void {
+  if (event.type === "message_start") {
+    event.message.usage.input_tokens += overhead
+  }
+  if (
+    event.type === "message_delta"
+    && event.usage?.input_tokens !== undefined
+  ) {
+    event.usage.input_tokens += overhead
+  }
+}
+
 async function handleNonStreaming(
   c: Context,
   anthropicPayload: AnthropicMessagesPayload,
 ) {
-  let response: Awaited<ReturnType<typeof createChatCompletions>>
+  let result: ImageStrippingResult<
+    Awaited<ReturnType<typeof createChatCompletions>>
+  >
 
   try {
-    response = await fetchWithImageStripping(
+    result = await fetchWithImageStripping(
       fetchCopilotResponse,
       anthropicPayload,
     )
@@ -146,7 +183,7 @@ async function handleNonStreaming(
     )
   }
 
-  if (!isNonStreaming(response)) {
+  if (!isNonStreaming(result.response)) {
     // Payload said non-streaming but Copilot returned a stream — treat as error.
     consola.error("Expected non-streaming response but got stream")
     return c.json(
@@ -160,9 +197,21 @@ async function handleNonStreaming(
 
   consola.debug(
     "Non-streaming response from Copilot:",
-    JSON.stringify(response).slice(-400),
+    JSON.stringify(result.response).slice(-400),
   )
-  const anthropicResponse = translateToAnthropic(response)
+  const anthropicResponse = translateToAnthropic(result.response)
+
+  // Inflate input_tokens to account for images stripped before sending.
+  // Copilot reports prompt_tokens based on the smaller (stripped) payload,
+  // but Claude Code uses this value to track context usage and decide when
+  // to compact.  Without inflation, it never sees the true cost of images
+  // in the conversation and never compacts.
+  if (result.strippedBase64Chars > 0) {
+    anthropicResponse.usage.input_tokens += estimateTokensForBase64Chars(
+      result.strippedBase64Chars,
+    )
+  }
+
   consola.debug(
     "Translated Anthropic response:",
     JSON.stringify(anthropicResponse),
@@ -191,14 +240,14 @@ async function handleStreaming(
   )
 
   try {
-    let copilotResponse:
-      | Awaited<ReturnType<typeof fetchCopilotResponse>>
+    let strippingResult:
+      | ImageStrippingResult<Awaited<ReturnType<typeof fetchCopilotResponse>>>
       | undefined
     let lastError: unknown
 
     for (let attempt = 1; attempt <= MAX_FETCH_RETRIES; attempt++) {
       try {
-        copilotResponse = await fetchWithImageStripping(
+        strippingResult = await fetchWithImageStripping(
           fetchCopilotResponse,
           anthropicPayload,
         )
@@ -215,10 +264,13 @@ async function handleStreaming(
       }
     }
 
-    if (!copilotResponse) throw lastError
+    if (!strippingResult) throw lastError
 
     clearInterval(pingTimer)
     pingTimer = undefined
+
+    const { response: copilotResponse, strippedBase64Chars } = strippingResult
+    const imageTokenOverhead = estimateTokensForBase64Chars(strippedBase64Chars)
 
     if (isNonStreaming(copilotResponse)) {
       // Shouldn't happen for a streaming payload, but handle gracefully by
@@ -229,12 +281,15 @@ async function handleStreaming(
         "Non-streaming response from Copilot (unexpected for streaming request):",
         JSON.stringify(copilotResponse).slice(-400),
       )
-      await emitNonStreamingAsSSE(stream, copilotResponse)
+      await emitNonStreamingAsSSE(stream, copilotResponse, imageTokenOverhead)
       return
     }
 
     const thinkingEnabled = anthropicPayload.thinking?.type === "enabled"
-    await pipeStreamToClient(stream, copilotResponse, thinkingEnabled)
+    await pipeStreamToClient(stream, copilotResponse, {
+      thinkingEnabled,
+      imageTokenOverhead,
+    })
   } catch (error) {
     clearInterval(pingTimer)
     pingTimer = undefined
@@ -317,8 +372,9 @@ async function fetchCopilotResponse(
 async function pipeStreamToClient(
   stream: SSEStreamingApi,
   response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
-  thinkingEnabled: boolean,
+  options: { thinkingEnabled: boolean; imageTokenOverhead?: number },
 ): Promise<void> {
+  const { thinkingEnabled, imageTokenOverhead = 0 } = options
   const streamState: AnthropicStreamState = {
     messageStartSent: false,
     contentBlockIndex: 0,
@@ -353,6 +409,10 @@ async function pipeStreamToClient(
       const events = translateChunkToAnthropicEvents(chunk, streamState)
 
       for (const event of events) {
+        // Inflate input_tokens to account for images stripped before sending.
+        if (imageTokenOverhead > 0) {
+          inflateEventInputTokens(event, imageTokenOverhead)
+        }
         consola.debug("Translated Anthropic event:", JSON.stringify(event))
         await stream.writeSSE({
           event: event.type,
@@ -464,6 +524,7 @@ async function extractStreamingErrorDetails(error: unknown): Promise<{
 async function emitNonStreamingAsSSE(
   stream: SSEStreamingApi,
   response: ChatCompletionResponse,
+  imageTokenOverhead: number = 0,
 ): Promise<void> {
   const anthropicResponse = translateToAnthropic(response)
 
@@ -481,7 +542,8 @@ async function emitNonStreamingAsSSE(
         stop_reason: null,
         stop_sequence: null,
         usage: {
-          input_tokens: anthropicResponse.usage.input_tokens,
+          input_tokens:
+            anthropicResponse.usage.input_tokens + imageTokenOverhead,
           output_tokens: 0,
           ...(anthropicResponse.usage.cache_read_input_tokens !== undefined && {
             cache_read_input_tokens:
