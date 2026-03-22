@@ -91,13 +91,18 @@ function stripImages(
 }
 
 /**
- * Wraps a Copilot fetch function with progressive 413 retry logic.
+ * Wraps a Copilot fetch function with proactive image stripping and
+ * progressive 413 retry logic.
+ *
+ * When the payload contains 2+ base64 images, older images are stripped
+ * proactively (keeping the most recent) BEFORE the first request to
+ * avoid a wasted 413 round-trip.  If a 413 still occurs, the cascade
+ * continues by stripping all images, then triggering compaction.
  *
  * Cascade:
- *   1. Try original request
- *   2. On 413 with 2+ images: strip older images, keep last, retry
- *   3. On 413: strip ALL images, retry
- *   4. On 413 with no images left: throw CompactionNeededError
+ *   1. Proactively strip older images if 2+ exist, then send
+ *   2. On 413: strip ALL images, retry
+ *   3. On 413 with no images left: throw CompactionNeededError
  *
  * Non-413 HTTPErrors and non-HTTP errors propagate immediately.
  */
@@ -105,18 +110,31 @@ export async function fetchWithImageStripping<T>(
   fetchFn: (payload: AnthropicMessagesPayload) => Promise<T>,
   anthropicPayload: AnthropicMessagesPayload,
 ): Promise<T> {
-  // Stage 1: Try original request
+  // Proactive strip: if 2+ images exist, strip older ones before sending.
+  // This avoids a guaranteed 413 round-trip when the conversation has
+  // accumulated many screenshots over time.
+  const preStrip = stripImages(anthropicPayload, true)
+  const effectivePayload =
+    preStrip.strippedCount > 0 ? preStrip.payload : anthropicPayload
+
+  if (preStrip.strippedCount > 0) {
+    consola.info(
+      `Proactively stripped ${preStrip.strippedCount} older image(s) (keeping last) to avoid 413.`,
+    )
+  }
+
+  // Stage 1: Try with (possibly pre-stripped) payload
   try {
-    return await fetchFn(anthropicPayload)
+    return await fetchFn(effectivePayload)
   } catch (error) {
     if (!is413(error)) throw error
   }
 
-  // Stage 2: Strip older images, keep most recent
-  const stage2 = stripImages(anthropicPayload, true)
+  // Stage 2: Strip ALL images (from original payload)
+  const stage2 = stripImages(anthropicPayload, false)
   if (stage2.strippedCount > 0) {
     consola.warn(
-      `Request too large (413), retrying with older images stripped (keeping last image). Removed ${stage2.strippedCount} image(s).`,
+      `Request too large (413), retrying with all images stripped. Removed ${stage2.strippedCount} image(s).`,
     )
     try {
       return await fetchFn(stage2.payload)
@@ -125,20 +143,7 @@ export async function fetchWithImageStripping<T>(
     }
   }
 
-  // Stage 3: Strip ALL images (always from original payload)
-  const stage3 = stripImages(anthropicPayload, false)
-  if (stage3.strippedCount > 0) {
-    consola.warn(
-      `Still too large (413), retrying with all images stripped. Removed ${stage3.strippedCount} image(s).`,
-    )
-    try {
-      return await fetchFn(stage3.payload)
-    } catch (error) {
-      if (!is413(error)) throw error
-    }
-  }
-
-  // Stage 4: No images left, request is still too large — trigger compaction
+  // Stage 3: No images left, request is still too large — trigger compaction
   consola.warn(
     "Still too large (413) even without images, triggering auto-compaction",
   )
