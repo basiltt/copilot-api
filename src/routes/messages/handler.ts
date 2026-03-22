@@ -198,7 +198,10 @@ async function handleStreaming(
 
     for (let attempt = 1; attempt <= MAX_FETCH_RETRIES; attempt++) {
       try {
-        copilotResponse = await fetchCopilotResponse(anthropicPayload)
+        copilotResponse = await fetchWithImageStripping(
+          fetchCopilotResponse,
+          anthropicPayload,
+        )
         break
       } catch (error) {
         lastError = error
@@ -235,6 +238,20 @@ async function handleStreaming(
   } catch (error) {
     clearInterval(pingTimer)
     pingTimer = undefined
+
+    // 413 cascade exhausted — all images stripped, still too large.
+    // Emit invalid_request_error to trigger Claude Code auto-compaction.
+    if (error instanceof CompactionNeededError) {
+      const errorEvent = translateErrorToAnthropicErrorEvent(
+        "Request too large. Conversation context exceeds model limit.",
+        "invalid_request_error",
+      )
+      await stream.writeSSE({
+        event: errorEvent.type,
+        data: JSON.stringify(errorEvent),
+      })
+      return
+    }
 
     if (error instanceof HTTPError) {
       consola.error("Copilot HTTP error during streaming fetch:", error)
