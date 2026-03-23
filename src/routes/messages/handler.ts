@@ -30,6 +30,7 @@ import {
   CompactionNeededError,
   fetchWithImageStripping,
   type ImageStrippingResult,
+  updateImageFlag,
 } from "./image-stripping"
 import {
   translateToAnthropic,
@@ -71,6 +72,11 @@ export async function handleCompletion(c: Context) {
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
+
+  // Check if compaction has removed images from the conversation.
+  // This clears the imagesWereStripped flag so count_tokens stops
+  // returning the inflated 200K value.
+  updateImageFlag(anthropicPayload)
 
   if (state.manualApprove) {
     await awaitApproval()

@@ -23,14 +23,39 @@ export class CompactionNeededError extends Error {
 
 /**
  * Set to true when images have been proactively stripped from a request.
- * Consumed (and reset) by `count_tokens` to force compaction when images
- * are accumulating in the conversation.
+ * Stays true until a `/v1/messages` request arrives with zero images,
+ * meaning compaction has removed them from the conversation.  While true,
+ * `count_tokens` returns 200K to keep triggering compaction.
  */
 export let imagesWereStripped = false
 
-/** Resets the stripped-images flag after count_tokens has consumed it. */
-export function resetImagesStrippedFlag(): void {
-  imagesWereStripped = false
+/**
+ * Called by the messages handler at the start of every `/v1/messages`
+ * request.  If the incoming payload has no base64 images, compaction
+ * has succeeded and the flag is cleared so `count_tokens` stops
+ * returning the inflated 200K value.
+ */
+export function updateImageFlag(payload: AnthropicMessagesPayload): void {
+  if (!imagesWereStripped) return
+
+  const hasImages = payload.messages.some((msg) => {
+    if (msg.role !== "user") return false
+    if (typeof msg.content === "string") return false
+    return msg.content.some((block) => {
+      if (block.type === "image") return true
+      if (block.type === "tool_result" && Array.isArray(block.content)) {
+        return block.content.some((nested) => nested.type === "image")
+      }
+      return false
+    })
+  })
+
+  if (!hasImages) {
+    consola.info(
+      "No images in conversation — compaction succeeded, clearing image flag.",
+    )
+    imagesWereStripped = false
+  }
 }
 
 /** Reference to a single image block within its parent array. */
