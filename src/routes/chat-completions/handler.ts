@@ -85,6 +85,9 @@ export async function handleCompletion(c: Context) {
   return streamSSE(c, async (stream) => {
     for await (const chunk of response) {
       consola.debug("Streaming chunk:", JSON.stringify(chunk))
+      // Stop iterating once we see [DONE] — don't wait for the upstream HTTP
+      // connection to close, which can hang if the Copilot API keeps it open.
+      if (chunk.data === "[DONE]") break
       await stream.writeSSE(chunk as SSEMessage)
     }
   })

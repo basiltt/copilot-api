@@ -37,6 +37,7 @@ import {
   translateToOpenAI,
 } from "./non-stream-translation"
 import {
+  findTruncatedToolCalls,
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
 } from "./stream-translation"
@@ -46,10 +47,22 @@ import {
 } from "./web-search-detection"
 
 // Interval at which SSE ping events are sent to keep the downstream
-// connection alive while waiting for Copilot to start responding.
-// Must be shorter than the network's TCP idle timeout (~5 min on enterprise
-// firewalls). 20 seconds gives comfortable headroom.
-const PING_INTERVAL_MS = 20_000
+// connection alive while waiting for Copilot to start responding or
+// between chunks during slow generation (e.g. large file writes).
+// Must be shorter than both the network's TCP idle timeout (~5 min on
+// enterprise firewalls) and Claude Code's stream inactivity detector
+// (~45s).  10 seconds gives comfortable headroom for both.
+const PING_INTERVAL_MS = 10_000
+
+// Maximum time to wait for the next upstream chunk inside pipeStreamToClient
+// before assuming the stream is stalled.  When the Copilot API finishes
+// streaming a large tool call (e.g. 6000+ line Write), it sometimes never
+// sends the chunk containing `finish_reason` — the HTTP body remains open
+// and `reader.read()` blocks indefinitely.  Claude Code's own stream
+// inactivity detector fires at ~45s, so we break out at 30s to leave time
+// for synthesizing the missing termination events (message_delta +
+// message_stop) before Claude Code times out.
+const STREAM_STALL_TIMEOUT_MS = 30_000
 
 // Maximum number of times to retry a timed-out upstream fetch before giving up.
 // Each attempt gets a fresh TCP connection, resetting the firewall idle timer.
@@ -345,6 +358,35 @@ async function handleStreaming(
   }
 }
 
+/**
+ * Clamps `max_tokens` on the OpenAI payload to the model's actual
+ * `max_output_tokens` limit.  This prevents the upstream API from
+ * truncating the response mid-tool-call when the client (e.g. Claude Code)
+ * requests more output tokens than the model supports.
+ *
+ * When no `selectedModel` is provided, the function looks up the model
+ * from `state.models` by `payload.model`.  Mutates the payload in-place.
+ */
+function clampMaxTokens(
+  payload: import("~/services/copilot/create-chat-completions").ChatCompletionsPayload,
+  selectedModel?: import("~/services/copilot/get-models").Model,
+): void {
+  const model =
+    selectedModel ?? state.models?.data.find((m) => m.id === payload.model)
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
+  const modelMaxOutput = model?.capabilities?.limits?.max_output_tokens
+  if (
+    modelMaxOutput
+    && payload.max_tokens
+    && payload.max_tokens > modelMaxOutput
+  ) {
+    consola.debug(
+      `Clamping max_tokens from ${payload.max_tokens} to model limit ${modelMaxOutput}`,
+    )
+    payload.max_tokens = modelMaxOutput
+  }
+}
+
 async function fetchCopilotResponse(
   anthropicPayload: AnthropicMessagesPayload,
 ): ReturnType<typeof createChatCompletions> {
@@ -353,6 +395,7 @@ async function fetchCopilotResponse(
     const openAIPayload = prepareWebSearchPayload(
       translateToOpenAI(cleanedPayload),
     )
+    clampMaxTokens(openAIPayload)
     consola.debug(
       "Translated OpenAI request payload (web search):",
       JSON.stringify(openAIPayload),
@@ -369,6 +412,7 @@ async function fetchCopilotResponse(
   const selectedModel = state.models?.data.find(
     (m) => m.id === openAIPayload.model,
   )
+  clampMaxTokens(openAIPayload, selectedModel)
   consola.debug(
     `[routing] model=${openAIPayload.model} found=${selectedModel !== undefined} requiresResponses=${selectedModel !== undefined && requiresResponsesApi(selectedModel)} endpoints=${JSON.stringify(selectedModel?.supported_endpoints)}`,
   )
@@ -413,9 +457,18 @@ async function pipeStreamToClient(
   let chunkTimer: ReturnType<typeof setTimeout> | undefined = schedulePing()
 
   try {
-    for await (const rawEvent of response) {
+    // Instead of `for await (const rawEvent of response)` which blocks
+    // indefinitely when the upstream never closes, we manually iterate with
+    // a stall timeout.  This lets us break out and synthesize proper
+    // termination events when the Copilot API hangs after a large tool call.
+    for (;;) {
       clearTimeout(chunkTimer)
       chunkTimer = schedulePing()
+
+      const rawEvent = await nextWithTimeout(response, streamState)
+
+      // Timeout or natural end of stream
+      if (rawEvent === undefined) break
 
       consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
       if (rawEvent.data === "[DONE]") break
@@ -435,6 +488,11 @@ async function pipeStreamToClient(
           data: JSON.stringify(event),
         })
       }
+
+      // Once message_stop has been sent, all content is delivered to the client.
+      // Break immediately instead of waiting for [DONE] — the upstream Copilot
+      // API may keep the HTTP connection open after the last content chunk.
+      if (streamState.messageStopSent) break
     }
 
     await handleIncompleteStream(stream, streamState)
@@ -466,6 +524,52 @@ async function pipeStreamToClient(
 }
 
 /**
+ * Pulls the next value from an async iterator with a stall timeout.
+ *
+ * Returns the next yielded value, or `undefined` if either:
+ * - The iterator is done (natural end of stream), OR
+ * - The iterator has been stalled for STREAM_STALL_TIMEOUT_MS while the
+ *   stream has already started (messageStartSent === true).
+ *
+ * The stall timeout is the key fix for the Write tool hang: when the Copilot
+ * API finishes streaming a large tool call but never sends `finish_reason`,
+ * `response.next()` blocks forever on `reader.read()`.  Racing it against a
+ * 30-second timeout lets us break out and synthesize the missing termination
+ * events (via handleIncompleteStream) before Claude Code's ~45s inactivity
+ * detector fires.
+ */
+async function nextWithTimeout(
+  iter: AsyncGenerator<ServerSentEventMessage, void, unknown>,
+  streamState: AnthropicStreamState,
+): Promise<ServerSentEventMessage | undefined> {
+  // Before the stream has started we don't apply a stall timeout —
+  // the initial response from Copilot can take a long time (model
+  // thinking) and is covered by the ping keepalive + upstream inactivity
+  // abort instead.
+  if (!streamState.messageStartSent) {
+    const result = await iter.next()
+    return result.done ? undefined : result.value
+  }
+
+  // Race the next chunk against a stall timeout.
+  const stallTimeout = new Promise<"timeout">((resolve) =>
+    setTimeout(() => resolve("timeout"), STREAM_STALL_TIMEOUT_MS),
+  )
+
+  const result = await Promise.race([iter.next(), stallTimeout])
+
+  if (result === "timeout") {
+    consola.debug(
+      `Upstream stream stalled for ${STREAM_STALL_TIMEOUT_MS / 1000}s after `
+        + `message_start — synthesizing termination events`,
+    )
+    return undefined
+  }
+
+  return result.done ? undefined : result.value
+}
+
+/**
  * Handles the case where the upstream stream ended without a proper Anthropic
  * termination sequence (message_delta + message_stop).
  *
@@ -480,7 +584,7 @@ async function handleIncompleteStream(
 ): Promise<void> {
   if (!state.messageStartSent) {
     // No usable chunks arrived at all.
-    consola.warn(
+    consola.debug(
       "Copilot stream ended without producing any content — emitting error event",
     )
     const errorEvent = translateErrorToAnthropicErrorEvent(
@@ -503,7 +607,7 @@ async function handleIncompleteStream(
   // emitting content or tool-call chunks.  Without a proper termination
   // sequence Claude Code sees the SSE connection close with no indication
   // of completion and treats the turn as abandoned / silently dead.
-  consola.warn(
+  consola.debug(
     "Copilot stream ended without finish_reason — synthesizing message_delta/message_stop",
   )
 
@@ -517,11 +621,55 @@ async function handleIncompleteStream(
     })
   }
 
-  // Determine the correct stop_reason: if tool calls were emitted
-  // during the stream, the model intended "tool_use"; otherwise
-  // default to "end_turn".
+  // Check if any tool calls have truncated (invalid) JSON arguments.
+  // This happens when the output token limit was hit mid-tool-call — the
+  // accumulated argument fragments don't form valid JSON.  In this case,
+  // emit an explanatory text block and use "end_turn" instead of "tool_use"
+  // so Claude Code reads the feedback instead of executing a broken tool.
   const hasToolCalls = Object.keys(state.toolCalls).length > 0
-  const stopReason = hasToolCalls ? "tool_use" : "end_turn"
+  const truncated = hasToolCalls ? findTruncatedToolCalls(state) : []
+
+  if (truncated.length > 0) {
+    const toolName = truncated[0].name
+    consola.debug(
+      `Truncated tool call "${toolName}" detected during stream recovery`,
+    )
+    const nextIndex = state.contentBlockIndex + 1
+    await stream.writeSSE({
+      event: "content_block_start",
+      data: JSON.stringify({
+        type: "content_block_start",
+        index: nextIndex,
+        content_block: { type: "text", text: "" },
+      }),
+    })
+    await stream.writeSSE({
+      event: "content_block_delta",
+      data: JSON.stringify({
+        type: "content_block_delta",
+        index: nextIndex,
+        delta: {
+          type: "text_delta",
+          text:
+            `[Output truncated: the model's response was cut off while generating`
+            + ` tool call "${toolName}". The output exceeded the token limit.`
+            + ` Please retry with a smaller output, e.g. write the file in smaller chunks.]`,
+        },
+      }),
+    })
+    await stream.writeSSE({
+      event: "content_block_stop",
+      data: JSON.stringify({ type: "content_block_stop", index: nextIndex }),
+    })
+  }
+
+  // Use "end_turn" when tool calls are truncated to prevent Claude Code
+  // from trying to execute broken tool calls.  Use "tool_use" only when
+  // tool calls have valid (non-truncated) JSON arguments.
+  let stopReason: string = "end_turn"
+  if (hasToolCalls && truncated.length === 0) {
+    stopReason = "tool_use"
+  }
 
   await stream.writeSSE({
     event: "message_delta",

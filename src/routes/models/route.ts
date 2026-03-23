@@ -21,6 +21,8 @@ modelRoutes.get("/", async (c) => {
       created_at: new Date(0).toISOString(), // No date available from source
       owned_by: model.vendor,
       display_name: model.name,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
+      max_output_tokens: model.capabilities?.limits?.max_output_tokens,
     }))
 
     return c.json({

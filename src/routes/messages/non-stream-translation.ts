@@ -1,3 +1,5 @@
+import consola from "consola"
+
 import {
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
@@ -394,6 +396,53 @@ export function translateToAnthropic(
     allToolUseBlocks.length > 0 && stopReason === "stop" ?
       "tool_calls"
     : stopReason
+
+  // Guard: detect truncated tool calls when finish_reason is "length".
+  // When the output hits the token limit mid-tool-call, the JSON arguments are
+  // incomplete.  safeParseJson silently returns {} for these, which would cause
+  // Claude Code to execute a tool with empty/wrong input.  Instead, replace the
+  // broken tool use blocks with an explanatory text block and return "end_turn"
+  // so Claude Code reads the feedback and adjusts its strategy.
+  if (correctedStopReason === "length" && allToolUseBlocks.length > 0) {
+    const hasTruncated = response.choices.some((choice) =>
+      choice.message.tool_calls?.some((tc) => {
+        if (!tc.function.arguments) return false
+        try {
+          JSON.parse(tc.function.arguments)
+          return false
+        } catch {
+          return true
+        }
+      }),
+    )
+
+    if (hasTruncated) {
+      const toolName = allToolUseBlocks[0].name
+      consola.debug(
+        `[non-stream] Truncated tool call detected for "${toolName}" — `
+          + `replacing with explanatory text`,
+      )
+      return {
+        id: toAnthropicMessageId(response.id),
+        type: "message",
+        role: "assistant",
+        model: response.model,
+        content: [
+          ...allTextBlocks,
+          {
+            type: "text",
+            text:
+              `[Output truncated: the response exceeded the maximum output token limit`
+              + ` while generating tool call "${toolName}".`
+              + ` Please retry with a smaller output, e.g. write the file in smaller chunks.]`,
+          },
+        ],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: buildAnthropicUsage(response.usage),
+      }
+    }
+  }
 
   return {
     id: toAnthropicMessageId(response.id),

@@ -19,7 +19,11 @@
       "Bash(powershell -Command \"nssm stop CopilotProxy 2>&1\")",
       "Bash(powershell -Command \"Start-Process -FilePath ''nssm'' -ArgumentList ''set CopilotProxy Application C:\\\\Users\\\\ttbasil\\\\Desktop\\\\Projects\\\\PublicProjects\\\\copilot-api\\\\start-service.bat'' -Verb RunAs -Wait -WindowStyle Hidden 2>&1\")",
       "Bash(powershell -Command \"Start-Process -FilePath ''nssm'' -ArgumentList ''get CopilotProxy Application'' -Verb RunAs -Wait -RedirectStandardOutput ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_check.txt'' -WindowStyle Hidden; Get-Content ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_check.txt''\")",
-      "Bash(powershell -Command \"if \\(Test-Path ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_output.txt''\\) { Get-Content ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_output.txt'' } else { ''Output file not created'' }\")"
+      "Bash(powershell -Command \"if \\(Test-Path ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_output.txt''\\) { Get-Content ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_output.txt'' } else { ''Output file not created'' }\")",
+      "Bash(npx eslint:*)",
+      "Bash(curl -s http://localhost:4141/v1/models)",
+      "Bash(python -m json.tool)",
+      "Bash(powershell -Command \"Remove-Item -Recurse -Force ''c:\\\\Users\\\\ttbasil\\\\Desktop\\\\Projects\\\\PublicProjects\\\\copilot-api\\\\test-output''\")"
     ]
   }
 }

@@ -194,6 +194,7 @@ export function translateChunkToAnthropicEvents(
           id: toolCall.id,
           name: toolCall.function.name,
           anthropicBlockIndex,
+          accumulatedArgs: "",
         }
 
         events.push({
@@ -214,6 +215,7 @@ export function translateChunkToAnthropicEvents(
         // Tool call can still be empty
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
         if (toolCallInfo) {
+          toolCallInfo.accumulatedArgs += toolCall.function.arguments
           events.push({
             type: "content_block_delta",
             index: toolCallInfo.anthropicBlockIndex,
@@ -228,6 +230,19 @@ export function translateChunkToAnthropicEvents(
   }
 
   if (choice.finish_reason) {
+    // Detect truncated tool calls: when finish_reason is "length" and tool
+    // calls have incomplete JSON arguments, the output hit the token limit
+    // mid-tool-call.  Instead of passing broken JSON to Claude Code (which
+    // would cause it to execute a tool with invalid input), emit an
+    // explanatory text block and use "end_turn" so Claude Code adjusts its
+    // strategy (e.g., writing files in smaller chunks).
+    if (choice.finish_reason === "length") {
+      const truncated = findTruncatedToolCalls(state)
+      if (truncated.length > 0) {
+        return emitTruncationGuardEvents(state, chunk, { events, truncated })
+      }
+    }
+
     if (state.contentBlockOpen) {
       events.push({
         type: "content_block_stop",
@@ -273,6 +288,87 @@ export function translateChunkToAnthropicEvents(
     state.messageStopSent = true
   }
 
+  return events
+}
+
+/**
+ * Returns tool calls whose accumulated JSON arguments are invalid (truncated).
+ * Empty accumulatedArgs are considered valid (no arguments to parse).
+ */
+export function findTruncatedToolCalls(
+  state: AnthropicStreamState,
+): Array<{ id: string; name: string; accumulatedArgs: string }> {
+  return Object.values(state.toolCalls).filter((tc) => {
+    if (!tc.accumulatedArgs) return false
+    try {
+      JSON.parse(tc.accumulatedArgs)
+      return false
+    } catch {
+      return true
+    }
+  })
+}
+
+/**
+ * Emits guard events when a tool call is truncated by the output token limit.
+ * Closes the open tool block, emits an explanatory text block, and terminates
+ * with stop_reason "end_turn" so Claude Code reads the feedback instead of
+ * trying to execute a broken tool call.
+ */
+function emitTruncationGuardEvents(
+  state: AnthropicStreamState,
+  chunk: ChatCompletionChunk,
+  ctx: {
+    events: Array<AnthropicStreamEventData>
+    truncated: Array<{ name: string }>
+  },
+): Array<AnthropicStreamEventData> {
+  const { events, truncated } = ctx
+
+  if (state.contentBlockOpen) {
+    events.push({
+      type: "content_block_stop",
+      index: state.contentBlockIndex,
+    })
+    state.contentBlockIndex++
+    state.contentBlockOpen = false
+  }
+
+  const toolName = truncated[0].name
+  events.push(
+    {
+      type: "content_block_start",
+      index: state.contentBlockIndex,
+      content_block: { type: "text", text: "" },
+    },
+    {
+      type: "content_block_delta",
+      index: state.contentBlockIndex,
+      delta: {
+        type: "text_delta",
+        text:
+          `[Output truncated: the response exceeded the maximum output token limit`
+          + ` while generating tool call "${toolName}".`
+          + ` Please retry with a smaller output, e.g. write the file in smaller chunks.]`,
+      },
+    },
+    {
+      type: "content_block_stop",
+      index: state.contentBlockIndex,
+    },
+    {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: {
+        input_tokens:
+          (chunk.usage?.prompt_tokens ?? 0)
+          - (chunk.usage?.prompt_tokens_details?.cached_tokens ?? 0),
+        output_tokens: chunk.usage?.completion_tokens ?? 0,
+      },
+    },
+    { type: "message_stop" },
+  )
+  state.messageStopSent = true
   return events
 }
 

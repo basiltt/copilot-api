@@ -29,6 +29,7 @@ interface RunServerOptions {
   proxyEnv: boolean
 }
 
+// eslint-disable-next-line max-lines-per-function
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
     initProxyFromEnv()
@@ -83,9 +84,18 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   await setupCopilotToken()
   await cacheModels()
 
-  consola.info(
-    `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
-  )
+  const modelList = state.models?.data
+    .map((model) => {
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
+      const maxOut = model.capabilities?.limits?.max_output_tokens
+      const limit =
+        maxOut ?
+          ` (max_output: ${maxOut >= 1000 ? `${Math.round(maxOut / 1000)}k` : maxOut})`
+        : ""
+      return `- ${model.id}${limit}`
+    })
+    .join("\n")
+  consola.info(`Available models: \n${modelList}`)
 
   const serverUrl = `http://localhost:${options.port}`
 

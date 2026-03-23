@@ -289,6 +289,8 @@ export interface AnthropicStreamState {
       id: string
       name: string
       anthropicBlockIndex: number
+      /** Accumulated JSON argument fragments for truncation detection. */
+      accumulatedArgs: string
     }
   }
   /** Whether the original request included thinking: { type: "enabled" }. */
