@@ -21,6 +21,18 @@ export class CompactionNeededError extends Error {
   }
 }
 
+/**
+ * Set to true when images have been proactively stripped from a request.
+ * Consumed (and reset) by `count_tokens` to force compaction when images
+ * are accumulating in the conversation.
+ */
+export let imagesWereStripped = false
+
+/** Resets the stripped-images flag after count_tokens has consumed it. */
+export function resetImagesStrippedFlag(): void {
+  imagesWereStripped = false
+}
+
 /** Reference to a single image block within its parent array. */
 type ImageRef = {
   parent: Array<unknown>
@@ -152,6 +164,7 @@ export async function fetchWithImageStripping<T>(
   let totalStrippedChars = preStrip.strippedBase64Chars
 
   if (preStrip.strippedCount > 0) {
+    imagesWereStripped = true
     consola.info(
       `Proactively stripped ${preStrip.strippedCount} older image(s) (keeping last) to avoid 413.`,
     )

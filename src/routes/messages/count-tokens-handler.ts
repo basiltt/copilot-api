@@ -10,6 +10,7 @@ import {
   type AnthropicUserContentBlock,
   isTypedTool,
 } from "./anthropic-types"
+import { imagesWereStripped, resetImagesStrippedFlag } from "./image-stripping"
 import { translateToOpenAI } from "./non-stream-translation"
 
 // Base64 image data inflates the HTTP body far more than the tokenizer
@@ -114,6 +115,21 @@ function estimateImageTokenOverhead(payload: AnthropicMessagesPayload): number {
  */
 export async function handleCountTokens(c: Context) {
   try {
+    // If images were stripped from a recent messages request, force
+    // compaction by returning a very high token count.  Claude Code
+    // doesn't include image data in count_tokens payloads, so the
+    // normal token calculation can't see them.  This flag is the only
+    // way to signal "the conversation has images that need compaction."
+    if (imagesWereStripped) {
+      resetImagesStrippedFlag()
+      consola.info(
+        "Images were recently stripped — returning 200K tokens to trigger compaction",
+      )
+      return c.json({
+        input_tokens: 200_000,
+      })
+    }
+
     const anthropicBeta = c.req.header("anthropic-beta")
 
     const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
