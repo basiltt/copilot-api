@@ -387,25 +387,35 @@ export function translateToAnthropic(
 
   // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
 
+  // Some models (notably Gemini) intermittently return finish_reason "stop"
+  // even when they emitted tool calls. Correct this to "tool_calls" so Claude
+  // Code executes the pending tool calls instead of treating the turn as done.
+  const correctedStopReason =
+    allToolUseBlocks.length > 0 && stopReason === "stop" ?
+      "tool_calls"
+    : stopReason
+
   return {
     id: toAnthropicMessageId(response.id),
     type: "message",
     role: "assistant",
     model: response.model,
     content: [...allTextBlocks, ...allToolUseBlocks],
-    stop_reason: mapOpenAIStopReasonToAnthropic(stopReason),
+    stop_reason: mapOpenAIStopReasonToAnthropic(correctedStopReason),
     stop_sequence: null,
-    usage: {
-      input_tokens:
-        (response.usage?.prompt_tokens ?? 0)
-        - (response.usage?.prompt_tokens_details?.cached_tokens ?? 0),
-      output_tokens: response.usage?.completion_tokens ?? 0,
-      ...(response.usage?.prompt_tokens_details?.cached_tokens
-        !== undefined && {
-        cache_read_input_tokens:
-          response.usage.prompt_tokens_details.cached_tokens,
-      }),
-    },
+    usage: buildAnthropicUsage(response.usage),
+  }
+}
+
+function buildAnthropicUsage(usage: ChatCompletionResponse["usage"]) {
+  return {
+    input_tokens:
+      (usage?.prompt_tokens ?? 0)
+      - (usage?.prompt_tokens_details?.cached_tokens ?? 0),
+    output_tokens: usage?.completion_tokens ?? 0,
+    ...(usage?.prompt_tokens_details?.cached_tokens !== undefined && {
+      cache_read_input_tokens: usage.prompt_tokens_details.cached_tokens,
+    }),
   }
 }
 

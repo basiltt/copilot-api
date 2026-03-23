@@ -249,6 +249,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
 
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageStopSent: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       thinkingBlockOpen: false,
@@ -351,6 +352,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
     // Streaming translation requires state
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageStopSent: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       thinkingBlockOpen: false,

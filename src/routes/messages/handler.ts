@@ -392,6 +392,7 @@ async function pipeStreamToClient(
   const { thinkingEnabled, imageTokenOverhead = 0 } = options
   const streamState: AnthropicStreamState = {
     messageStartSent: false,
+    messageStopSent: false,
     contentBlockIndex: 0,
     contentBlockOpen: false,
     thinkingBlockOpen: false,
@@ -436,23 +437,7 @@ async function pipeStreamToClient(
       }
     }
 
-    // If the upstream stream ended without ever sending a usable chunk
-    // (e.g. the model returned an empty response or only unsupported
-    // event types), no message_start was emitted and the client sees an
-    // empty SSE connection with no indication of what went wrong.
-    // Emit a synthetic Anthropic error so the UI can surface the problem.
-    if (!streamState.messageStartSent) {
-      consola.warn(
-        "Copilot stream ended without producing any content — emitting error event",
-      )
-      const errorEvent = translateErrorToAnthropicErrorEvent(
-        "The model returned an empty response. This may indicate the model is unavailable or does not support this request.",
-      )
-      await stream.writeSSE({
-        event: errorEvent.type,
-        data: JSON.stringify(errorEvent),
-      })
-    }
+    await handleIncompleteStream(stream, streamState)
   } catch (error) {
     consola.error("Stream error from Copilot:", error)
 
@@ -478,6 +463,84 @@ async function pipeStreamToClient(
   } finally {
     clearTimeout(chunkTimer)
   }
+}
+
+/**
+ * Handles the case where the upstream stream ended without a proper Anthropic
+ * termination sequence (message_delta + message_stop).
+ *
+ * Two scenarios:
+ * 1. Stream never produced any content → emit a synthetic error event.
+ * 2. Stream started (message_start sent) but ended without finish_reason →
+ *    synthesize the missing termination events so Claude Code can proceed.
+ */
+async function handleIncompleteStream(
+  stream: SSEStreamingApi,
+  state: AnthropicStreamState,
+): Promise<void> {
+  if (!state.messageStartSent) {
+    // No usable chunks arrived at all.
+    consola.warn(
+      "Copilot stream ended without producing any content — emitting error event",
+    )
+    const errorEvent = translateErrorToAnthropicErrorEvent(
+      "The model returned an empty response. This may indicate the model is unavailable or does not support this request.",
+    )
+    await stream.writeSSE({
+      event: errorEvent.type,
+      data: JSON.stringify(errorEvent),
+    })
+    return
+  }
+
+  if (state.messageStopSent) {
+    return // Stream ended normally, nothing to do.
+  }
+
+  // The upstream stream started but ended without a chunk containing
+  // finish_reason — no message_delta / message_stop was ever sent.
+  // Some models (notably Gemini) can terminate the stream abruptly after
+  // emitting content or tool-call chunks.  Without a proper termination
+  // sequence Claude Code sees the SSE connection close with no indication
+  // of completion and treats the turn as abandoned / silently dead.
+  consola.warn(
+    "Copilot stream ended without finish_reason — synthesizing message_delta/message_stop",
+  )
+
+  if (state.contentBlockOpen) {
+    await stream.writeSSE({
+      event: "content_block_stop",
+      data: JSON.stringify({
+        type: "content_block_stop",
+        index: state.contentBlockIndex,
+      }),
+    })
+  }
+
+  // Determine the correct stop_reason: if tool calls were emitted
+  // during the stream, the model intended "tool_use"; otherwise
+  // default to "end_turn".
+  const hasToolCalls = Object.keys(state.toolCalls).length > 0
+  const stopReason = hasToolCalls ? "tool_use" : "end_turn"
+
+  await stream.writeSSE({
+    event: "message_delta",
+    data: JSON.stringify({
+      type: "message_delta",
+      delta: {
+        stop_reason: stopReason,
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+      },
+    }),
+  })
+  await stream.writeSSE({
+    event: "message_stop",
+    data: JSON.stringify({ type: "message_stop" }),
+  })
 }
 
 const isNonStreaming = (

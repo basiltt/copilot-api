@@ -236,11 +236,22 @@ export function translateChunkToAnthropicEvents(
       state.contentBlockOpen = false
     }
 
+    // Some models (notably Gemini) intermittently return finish_reason "stop"
+    // even when they emitted tool calls in the response. Claude Code interprets
+    // stop_reason "end_turn" as "model is done" and skips pending tool
+    // executions, causing the session to stall after a few rounds.
+    // Detect this mismatch and correct finish_reason to "tool_calls".
+    const hasToolCalls = Object.keys(state.toolCalls).length > 0
+    const correctedFinishReason =
+      hasToolCalls && choice.finish_reason === "stop" ?
+        "tool_calls"
+      : choice.finish_reason
+
     events.push(
       {
         type: "message_delta",
         delta: {
-          stop_reason: mapOpenAIStopReasonToAnthropic(choice.finish_reason),
+          stop_reason: mapOpenAIStopReasonToAnthropic(correctedFinishReason),
           stop_sequence: null,
         },
         usage: {
@@ -259,6 +270,7 @@ export function translateChunkToAnthropicEvents(
         type: "message_stop",
       },
     )
+    state.messageStopSent = true
   }
 
   return events

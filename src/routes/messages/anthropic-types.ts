@@ -276,6 +276,8 @@ export type AnthropicStreamEventData =
 // State for streaming translation
 export interface AnthropicStreamState {
   messageStartSent: boolean
+  /** Whether the terminal message_stop event has been emitted. */
+  messageStopSent: boolean
   contentBlockIndex: number
   contentBlockOpen: boolean
   /** Whether the currently open content block is a thinking block. */

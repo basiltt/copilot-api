@@ -111,7 +111,7 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
   const prefix = ok ? `${CYAN}◀${R}` : `${RED}✕${R}`
   const methodStr = pad(`${DIM}${method}${R}`, 4)
   const pathStr = pad(`${CYAN}${path}${R}`, 27)
-  const modelStr = pad(model ? `${YELLOW}${model}${R}` : "", 18)
+  const modelStr = pad(model ? `${YELLOW}${model}${R}` : "", 26)
   const sessionStr = pad(sessionId ? `${DIM}${sessionId}${R}` : "", 8)
   const streamStr = pad(stream === true ? `${BLUE}stream${R}` : "", 6)
   const statusStr = pad(colorStatus(status), 3)
