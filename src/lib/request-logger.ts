@@ -8,7 +8,7 @@ export function formatDuration(ms: number): string {
 }
 
 /**
- * Extracts `model` and `stream` from the Hono request context.
+ * Extracts `model`, `stream`, and `sessionId` from the Hono request context.
  *
  * Uses `c.req.json()` instead of `c.req.raw.clone()` so that Hono's internal
  * body-cache is shared between the middleware and any subsequent handler that
@@ -16,15 +16,25 @@ export function formatDuration(ms: number): string {
  * production bypasses this cache and creates a `ReadableStream.tee()` on the
  * live TCP-socket-backed body, which can corrupt the stream that the handler
  * later tries to read — especially for large request bodies.
+ *
+ * `sessionId` is extracted from `metadata.user_id` (Anthropic protocol) which
+ * Claude Code sets to a per-session UUID.  Only the first 8 hex characters are
+ * returned to keep the log line compact.
  */
 export async function extractBodyFields(
   c: Context,
-): Promise<{ model?: string; stream?: boolean }> {
+): Promise<{ model?: string; stream?: boolean; sessionId?: string }> {
   try {
     const parsed = await c.req.json<Record<string, unknown>>()
+    let sessionId: string | undefined
+    const metadata = parsed.metadata as Record<string, unknown> | undefined
+    if (typeof metadata?.user_id === "string" && metadata.user_id.length > 0) {
+      sessionId = metadata.user_id.slice(0, 8)
+    }
     return {
       model: typeof parsed.model === "string" ? parsed.model : undefined,
       stream: typeof parsed.stream === "boolean" ? parsed.stream : undefined,
+      sessionId,
     }
   } catch {
     return {}
@@ -68,7 +78,7 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
   // duration still covers the full round-trip.  Because we use c.req.json()
   // (Hono's cached body reader) the result is shared with the handler —
   // no double-read, no stream tee.
-  const { model, stream } = await extractBodyFields(c)
+  const { model, stream, sessionId } = await extractBodyFields(c)
 
   await next()
 
@@ -101,6 +111,7 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
   const methodStr = pad(`${DIM}${method}${R}`, 4)
   const pathStr = pad(`${CYAN}${path}${R}`, 27)
   const modelStr = pad(model ? `${YELLOW}${model}${R}` : "", 18)
+  const sessionStr = pad(sessionId ? `${DIM}${sessionId}${R}` : "", 8)
   const streamStr = pad(stream === true ? `${BLUE}stream${R}` : "", 6)
   const statusStr = pad(colorStatus(status), 3)
   const durationStr = pad(formatDuration(duration), 6)
@@ -113,6 +124,7 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
     methodStr,
     pathStr,
     modelStr,
+    sessionStr,
     streamStr,
     statusStr,
     durationStr,
