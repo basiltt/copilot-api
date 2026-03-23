@@ -5,7 +5,21 @@
       "Bash(bun run:*)",
       "Skill(update-config)",
       "Skill(update-config:*)",
-      "mcp__plugin_context7_context7__resolve-library-id"
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "Bash(powershell -Command \"Get-Command bun -ErrorAction SilentlyContinue | Select-Object Source\")",
+      "Bash(powershell -Command \"Test-Path ''$env:USERPROFILE\\\\.local\\\\share\\\\copilot-api\\\\github_token''\")",
+      "Bash(powershell -Command \"nssm status CopilotProxy 2>&1\")",
+      "Bash(powershell -Command \"nssm get CopilotProxy AppDirectory 2>&1; nssm get CopilotProxy Application 2>&1; nssm get CopilotProxy AppParameters 2>&1; nssm get CopilotProxy AppEnvironmentExtra 2>&1\")",
+      "Bash(powershell -Command \"if \\(Test-Path ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\Projects\\\\PublicProjects\\\\copilot-api\\\\logs''\\) { Get-ChildItem ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\Projects\\\\PublicProjects\\\\copilot-api\\\\logs'' } else { ''logs dir not found'' }\")",
+      "Bash(powershell -Command \"Get-WinEvent -LogName ''System'' -FilterXPath ''*[System[Provider[@Name=\"\"nssm\"\"] or Provider[@Name=\"\"Service Control Manager\"\"]] and System[TimeCreated[timediff\\(@SystemTime\\) <= 604800000]]]'' -MaxEvents 30 2>&1 | Select-Object TimeCreated, Id, Message | Format-List\")",
+      "Bash(powershell -Command \"Get-WinEvent -LogName ''System'' -FilterXPath ''*[System[Provider[@Name=\"\"nssm\"\"]]]'' -MaxEvents 20 2>&1 | Select-Object TimeCreated, Id, Message | Format-List\")",
+      "Bash(powershell -Command \"Get-WinEvent -LogName ''System'' -FilterXPath ''*[System[Provider[@Name=''''nssm'''']]]'' -MaxEvents 20 2>&1\")",
+      "Bash(powershell -Command \"nssm get CopilotProxy AppStdout 2>&1; nssm get CopilotProxy AppStderr 2>&1\")",
+      "Bash(powershell -Command \"Test-Path ''C:\\\\Users\\\\ttbasil\\\\.local\\\\share\\\\copilot-api\\\\github_token''\")",
+      "Bash(powershell -Command \"nssm stop CopilotProxy 2>&1\")",
+      "Bash(powershell -Command \"Start-Process -FilePath ''nssm'' -ArgumentList ''set CopilotProxy Application C:\\\\Users\\\\ttbasil\\\\Desktop\\\\Projects\\\\PublicProjects\\\\copilot-api\\\\start-service.bat'' -Verb RunAs -Wait -WindowStyle Hidden 2>&1\")",
+      "Bash(powershell -Command \"Start-Process -FilePath ''nssm'' -ArgumentList ''get CopilotProxy Application'' -Verb RunAs -Wait -RedirectStandardOutput ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_check.txt'' -WindowStyle Hidden; Get-Content ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_check.txt''\")",
+      "Bash(powershell -Command \"if \\(Test-Path ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_output.txt''\\) { Get-Content ''C:\\\\Users\\\\ttbasil\\\\Desktop\\\\nssm_output.txt'' } else { ''Output file not created'' }\")"
     ]
   }
 }
