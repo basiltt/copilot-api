@@ -185,21 +185,21 @@ export interface ImageStrippingResult<T> {
 }
 
 /**
- * Wraps a Copilot fetch function with proactive image stripping and
- * progressive 413 retry logic.
+ * Wraps a Copilot fetch function with reactive 413 retry logic.
  *
- * When the payload contains 2+ base64 images, older images are stripped
- * proactively (keeping the most recent) BEFORE the first request to
- * avoid a wasted 413 round-trip.  If a 413 still occurs, the cascade
- * continues by stripping all images, then triggering compaction.
+ * All images are sent as-is on the first attempt, letting Claude Code
+ * manage its own context (including deciding when to compact and which
+ * images to keep).  The proxy only intervenes when Copilot's HTTP body
+ * size limit rejects the request with 413.
  *
  * Returns the response along with metadata about how many base64
  * characters were stripped, so the caller can inflate usage tokens.
  *
  * Cascade:
- *   1. Proactively strip older images if 2+ exist, then send
- *   2. On 413: strip ALL images, retry
- *   3. On 413 with no images left: throw CompactionNeededError
+ *   1. Send payload unchanged (all images intact)
+ *   2. On 413: strip older images (keep most recent), retry
+ *   3. On 413: strip ALL images, retry
+ *   4. On 413 with no images left: throw CompactionNeededError
  *
  * Non-413 HTTPErrors and non-HTTP errors propagate immediately.
  */
@@ -209,56 +209,44 @@ export async function fetchWithImageStripping<T>(
 ): Promise<ImageStrippingResult<T>> {
   const sessionId = getSessionId(anthropicPayload)
 
-  // Proactive strip: if 2+ images exist, strip older ones before sending.
-  // This avoids a guaranteed 413 round-trip when the conversation has
-  // accumulated many screenshots over time.
-  const preStrip = stripImages(anthropicPayload, true)
-  const effectivePayload =
-    preStrip.strippedCount > 0 ? preStrip.payload : anthropicPayload
-  let totalStrippedChars = preStrip.strippedBase64Chars
-
-  if (preStrip.strippedCount > 0) {
-    // NOTE: We intentionally do NOT set sessionsWithStrippedImages here.
-    // Proactive stripping is the normal, successful path — it silently
-    // removes older images to fit the HTTP body while keeping the most
-    // recent screenshot.  Setting the flag here would cause count_tokens
-    // to return 200K on the next call, forcing Claude Code to compact
-    // after every screenshot activity (the exact bug we're fixing).
-    // The flag should only be set during reactive 413 stripping (Stage 2)
-    // where ALL images are removed and the conversation genuinely needs
-    // to shrink.
-    consola.debug(
-      `${sessionId ? `[${sessionId}] ` : ""}Proactively stripped ${preStrip.strippedCount} older image(s) (keeping last) to avoid 413.`,
-    )
-  }
-
-  // Stage 1: Try with (possibly pre-stripped) payload
+  // Stage 1: Try with all images intact — let the model see everything.
   try {
-    const response = await fetchFn(effectivePayload)
-    return { response, strippedBase64Chars: totalStrippedChars }
+    const response = await fetchFn(anthropicPayload)
+    return { response, strippedBase64Chars: 0 }
   } catch (error) {
     if (!is413(error)) throw error
   }
 
-  // Stage 2: Strip ALL images (from original payload)
-  const stage2 = stripImages(anthropicPayload, false)
-  totalStrippedChars = stage2.strippedBase64Chars
+  // Stage 2: Strip older images, keep the most recent one
+  const stage2 = stripImages(anthropicPayload, true)
   if (stage2.strippedCount > 0) {
-    // NOW set the flag — a 413 after proactive stripping means the
-    // conversation is genuinely too large and needs compaction.
-    if (sessionId) sessionsWithStrippedImages.add(sessionId)
-    consola.warn(
-      `Request too large (413), retrying with all images stripped. Removed ${stage2.strippedCount} image(s).`,
+    consola.debug(
+      `${sessionId ? `[${sessionId}] ` : ""}413 — stripped ${stage2.strippedCount} older image(s) (keeping last), retrying.`,
     )
     try {
       const response = await fetchFn(stage2.payload)
-      return { response, strippedBase64Chars: totalStrippedChars }
+      return { response, strippedBase64Chars: stage2.strippedBase64Chars }
     } catch (error) {
       if (!is413(error)) throw error
     }
   }
 
-  // Stage 3: No images left, request is still too large — trigger compaction
+  // Stage 3: Strip ALL images
+  const stage3 = stripImages(anthropicPayload, false)
+  if (stage3.strippedCount > 0) {
+    if (sessionId) sessionsWithStrippedImages.add(sessionId)
+    consola.warn(
+      `${sessionId ? `[${sessionId}] ` : ""}413 — stripped all ${stage3.strippedCount} image(s), retrying.`,
+    )
+    try {
+      const response = await fetchFn(stage3.payload)
+      return { response, strippedBase64Chars: stage3.strippedBase64Chars }
+    } catch (error) {
+      if (!is413(error)) throw error
+    }
+  }
+
+  // Stage 4: No images left, request is still too large — trigger compaction
   consola.warn(
     "Still too large (413) even without images, triggering auto-compaction",
   )
