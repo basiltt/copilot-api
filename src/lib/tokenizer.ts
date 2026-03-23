@@ -46,6 +46,15 @@ const calculateToolCallsTokens = (
 /**
  * Calculate tokens for content parts
  */
+/**
+ * Estimates image tokens based on Anthropic's formula: tokens ≈ (w × h) / 750.
+ * Since we only have the base64 data URL at this point (not original dimensions),
+ * we use a conservative fixed estimate per image.  Anthropic caps images at
+ * 1568 px on the longest edge, so the maximum is ~1,600 tokens.  Most
+ * screenshots fall in the 1,200–1,600 range.  Using 1,600 as a safe ceiling.
+ */
+const TOKENS_PER_IMAGE = 1_600
+
 const calculateContentPartsTokens = (
   contentParts: Array<ContentPart>,
   encoder: Encoder,
@@ -53,7 +62,12 @@ const calculateContentPartsTokens = (
   let tokens = 0
   for (const part of contentParts) {
     if (part.type === "image_url") {
-      tokens += encoder.encode(part.image_url.url).length + 85
+      // Use a fixed per-image token estimate based on Anthropic's vision
+      // pricing (tokens = width*height / 750, max ~1,600 for full-size
+      // images).  Previously this tokenized the entire base64 data URL as
+      // text, producing ~76K tokens per screenshot — 50× the real cost —
+      // which triggered premature compaction in Claude Code.
+      tokens += TOKENS_PER_IMAGE
     } else if (part.text) {
       tokens += encoder.encode(part.text).length
     }

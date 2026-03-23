@@ -73,9 +73,9 @@ export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
-  // Check if compaction has removed images from the conversation.
-  // This clears the imagesWereStripped flag so count_tokens stops
-  // returning the inflated 200K value.
+  // Check if compaction has removed images from this session's conversation.
+  // This clears the per-session image-stripped flag so count_tokens stops
+  // returning the inflated 200K value for this session.
   updateImageFlag(anthropicPayload)
 
   if (state.manualApprove) {
@@ -108,12 +108,20 @@ export async function handleCompletion(c: Context) {
  * Used to inflate response `input_tokens` so Claude Code sees the true
  * context size and triggers compaction when images accumulate.
  *
- * Rough heuristic: base64 encodes ~3/4 bytes per character, and typical
- * tokenizers produce ~1 token per 3-4 base64 characters.  We use 1 token
- * per 2 characters (intentionally aggressive) to ensure compaction fires.
+ * Per Anthropic's docs, images cost ~(width*height)/750 tokens, with a
+ * practical maximum of ~1,600 tokens per image.  Since we don't know the
+ * original dimensions, we use 1,600 as a conservative ceiling.
+ *
+ * A typical screenshot is ~200KB base64 (~267,000 chars).  Dividing by
+ * a generous 200K-chars-per-image gives us a rough image count, then we
+ * multiply by the per-image token cost.
  */
-function estimateTokensForBase64Chars(base64Chars: number): number {
-  return Math.ceil(base64Chars / 2)
+function estimateTokensForStrippedImages(base64Chars: number): number {
+  if (base64Chars <= 0) return 0
+  // Estimate number of images from total base64 chars.
+  // A typical screenshot is 150K-300K base64 chars; use 200K as average.
+  const estimatedImages = Math.max(1, Math.round(base64Chars / 200_000))
+  return estimatedImages * 1_600
 }
 
 /**
@@ -213,7 +221,7 @@ async function handleNonStreaming(
   // to compact.  Without inflation, it never sees the true cost of images
   // in the conversation and never compacts.
   if (result.strippedBase64Chars > 0) {
-    anthropicResponse.usage.input_tokens += estimateTokensForBase64Chars(
+    anthropicResponse.usage.input_tokens += estimateTokensForStrippedImages(
       result.strippedBase64Chars,
     )
   }
@@ -276,7 +284,8 @@ async function handleStreaming(
     pingTimer = undefined
 
     const { response: copilotResponse, strippedBase64Chars } = strippingResult
-    const imageTokenOverhead = estimateTokensForBase64Chars(strippedBase64Chars)
+    const imageTokenOverhead =
+      estimateTokensForStrippedImages(strippedBase64Chars)
 
     if (isNonStreaming(copilotResponse)) {
       // Shouldn't happen for a streaming payload, but handle gracefully by

@@ -1,6 +1,7 @@
 import consola from "consola"
 
 import { HTTPError } from "~/lib/error"
+import { extractSessionId } from "~/lib/session-id"
 
 import type {
   AnthropicDocumentBlock,
@@ -22,21 +23,47 @@ export class CompactionNeededError extends Error {
 }
 
 /**
- * Set to true when images have been proactively stripped from a request.
- * Stays true until a `/v1/messages` request arrives with zero images,
- * meaning compaction has removed them from the conversation.  While true,
- * `count_tokens` returns 200K to keep triggering compaction.
+ * Tracks which sessions have had images proactively stripped.
+ * Keyed by session ID (8-char hex hash from metadata.user_id).
+ * When a session's images are stripped, its ID is added here.
+ * When that session later sends a `/v1/messages` with zero images
+ * (meaning compaction removed them), its ID is removed.
+ *
+ * This is per-session to prevent cross-session contamination:
+ * Session A stripping images should NOT cause Session B to compact.
  */
-export let imagesWereStripped = false
+const sessionsWithStrippedImages = new Set<string>()
+
+/**
+ * Returns true if the given session has had images stripped and
+ * `count_tokens` should return an inflated value to trigger compaction.
+ * Returns false for unknown sessions or sessions without the flag.
+ */
+export function hasStrippedImages(sessionId: string | undefined): boolean {
+  if (!sessionId) return false
+  return sessionsWithStrippedImages.has(sessionId)
+}
+
+/**
+ * Extracts the session ID from an Anthropic payload's metadata.
+ * Convenience wrapper so callers don't need to import extractSessionId separately.
+ */
+export function getSessionId(
+  payload: AnthropicMessagesPayload,
+): string | undefined {
+  return extractSessionId(payload.metadata?.user_id)
+}
 
 /**
  * Called by the messages handler at the start of every `/v1/messages`
- * request.  If the incoming payload has no base64 images, compaction
- * has succeeded and the flag is cleared so `count_tokens` stops
+ * request.  If the incoming payload has no base64 images AND this
+ * session previously had images stripped, compaction has succeeded
+ * and the per-session flag is cleared so `count_tokens` stops
  * returning the inflated 200K value.
  */
 export function updateImageFlag(payload: AnthropicMessagesPayload): void {
-  if (!imagesWereStripped) return
+  const sessionId = getSessionId(payload)
+  if (!sessionId || !sessionsWithStrippedImages.has(sessionId)) return
 
   const hasImages = payload.messages.some((msg) => {
     if (msg.role !== "user") return false
@@ -51,10 +78,10 @@ export function updateImageFlag(payload: AnthropicMessagesPayload): void {
   })
 
   if (!hasImages) {
-    consola.info(
-      "No images in conversation — compaction succeeded, clearing image flag.",
+    consola.debug(
+      `[${sessionId}] No images in conversation — compaction succeeded, clearing image flag.`,
     )
-    imagesWereStripped = false
+    sessionsWithStrippedImages.delete(sessionId)
   }
 }
 
@@ -180,6 +207,8 @@ export async function fetchWithImageStripping<T>(
   fetchFn: (payload: AnthropicMessagesPayload) => Promise<T>,
   anthropicPayload: AnthropicMessagesPayload,
 ): Promise<ImageStrippingResult<T>> {
+  const sessionId = getSessionId(anthropicPayload)
+
   // Proactive strip: if 2+ images exist, strip older ones before sending.
   // This avoids a guaranteed 413 round-trip when the conversation has
   // accumulated many screenshots over time.
@@ -189,9 +218,17 @@ export async function fetchWithImageStripping<T>(
   let totalStrippedChars = preStrip.strippedBase64Chars
 
   if (preStrip.strippedCount > 0) {
-    imagesWereStripped = true
-    consola.info(
-      `Proactively stripped ${preStrip.strippedCount} older image(s) (keeping last) to avoid 413.`,
+    // NOTE: We intentionally do NOT set sessionsWithStrippedImages here.
+    // Proactive stripping is the normal, successful path — it silently
+    // removes older images to fit the HTTP body while keeping the most
+    // recent screenshot.  Setting the flag here would cause count_tokens
+    // to return 200K on the next call, forcing Claude Code to compact
+    // after every screenshot activity (the exact bug we're fixing).
+    // The flag should only be set during reactive 413 stripping (Stage 2)
+    // where ALL images are removed and the conversation genuinely needs
+    // to shrink.
+    consola.debug(
+      `${sessionId ? `[${sessionId}] ` : ""}Proactively stripped ${preStrip.strippedCount} older image(s) (keeping last) to avoid 413.`,
     )
   }
 
@@ -207,6 +244,9 @@ export async function fetchWithImageStripping<T>(
   const stage2 = stripImages(anthropicPayload, false)
   totalStrippedChars = stage2.strippedBase64Chars
   if (stage2.strippedCount > 0) {
+    // NOW set the flag — a 413 after proactive stripping means the
+    // conversation is genuinely too large and needs compaction.
+    if (sessionId) sessionsWithStrippedImages.add(sessionId)
     consola.warn(
       `Request too large (413), retrying with all images stripped. Removed ${stage2.strippedCount} image(s).`,
     )

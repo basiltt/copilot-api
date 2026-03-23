@@ -1,5 +1,7 @@
 import type { Context, MiddlewareHandler } from "hono"
 
+import { extractSessionId } from "~/lib/session-id"
+
 // ─── Pure helpers (exported for testing) ─────────────────────────────────────
 
 export function formatDuration(ms: number): string {
@@ -17,20 +19,19 @@ export function formatDuration(ms: number): string {
  * live TCP-socket-backed body, which can corrupt the stream that the handler
  * later tries to read — especially for large request bodies.
  *
- * `sessionId` is extracted from `metadata.user_id` (Anthropic protocol) which
- * Claude Code sets to a per-session UUID.  Only the first 8 hex characters are
- * returned to keep the log line compact.
+ * `sessionId` is extracted from `metadata.user_id` (Anthropic protocol) via
+ * {@link extractSessionId}, which parses the JSON-encoded value that Claude
+ * Code sends and returns a stable 8-char hex hash.
  */
 export async function extractBodyFields(
   c: Context,
 ): Promise<{ model?: string; stream?: boolean; sessionId?: string }> {
   try {
     const parsed = await c.req.json<Record<string, unknown>>()
-    let sessionId: string | undefined
     const metadata = parsed.metadata as Record<string, unknown> | undefined
-    if (typeof metadata?.user_id === "string" && metadata.user_id.length > 0) {
-      sessionId = metadata.user_id.slice(0, 8)
-    }
+    const sessionId = extractSessionId(
+      typeof metadata?.user_id === "string" ? metadata.user_id : undefined,
+    )
     return {
       model: typeof parsed.model === "string" ? parsed.model : undefined,
       stream: typeof parsed.stream === "boolean" ? parsed.stream : undefined,
