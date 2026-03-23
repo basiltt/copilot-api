@@ -50,7 +50,7 @@ export const createResponsesCompletion = async (
   }
 
   if (payload.stream) {
-    const responseId = `resp_${Date.now()}`
+    const responseId = `resp_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
     const model = payload.model
     const streamState = createResponsesStreamState()
 
