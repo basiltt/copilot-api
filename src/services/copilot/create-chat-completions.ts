@@ -273,6 +273,8 @@ interface Delta {
   content?: string | null
   /** Reasoning/thinking content from models that support it (e.g. GPT 5.4). */
   reasoning_content?: string | null
+  /** Reasoning text from Gemini models (equivalent to reasoning_content). */
+  reasoning_text?: string | null
   role?: "user" | "assistant" | "system" | "tool"
   tool_calls?: Array<{
     index: number

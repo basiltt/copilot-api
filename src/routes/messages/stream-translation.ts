@@ -62,7 +62,14 @@ export function translateChunkToAnthropicEvents(
     state.messageStartSent = true
   }
 
-  // Reasoning/thinking content from models like GPT 5.4.
+  // Normalize Gemini's reasoning_text → reasoning_content so the rest of
+  // the logic only needs to check one field.  Gemini models send reasoning
+  // output as `reasoning_text` while GPT models use `reasoning_content`.
+  if (delta.reasoning_text && !delta.reasoning_content) {
+    delta.reasoning_content = delta.reasoning_text
+  }
+
+  // Reasoning/thinking content from models like GPT 5.4 and Gemini.
   // Always emit as a regular text block so the content is visible to the user.
   // Claude Code displays thinking blocks only as brief status labels (e.g.
   // "Unfurling…", "Cerebrating…") without showing the actual text, which makes
@@ -243,6 +250,8 @@ export function translateChunkToAnthropicEvents(
       }
     }
 
+    const hasToolCalls = Object.keys(state.toolCalls).length > 0
+
     if (state.contentBlockOpen) {
       events.push({
         type: "content_block_stop",
@@ -256,7 +265,6 @@ export function translateChunkToAnthropicEvents(
     // stop_reason "end_turn" as "model is done" and skips pending tool
     // executions, causing the session to stall after a few rounds.
     // Detect this mismatch and correct finish_reason to "tool_calls".
-    const hasToolCalls = Object.keys(state.toolCalls).length > 0
     const correctedFinishReason =
       hasToolCalls && choice.finish_reason === "stop" ?
         "tool_calls"
@@ -307,6 +315,28 @@ export function findTruncatedToolCalls(
       return true
     }
   })
+}
+
+/**
+ * Detects whether a raw SSE chunk represents a complete but empty response.
+ *
+ * Some models (notably Gemini) occasionally return a single chunk with
+ * `finish_reason: "stop"`, `content: null`, and zero tool calls after
+ * completing their reasoning phase.  This is effectively a "model had
+ * nothing to say" response.  When detected before `message_start` is sent,
+ * the caller can retry the request transparently instead of passing an
+ * empty turn to Claude Code (which would cause it to silently stop).
+ */
+export function isEmptyStreamResponse(chunk: ChatCompletionChunk): boolean {
+  if (chunk.choices.length === 0) return false
+  const choice = chunk.choices[0]
+  return (
+    choice.finish_reason === "stop"
+    && !choice.delta.content
+    && !choice.delta.reasoning_content
+    && !choice.delta.reasoning_text
+    && (!choice.delta.tool_calls || choice.delta.tool_calls.length === 0)
+  )
 }
 
 /**

@@ -38,9 +38,11 @@ import {
 } from "./non-stream-translation"
 import {
   findTruncatedToolCalls,
+  isEmptyStreamResponse,
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
 } from "./stream-translation"
+import { toAnthropicMessageId } from "./utils"
 import {
   detectWebSearchIntent,
   stripWebSearchTypedTools,
@@ -58,17 +60,25 @@ const PING_INTERVAL_MS = 10_000
 // before assuming the stream is stalled.  When the Copilot API finishes
 // streaming a large tool call (e.g. 6000+ line Write), it sometimes never
 // sends the chunk containing `finish_reason` — the HTTP body remains open
-// and `reader.read()` blocks indefinitely.  Claude Code's own stream
-// inactivity detector fires at ~45s, so we break out at 30s to leave time
-// for synthesizing the missing termination events (message_delta +
-// message_stop) before Claude Code times out.
-const STREAM_STALL_TIMEOUT_MS = 30_000
+// and `reader.read()` blocks indefinitely.  Models like Gemini 3 Pro can
+// have long pauses (60-90s) between reasoning chunks while doing deep
+// internal processing.  The downstream stays alive via PING_INTERVAL_MS,
+// so the only constraint here is how long we wait for a genuinely stalled
+// upstream.  90s accommodates long reasoning phases while still recovering
+// from truly dead connections within a reasonable time.
+const STREAM_STALL_TIMEOUT_MS = 90_000
 
 // Maximum number of times to retry a timed-out upstream fetch before giving up.
 // Each attempt gets a fresh TCP connection, resetting the firewall idle timer.
 // Retry is safe because we only retry before the first byte arrives — if Copilot
 // hasn't started generating yet, the request is idempotent.
 const MAX_FETCH_RETRIES = 3
+
+// Maximum number of times to retry when the model returns an empty response
+// (finish_reason "stop" with no content or tool calls).  Some models
+// (notably Gemini) occasionally do this after their reasoning phase completes
+// without producing output.  Retrying typically succeeds on the next attempt.
+const MAX_EMPTY_RESPONSE_RETRIES = 2
 
 // Error name/code patterns that indicate a retriable network failure
 // (firewall idle timeout, connection reset) vs. a non-retriable one (4xx, auth).
@@ -226,6 +236,21 @@ async function handleNonStreaming(
     "Non-streaming response from Copilot:",
     JSON.stringify(result.response).slice(-400),
   )
+
+  // Detect empty non-streaming responses: some models (notably Gemini)
+  // return finish_reason "stop" with empty/null content and 0 output tokens.
+  // Returning this as a valid response causes Claude Code to see "end_turn"
+  // with empty content and stop the session.  Returning overloaded_error would
+  // cause Claude Code to retry the exact same request in an infinite loop.
+  // Instead, return a synthetic valid response with explanatory text so the
+  // conversation can move forward.
+  if (isEmptyNonStreamingResponse(result.response)) {
+    consola.debug(
+      "Empty non-streaming response detected — returning synthetic fallback",
+    )
+    return c.json(buildSyntheticFallbackJson(anthropicPayload, result.response))
+  }
+
   const anthropicResponse = translateToAnthropic(result.response)
 
   // Inflate input_tokens to account for images stripped before sending.
@@ -246,6 +271,7 @@ async function handleNonStreaming(
   return c.json(anthropicResponse)
 }
 
+// eslint-disable-next-line max-lines-per-function
 async function handleStreaming(
   stream: SSEStreamingApi,
   anthropicPayload: AnthropicMessagesPayload,
@@ -309,15 +335,41 @@ async function handleStreaming(
         "Non-streaming response from Copilot (unexpected for streaming request):",
         JSON.stringify(copilotResponse).slice(-400),
       )
+
+      // Detect empty non-streaming response and treat like an empty stream —
+      // retry transparently instead of sending empty content to Claude Code.
+      if (isEmptyNonStreamingResponse(copilotResponse)) {
+        consola.debug(
+          "Empty non-streaming response detected in streaming path — retrying",
+        )
+        const thinkingEnabled = anthropicPayload.thinking?.type === "enabled"
+        await retryEmptyResponse(stream, anthropicPayload, {
+          thinkingEnabled,
+          imageTokenOverhead,
+        })
+        return
+      }
+
       await emitNonStreamingAsSSE(stream, copilotResponse, imageTokenOverhead)
       return
     }
 
     const thinkingEnabled = anthropicPayload.thinking?.type === "enabled"
-    await pipeStreamToClient(stream, copilotResponse, {
+    const hadContent = await pipeStreamToClient(stream, copilotResponse, {
       thinkingEnabled,
       imageTokenOverhead,
     })
+
+    // When the model returns an empty response (reasoning completed but no
+    // output), retry the request transparently.  Since no message_start was
+    // sent to the client, the SSE connection is clean and we can pipe a new
+    // response without protocol violations.
+    if (!hadContent) {
+      await retryEmptyResponse(stream, anthropicPayload, {
+        thinkingEnabled,
+        imageTokenOverhead,
+      })
+    }
   } catch (error) {
     clearInterval(pingTimer)
     pingTimer = undefined
@@ -428,11 +480,69 @@ async function fetchCopilotResponse(
   return createChatCompletions(openAIPayload)
 }
 
+/**
+ * Retries the upstream fetch when the model returned an empty response
+ * (no content, no tool calls).  Since no `message_start` was sent to the
+ * client yet, the SSE connection is clean and we can transparently pipe
+ * a fresh response.  After all retries are exhausted, sends an error event.
+ */
+async function retryEmptyResponse(
+  stream: SSEStreamingApi,
+  anthropicPayload: AnthropicMessagesPayload,
+  ctx: { thinkingEnabled: boolean; imageTokenOverhead: number },
+): Promise<void> {
+  for (
+    let emptyRetry = 1;
+    emptyRetry <= MAX_EMPTY_RESPONSE_RETRIES;
+    emptyRetry++
+  ) {
+    consola.debug(
+      `Empty response retry ${emptyRetry}/${MAX_EMPTY_RESPONSE_RETRIES}`,
+    )
+    const retryResult = await fetchWithImageStripping(
+      fetchCopilotResponse,
+      anthropicPayload,
+    )
+    const { response: retryResponse } = retryResult
+
+    if (isNonStreaming(retryResponse)) {
+      // Non-streaming retry can also be empty — treat as another empty attempt
+      // and continue to the next retry rather than emitting empty content.
+      if (isEmptyNonStreamingResponse(retryResponse)) {
+        consola.debug(
+          `Empty non-streaming response on retry ${emptyRetry} — continuing`,
+        )
+        continue
+      }
+      await emitNonStreamingAsSSE(stream, retryResponse, ctx.imageTokenOverhead)
+      return
+    }
+
+    const retryHadContent = await pipeStreamToClient(stream, retryResponse, {
+      thinkingEnabled: ctx.thinkingEnabled,
+      imageTokenOverhead: ctx.imageTokenOverhead,
+    })
+    if (retryHadContent) return
+  }
+
+  // All retries returned empty — the model persistently refuses to generate
+  // output for this conversation state.  Sending overloaded_error here would
+  // cause Claude Code to retry the exact same (doomed) request in an infinite
+  // loop until it gives up and stops the session.  Instead, emit a synthetic
+  // valid assistant response.  This allows the conversation to move forward:
+  // Claude Code sees the model "said something" and can proceed to the next
+  // turn naturally.
+  consola.debug(
+    "All empty response retries exhausted — emitting synthetic fallback response",
+  )
+  await emitSyntheticFallbackResponse(stream, anthropicPayload)
+}
+
 async function pipeStreamToClient(
   stream: SSEStreamingApi,
   response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
   options: { thinkingEnabled: boolean; imageTokenOverhead?: number },
-): Promise<void> {
+): Promise<boolean> {
   const { thinkingEnabled, imageTokenOverhead = 0 } = options
   const streamState: AnthropicStreamState = {
     messageStartSent: false,
@@ -475,6 +585,19 @@ async function pipeStreamToClient(
       if (!rawEvent.data) continue
 
       const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+
+      // Detect empty responses before sending message_start: some models
+      // (notably Gemini) return a single chunk with finish_reason "stop",
+      // no content, and no tool calls after completing their reasoning phase.
+      // If we haven't sent message_start yet, we can safely signal the
+      // caller to retry instead of sending an empty turn to Claude Code.
+      if (!streamState.messageStartSent && isEmptyStreamResponse(chunk)) {
+        consola.debug(
+          "Empty response detected from model — signaling for retry",
+        )
+        return false
+      }
+
       const events = translateChunkToAnthropicEvents(chunk, streamState)
 
       for (const event of events) {
@@ -521,6 +644,7 @@ async function pipeStreamToClient(
   } finally {
     clearTimeout(chunkTimer)
   }
+  return true
 }
 
 /**
@@ -534,9 +658,10 @@ async function pipeStreamToClient(
  * The stall timeout is the key fix for the Write tool hang: when the Copilot
  * API finishes streaming a large tool call but never sends `finish_reason`,
  * `response.next()` blocks forever on `reader.read()`.  Racing it against a
- * 30-second timeout lets us break out and synthesize the missing termination
- * events (via handleIncompleteStream) before Claude Code's ~45s inactivity
- * detector fires.
+ * 90-second timeout lets us break out and synthesize the missing termination
+ * events (via handleIncompleteStream).  The downstream stays alive via
+ * periodic ping events, so the timeout can be generous enough to accommodate
+ * models like Gemini that pause for 60-90s during deep reasoning.
  */
 async function nextWithTimeout(
   iter: AsyncGenerator<ServerSentEventMessage, void, unknown>,
@@ -696,6 +821,29 @@ const isNonStreaming = (
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
 
 /**
+ * Detects whether a non-streaming response is effectively empty.
+ *
+ * Some models (notably Gemini) return finish_reason "stop" with empty or null
+ * content and 0 completion tokens after their reasoning phase completes without
+ * producing output.  Without this guard, the empty response gets translated to
+ * a valid Anthropic message with stop_reason "end_turn" and empty content,
+ * causing Claude Code to treat the model's turn as complete and stop the session.
+ */
+function isEmptyNonStreamingResponse(
+  response: ChatCompletionResponse,
+): boolean {
+  if (response.choices.length === 0) return false
+  const choice = response.choices[0]
+  if (choice.finish_reason !== "stop") return false
+  if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
+    return false
+  }
+  // Content is empty if null, undefined, or empty string
+  const content = choice.message.content
+  return !content || content.trim() === ""
+}
+
+/**
  * Maps an HTTP status code to the corresponding Anthropic error type.
  * Claude Code uses the error type to decide whether a request can be retried.
  */
@@ -853,4 +1001,106 @@ async function emitNonStreamingAsSSE(
     event: "message_stop",
     data: JSON.stringify({ type: "message_stop" }),
   })
+}
+
+// -- Synthetic fallback for persistent empty responses -----------------------
+//
+// When a model (notably Gemini) persistently returns empty output for a given
+// conversation state, retrying the same request is futile.  Returning an error
+// (overloaded_error) causes Claude Code to retry the same doomed request in
+// an infinite loop until it exhausts its retry budget and stops the session.
+//
+// The solution: emit a *valid* assistant response with text explaining that the
+// model produced no output.  This is saved to conversation history and allows
+// Claude Code to proceed — it will see the assistant's "turn" is complete and
+// can issue the next turn (which has a different conversation state and often
+// succeeds).
+
+const FALLBACK_TEXT =
+  "I apologize, but I was unable to generate a response for this turn. "
+  + "Let me try a different approach."
+
+/**
+ * Emits a synthetic Anthropic SSE event sequence that represents a valid
+ * assistant message containing a fallback text.  This unblocks the
+ * conversation so Claude Code can proceed to the next turn.
+ */
+async function emitSyntheticFallbackResponse(
+  stream: SSEStreamingApi,
+  anthropicPayload: AnthropicMessagesPayload,
+): Promise<void> {
+  const msgId = `msg_fallback_${Date.now()}`
+  const model = anthropicPayload.model
+
+  await stream.writeSSE({
+    event: "message_start",
+    data: JSON.stringify({
+      type: "message_start",
+      message: {
+        id: msgId,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    }),
+  })
+  await stream.writeSSE({
+    event: "content_block_start",
+    data: JSON.stringify({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }),
+  })
+  await stream.writeSSE({
+    event: "content_block_delta",
+    data: JSON.stringify({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: FALLBACK_TEXT },
+    }),
+  })
+  await stream.writeSSE({
+    event: "content_block_stop",
+    data: JSON.stringify({ type: "content_block_stop", index: 0 }),
+  })
+  await stream.writeSSE({
+    event: "message_delta",
+    data: JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 1 },
+    }),
+  })
+  await stream.writeSSE({
+    event: "message_stop",
+    data: JSON.stringify({ type: "message_stop" }),
+  })
+}
+
+/**
+ * Builds a non-streaming Anthropic JSON response with fallback text.
+ * Used by the non-streaming handler when the model returns empty.
+ */
+function buildSyntheticFallbackJson(
+  anthropicPayload: AnthropicMessagesPayload,
+  response: ChatCompletionResponse,
+): import("./anthropic-types").AnthropicResponse {
+  return {
+    id: toAnthropicMessageId(response.id),
+    type: "message",
+    role: "assistant",
+    model: anthropicPayload.model,
+    content: [{ type: "text", text: FALLBACK_TEXT }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: response.usage?.prompt_tokens ?? 0,
+      output_tokens: 1,
+    },
+  }
 }

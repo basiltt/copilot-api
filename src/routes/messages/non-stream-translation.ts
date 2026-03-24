@@ -130,10 +130,33 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
     }
 
     if (otherBlocks.length > 0) {
-      newMessages.push({
-        role: "user",
-        content: mapContent(otherBlocks),
-      })
+      const otherContent = mapContent(otherBlocks)
+      // When a user message contains both tool results and additional text
+      // (e.g. Claude Code's Skill tool returns tool_result + text blocks in
+      // the same user message), avoid emitting a standalone "user" message
+      // between the tool result and the next assistant message.  Gemini
+      // returns empty responses when it sees user → assistant(+tool_calls)
+      // inside a tool-calling loop — it expects tool → assistant only.
+      // Appending the extra text to the last tool result is safe for all
+      // models; the OpenAI tool message content field accepts any text.
+      if (toolResultBlocks.length > 0 && otherContent) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- guarded by length > 0
+        const lastToolMsg = newMessages.at(-1)!
+        const existingContent =
+          typeof lastToolMsg.content === "string" ?
+            lastToolMsg.content
+          : JSON.stringify(lastToolMsg.content)
+        const extraText =
+          typeof otherContent === "string" ? otherContent : (
+            JSON.stringify(otherContent)
+          )
+        lastToolMsg.content = existingContent + "\n\n" + extraText
+      } else {
+        newMessages.push({
+          role: "user",
+          content: otherContent,
+        })
+      }
     }
   } else {
     newMessages.push({
