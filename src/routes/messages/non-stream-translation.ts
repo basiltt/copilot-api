@@ -46,6 +46,11 @@ export function translateToOpenAI(
     max_tokens: payload.max_tokens,
     stop: payload.stop_sequences,
     stream: payload.stream,
+    // Request usage data in the final streaming chunk so Claude Code can
+    // track actual input_tokens for proactive context-window compaction.
+    // Without this, streaming chunks have no usage → input_tokens defaults
+    // to 0 → Claude Code never knows the context is filling up.
+    stream_options: payload.stream ? { include_usage: true } : undefined,
     temperature: payload.temperature,
     top_p: payload.top_p,
     user: payload.metadata?.user_id,

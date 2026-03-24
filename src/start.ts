@@ -13,6 +13,10 @@ import { state } from "./lib/state"
 import { setupCopilotToken, setupGitHubToken } from "./lib/token"
 import { cacheModels, cacheVSCodeVersion } from "./lib/utils"
 import { server } from "./server"
+import {
+  getModelContextWindow,
+  getModelMaxOutput,
+} from "./services/copilot/get-models"
 
 interface RunServerOptions {
   port: number
@@ -28,6 +32,9 @@ interface RunServerOptions {
   showToken: boolean
   proxyEnv: boolean
 }
+
+/** Formats a number as "Nk" if >= 1000, otherwise as-is. */
+const formatK = (v: number) => (v >= 1000 ? `${Math.round(v / 1000)}k` : `${v}`)
 
 // eslint-disable-next-line max-lines-per-function
 export async function runServer(options: RunServerOptions): Promise<void> {
@@ -86,13 +93,13 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   const modelList = state.models?.data
     .map((model) => {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
-      const maxOut = model.capabilities?.limits?.max_output_tokens
-      const limit =
-        maxOut ?
-          ` (max_output: ${maxOut >= 1000 ? `${Math.round(maxOut / 1000)}k` : maxOut})`
-        : ""
-      return `- ${model.id}${limit}`
+      const maxOut = getModelMaxOutput(model)
+      const ctxWindow = getModelContextWindow(model)
+      const parts: Array<string> = []
+      if (ctxWindow) parts.push(`ctx: ${formatK(ctxWindow)}`)
+      if (maxOut) parts.push(`out: ${formatK(maxOut)}`)
+      const suffix = parts.length > 0 ? ` (${parts.join(", ")})` : ""
+      return `- ${model.id}${suffix}`
     })
     .join("\n")
   consola.info(`Available models: \n${modelList}`)

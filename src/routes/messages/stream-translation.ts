@@ -6,6 +6,73 @@ import {
 } from "./anthropic-types"
 import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
 
+/**
+ * Generates a human-readable description for a tool call so the user can see
+ * what the model is doing.  Models like Gemini go straight to tool calls
+ * without any explanatory text — this provides that missing context.
+ *
+ * When arguments are available (e.g. Gemini sends name + args in one chunk),
+ * the description extracts key details like file paths and commands.
+ * Otherwise falls back to just the tool name.
+ */
+function describeToolCall(name: string, rawArgs: string | undefined): string {
+  // Try to parse arguments for richer descriptions
+  const args = parseToolArgs(rawArgs)
+
+  if (args) {
+    // Bash tool — show the command (truncated if very long)
+    if (typeof args.command === "string") {
+      const cmd = args.command
+      return `Running: ${cmd.length > 120 ? cmd.slice(0, 120) + "…" : cmd}`
+    }
+    // File-based tools — show the path with an action verb
+    if (typeof args.file_path === "string") {
+      return describeFileToolCall(name, args.file_path)
+    }
+    // Search tools — show the pattern
+    if (typeof args.pattern === "string") {
+      return describeSearchToolCall(name, args.pattern)
+    }
+    // WebFetch — show the URL
+    if (typeof args.prompt === "string" && typeof args.url === "string") {
+      return `Fetching: ${args.url}`
+    }
+  }
+
+  return `Using tool: ${name}`
+}
+
+/** Safely parses JSON tool arguments, returning undefined on failure. */
+function parseToolArgs(
+  rawArgs: string | undefined,
+): Record<string, unknown> | undefined {
+  if (!rawArgs) return undefined
+  try {
+    return JSON.parse(rawArgs) as Record<string, unknown>
+  } catch {
+    return undefined
+  }
+}
+
+/** Returns a description for file-path-based tools (Read, Write, Edit, etc.). */
+function describeFileToolCall(name: string, filePath: string): string {
+  const lower = name.toLowerCase()
+  if (lower.includes("read") || name === "Read") return `Reading: ${filePath}`
+  if (lower.includes("write") || name === "Write") return `Writing: ${filePath}`
+  if (lower.includes("edit") || name === "Edit") return `Editing: ${filePath}`
+  return `${name}: ${filePath}`
+}
+
+/** Returns a description for search-pattern-based tools (Glob, Grep, etc.). */
+function describeSearchToolCall(name: string, pattern: string): string {
+  const lower = name.toLowerCase()
+  if (lower.includes("glob") || name === "Glob")
+    return `Searching files: ${pattern}`
+  if (lower.includes("grep") || name === "Grep")
+    return `Searching for: ${pattern}`
+  return `${name}: ${pattern}`
+}
+
 function isToolBlockOpen(state: AnthropicStreamState): boolean {
   if (!state.contentBlockOpen) {
     return false
@@ -27,6 +94,14 @@ export function translateChunkToAnthropicEvents(
   state: AnthropicStreamState,
 ): Array<AnthropicStreamEventData> {
   const events: Array<AnthropicStreamEventData> = []
+
+  // Always capture usage from every chunk that has it.  With
+  // `stream_options: { include_usage: true }`, the OpenAI API sends a
+  // final chunk with `choices: []` and `usage` — we need to store it
+  // so the deferred `message_delta` can include accurate `input_tokens`.
+  if (chunk.usage) {
+    state.lastSeenUsage = chunk.usage
+  }
 
   if (chunk.choices.length === 0) {
     return events
@@ -70,15 +145,12 @@ export function translateChunkToAnthropicEvents(
   }
 
   // Reasoning/thinking content from models like GPT 5.4 and Gemini.
-  // Always emit as a regular text block so the content is visible to the user.
-  // Claude Code displays thinking blocks only as brief status labels (e.g.
-  // "Unfurling…", "Cerebrating…") without showing the actual text, which makes
-  // the model appear stuck during long reasoning phases.  Emitting as text
-  // gives the user real-time visibility into the model's reasoning progress.
+  // When the client has `thinking` enabled, emit as proper Anthropic thinking
+  // blocks so Claude Code displays them in its dedicated thinking UI.  When
+  // thinking is not enabled, emit as regular text blocks so the content is
+  // still visible to the user.
   if (delta.reasoning_content) {
-    // If a thinking block is open (from a previous reasoning chunk that was
-    // emitted as text), keep appending to it.  If a tool block is open,
-    // close it first.
+    // If a tool block is open, close it first.
     if (isToolBlockOpen(state)) {
       events.push({
         type: "content_block_stop",
@@ -89,21 +161,42 @@ export function translateChunkToAnthropicEvents(
       state.thinkingBlockOpen = false
     }
 
-    if (!state.contentBlockOpen) {
-      events.push({
-        type: "content_block_start",
-        index: state.contentBlockIndex,
-        content_block: { type: "text", text: "" },
-      })
-      state.contentBlockOpen = true
-      state.thinkingBlockOpen = true
-    }
+    if (state.thinkingEnabled) {
+      // Emit as a proper thinking block so Claude Code's thinking UI
+      // displays the reasoning content with real-time streaming.
+      if (!state.contentBlockOpen) {
+        events.push({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "thinking", thinking: "" },
+        })
+        state.contentBlockOpen = true
+        state.thinkingBlockOpen = true
+      }
 
-    events.push({
-      type: "content_block_delta",
-      index: state.contentBlockIndex,
-      delta: { type: "text_delta", text: delta.reasoning_content },
-    })
+      events.push({
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+      })
+    } else {
+      // Thinking not enabled — emit as regular text so content is visible.
+      if (!state.contentBlockOpen) {
+        events.push({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "text", text: "" },
+        })
+        state.contentBlockOpen = true
+        state.thinkingBlockOpen = true
+      }
+
+      events.push({
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: { type: "text_delta", text: delta.reasoning_content },
+      })
+    }
     state.hasEmittedText = true
   }
 
@@ -167,12 +260,17 @@ export function translateChunkToAnthropicEvents(
           state.thinkingBlockOpen = false
         }
 
-        // When a tool call starts and no visible text has been emitted yet,
-        // inject a brief text block so the user can see what's happening.
-        // Without this, models like GPT 5.4 that go straight to tool use
-        // produce only invisible input_json_delta events — Claude Code
-        // shows a loading animation with no indication of progress.
+        // Inject a descriptive text block when the model hasn't emitted any
+        // visible text before starting tool calls.  Models like Gemini go
+        // straight to tool_use without any explanatory content — Claude Code
+        // would show a loading animation with no indication of progress.
+        // The description extracts key details from tool arguments (e.g.
+        // file paths, commands) so the user sees what's actually happening.
         if (!state.hasEmittedText) {
+          const description = describeToolCall(
+            toolCall.function.name,
+            toolCall.function.arguments,
+          )
           events.push(
             {
               type: "content_block_start",
@@ -184,7 +282,7 @@ export function translateChunkToAnthropicEvents(
               index: state.contentBlockIndex,
               delta: {
                 type: "text_delta",
-                text: `Using tool: ${toolCall.function.name}`,
+                text: description,
               },
             },
             {
@@ -270,37 +368,58 @@ export function translateChunkToAnthropicEvents(
         "tool_calls"
       : choice.finish_reason
 
-    events.push(
-      {
-        type: "message_delta",
-        delta: {
-          stop_reason: mapOpenAIStopReasonToAnthropic(correctedFinishReason),
-          stop_sequence: null,
-        },
-        usage: {
-          input_tokens:
-            (chunk.usage?.prompt_tokens ?? 0)
-            - (chunk.usage?.prompt_tokens_details?.cached_tokens ?? 0),
-          output_tokens: chunk.usage?.completion_tokens ?? 0,
-          ...(chunk.usage?.prompt_tokens_details?.cached_tokens
-            !== undefined && {
-            cache_read_input_tokens:
-              chunk.usage.prompt_tokens_details.cached_tokens,
-          }),
-        },
-      },
-      {
-        type: "message_stop",
-      },
-    )
-    state.messageStopSent = true
+    // Defer message_delta + message_stop instead of emitting immediately.
+    // When `stream_options: { include_usage: true }` is set, the usage chunk
+    // (with accurate prompt_tokens) arrives AFTER this finish_reason chunk.
+    // By deferring, we let `flushDeferredFinish()` emit these events with
+    // the real usage data once the stream ends or the usage chunk arrives.
+    state.deferredFinishReason = correctedFinishReason
   }
 
   return events
 }
 
 /**
- * Returns tool calls whose accumulated JSON arguments are invalid (truncated).
+ * Emits the deferred `message_delta` + `message_stop` events after the stream
+ * has ended.  This is called from the stream handler after all chunks have been
+ * processed, so the accumulated `lastSeenUsage` contains the final usage data
+ * (from the usage-only chunk sent by the OpenAI API with `stream_options`).
+ *
+ * If no finish was deferred (stream ended without finish_reason), returns empty.
+ */
+export function flushDeferredFinish(
+  state: AnthropicStreamState,
+): Array<AnthropicStreamEventData> {
+  if (state.deferredFinishReason === undefined) return []
+
+  const usage = state.lastSeenUsage
+  const events: Array<AnthropicStreamEventData> = [
+    {
+      type: "message_delta",
+      delta: {
+        stop_reason: mapOpenAIStopReasonToAnthropic(state.deferredFinishReason),
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens:
+          (usage?.prompt_tokens ?? 0)
+          - (usage?.prompt_tokens_details?.cached_tokens ?? 0),
+        output_tokens: usage?.completion_tokens ?? 0,
+        ...(usage?.prompt_tokens_details?.cached_tokens !== undefined && {
+          cache_read_input_tokens: usage.prompt_tokens_details.cached_tokens,
+        }),
+      },
+    },
+    {
+      type: "message_stop",
+    },
+  ]
+  state.messageStopSent = true
+  state.deferredFinishReason = undefined
+  return events
+}
+
+/**
  * Empty accumulatedArgs are considered valid (no arguments to parse).
  */
 export function findTruncatedToolCalls(
@@ -391,9 +510,11 @@ function emitTruncationGuardEvents(
       delta: { stop_reason: "end_turn", stop_sequence: null },
       usage: {
         input_tokens:
-          (chunk.usage?.prompt_tokens ?? 0)
-          - (chunk.usage?.prompt_tokens_details?.cached_tokens ?? 0),
-        output_tokens: chunk.usage?.completion_tokens ?? 0,
+          ((state.lastSeenUsage ?? chunk.usage)?.prompt_tokens ?? 0)
+          - ((state.lastSeenUsage ?? chunk.usage)?.prompt_tokens_details
+            ?.cached_tokens ?? 0),
+        output_tokens:
+          (state.lastSeenUsage ?? chunk.usage)?.completion_tokens ?? 0,
       },
     },
     { type: "message_stop" },

@@ -295,4 +295,26 @@ export interface AnthropicStreamState {
   }
   /** Whether the original request included thinking: { type: "enabled" }. */
   thinkingEnabled: boolean
+  /**
+   * Last usage data seen from any upstream chunk.  With `stream_options:
+   * { include_usage: true }`, the OpenAI API sends usage in the final chunk
+   * (often after the finish_reason chunk).  We accumulate it here so the
+   * `message_delta` event can include accurate `input_tokens`.
+   */
+  lastSeenUsage?: {
+    prompt_tokens: number
+    completion_tokens: number
+    prompt_tokens_details?: { cached_tokens: number }
+  }
+  /**
+   * Deferred finish_reason — set when we see `finish_reason` but want to
+   * delay emitting `message_delta` + `message_stop` until after the usage
+   * chunk arrives (or the stream ends).
+   */
+  deferredFinishReason?:
+    | "stop"
+    | "length"
+    | "tool_calls"
+    | "content_filter"
+    | null
 }

@@ -17,8 +17,8 @@ export function selectModelForTokenCount(
   }
 
   const contextWindow =
-    requestedModel.capabilities.limits.max_context_window_tokens
-    ?? requestedModel.capabilities.limits.max_prompt_tokens
+    requestedModel.capabilities.limits.max_prompt_tokens
+    ?? requestedModel.capabilities.limits.max_context_window_tokens
 
   if (contextWindow === undefined) {
     return { model: requestedModelId, switched: false }
@@ -33,12 +33,12 @@ export function selectModelForTokenCount(
     (typeof models.data)[number] | undefined
   >((best, m) => {
     const win =
-      m.capabilities.limits.max_context_window_tokens
-      ?? m.capabilities.limits.max_prompt_tokens
+      m.capabilities.limits.max_prompt_tokens
+      ?? m.capabilities.limits.max_context_window_tokens
       ?? 0
     const bestWin =
-      best?.capabilities.limits.max_context_window_tokens
-      ?? best?.capabilities.limits.max_prompt_tokens
+      best?.capabilities.limits.max_prompt_tokens
+      ?? best?.capabilities.limits.max_context_window_tokens
       ?? 0
     return win > bestWin ? m : best
   }, undefined)
@@ -48,8 +48,8 @@ export function selectModelForTokenCount(
   }
 
   const largestWindow =
-    largestModel.capabilities.limits.max_context_window_tokens
-    ?? largestModel.capabilities.limits.max_prompt_tokens
+    largestModel.capabilities.limits.max_prompt_tokens
+    ?? largestModel.capabilities.limits.max_context_window_tokens
     ?? 0
 
   return {

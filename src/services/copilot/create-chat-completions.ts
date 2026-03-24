@@ -352,6 +352,7 @@ export interface ChatCompletionsPayload {
     | { type: "function"; function: { name: string } }
     | null
   user?: string | null
+  stream_options?: { include_usage: boolean } | null
 }
 
 export interface Tool {

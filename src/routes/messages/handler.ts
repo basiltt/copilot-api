@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import type { ServerSentEventMessage } from "fetch-event-stream"
 import type { Context } from "hono"
 import type { SSEStreamingApi } from "hono/streaming"
@@ -6,7 +7,12 @@ import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
-import { HTTPError } from "~/lib/error"
+import {
+  HTTPError,
+  isContextWindowError,
+  formatAnthropicContextWindowError,
+  buildAnthropicContextWindowErrorResponse,
+} from "~/lib/error"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
 import {
@@ -15,6 +21,7 @@ import {
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
+import { getModelContextWindow } from "~/services/copilot/get-models"
 import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 import {
   prepareWebSearchPayload,
@@ -38,6 +45,7 @@ import {
 } from "./non-stream-translation"
 import {
   findTruncatedToolCalls,
+  flushDeferredFinish,
   isEmptyStreamResponse,
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
@@ -89,6 +97,16 @@ const RETRIABLE_ERROR_NAMES = new Set([
   "ConnectionRefused",
 ])
 
+/**
+ * Looks up the model's max_prompt_tokens limit from cached models.
+ * Used to produce accurate "prompt is too long: N tokens > M maximum"
+ * errors even when the upstream error doesn't contain token numbers.
+ */
+function lookupModelLimit(modelId: string): number | undefined {
+  const model = state.models?.data.find((m) => m.id === modelId)
+  return model ? getModelContextWindow(model) : undefined
+}
+
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
   await checkBurstLimit(state)
@@ -118,12 +136,38 @@ export async function handleCompletion(c: Context) {
     return handleNonStreaming(c, anthropicPayload)
   }
 
-  // For streaming requests open the SSE connection to the client first,
-  // then fetch from Copilot inside the stream callback. This lets us send
-  // periodic ping events while Copilot is thinking, preventing the
-  // downstream TCP connection from being killed by enterprise firewalls
-  // that drop idle connections after ~5 minutes.
-  return streamSSE(c, (stream) => handleStreaming(stream, anthropicPayload))
+  // Attempt upstream fetch BEFORE opening the SSE connection so context-window
+  // errors surface as HTTP-level responses (400 + invalid_request_error) that
+  // Claude Code recognizes for auto-compaction.  SSE error events inside an
+  // already-committed HTTP 200 stream do NOT trigger compaction.
+  try {
+    const strippingResult = await prefetchCopilotResponse(anthropicPayload)
+    return streamSSE(c, (stream) =>
+      handleStreaming(stream, anthropicPayload, strippingResult),
+    )
+  } catch (error) {
+    // Context window errors (HTTP 400 with "exceeds the context window")
+    // or CompactionNeededError (413 cascade exhausted): return 400 with
+    // Anthropic-formatted invalid_request_error in the exact format
+    // Claude Code expects: "prompt is too long: N tokens > M maximum".
+    const contextWindowMessage = await extractContextWindowMessage(error)
+    if (error instanceof CompactionNeededError || contextWindowMessage) {
+      const modelLimit = lookupModelLimit(anthropicPayload.model)
+      consola.debug(
+        `[context-window] Upstream error: "${contextWindowMessage}", modelLimit=${modelLimit}`,
+      )
+      return c.json(
+        buildAnthropicContextWindowErrorResponse(
+          contextWindowMessage ?? "",
+          modelLimit,
+        ),
+        400,
+      )
+    }
+
+    // All other errors: let route-level forwardError handle them
+    throw error
+  }
 }
 
 /**
@@ -186,16 +230,10 @@ async function handleNonStreaming(
     // This is safe because images are already gone and compaction will
     // reduce the text content, producing a convergently smaller request.
     if (error instanceof CompactionNeededError) {
+      const modelLimit = lookupModelLimit(anthropicPayload.model)
       return c.json(
-        {
-          type: "error",
-          error: {
-            type: "invalid_request_error",
-            message:
-              "Request too large. Conversation context exceeds model limit.",
-          },
-        },
-        413,
+        buildAnthropicContextWindowErrorResponse("", modelLimit),
+        400,
       )
     }
 
@@ -271,57 +309,93 @@ async function handleNonStreaming(
   return c.json(anthropicResponse)
 }
 
-// eslint-disable-next-line max-lines-per-function
+/**
+ * Attempts the upstream Copilot fetch with retry logic BEFORE the SSE stream
+ * is opened.  Context-window errors and CompactionNeededError propagate to
+ * the caller so they can be returned as HTTP-level errors (not SSE events).
+ */
+async function prefetchCopilotResponse(
+  anthropicPayload: AnthropicMessagesPayload,
+): Promise<
+  ImageStrippingResult<Awaited<ReturnType<typeof fetchCopilotResponse>>>
+> {
+  let strippingResult:
+    | ImageStrippingResult<Awaited<ReturnType<typeof fetchCopilotResponse>>>
+    | undefined
+  let lastError: unknown
+
+  for (let attempt = 1; attempt <= MAX_FETCH_RETRIES; attempt++) {
+    try {
+      strippingResult = await fetchWithImageStripping(
+        fetchCopilotResponse,
+        anthropicPayload,
+      )
+      break
+    } catch (error) {
+      lastError = error
+      // HTTPErrors (including context window 400s) propagate immediately
+      if (error instanceof HTTPError) throw error
+      // CompactionNeededError propagates immediately
+      if (error instanceof CompactionNeededError) throw error
+      const isRetriable =
+        error instanceof Error && RETRIABLE_ERROR_NAMES.has(error.name)
+      if (!isRetriable || attempt === MAX_FETCH_RETRIES) throw error
+      consola.warn(
+        `Copilot fetch attempt ${attempt}/${MAX_FETCH_RETRIES} failed (${error.message}), retrying…`,
+      )
+    }
+  }
+
+  if (!strippingResult) throw lastError
+  return strippingResult
+}
+
+/**
+ * If the error is an HTTPError with a context-window-exceeded message,
+ * returns that message string.  Otherwise returns undefined.
+ * Reads and clones the response so the body is still available for
+ * downstream error handling.
+ */
+async function extractContextWindowMessage(
+  error: unknown,
+): Promise<string | undefined> {
+  if (!(error instanceof HTTPError)) return undefined
+  try {
+    const cloned = error.response.clone()
+    const text = await cloned.text()
+    consola.debug(
+      `[context-window] Raw upstream error (status=${error.response.status}): ${text.slice(0, 500)}`,
+    )
+    if (isContextWindowError(text)) {
+      // Try to extract the inner message from JSON
+      try {
+        const parsed = JSON.parse(text) as Record<string, unknown>
+        const errObj = parsed.error as Record<string, unknown> | undefined
+        if (typeof errObj?.message === "string") {
+          consola.debug(
+            `[context-window] Extracted inner message: ${errObj.message}`,
+          )
+          return errObj.message
+        }
+      } catch {
+        // not JSON
+      }
+      return text
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function handleStreaming(
   stream: SSEStreamingApi,
   anthropicPayload: AnthropicMessagesPayload,
+  strippingResult: ImageStrippingResult<
+    Awaited<ReturnType<typeof fetchCopilotResponse>>
+  >,
 ): Promise<void> {
-  // Start pinging every PING_INTERVAL_MS so the downstream TCP connection
-  // stays alive while we wait for Copilot to begin responding.
-  let pingTimer: ReturnType<typeof setInterval> | undefined = setInterval(
-    () => {
-      consola.debug("Sending SSE ping to keep connection alive")
-      stream
-        .writeSSE({ event: "ping", data: JSON.stringify({ type: "ping" }) })
-        .catch(() => {
-          // Client disconnected — clear the timer; the stream will close naturally.
-          clearInterval(pingTimer)
-          pingTimer = undefined
-        })
-    },
-    PING_INTERVAL_MS,
-  )
-
   try {
-    let strippingResult:
-      | ImageStrippingResult<Awaited<ReturnType<typeof fetchCopilotResponse>>>
-      | undefined
-    let lastError: unknown
-
-    for (let attempt = 1; attempt <= MAX_FETCH_RETRIES; attempt++) {
-      try {
-        strippingResult = await fetchWithImageStripping(
-          fetchCopilotResponse,
-          anthropicPayload,
-        )
-        break
-      } catch (error) {
-        lastError = error
-        if (error instanceof HTTPError) throw error
-        const isRetriable =
-          error instanceof Error && RETRIABLE_ERROR_NAMES.has(error.name)
-        if (!isRetriable || attempt === MAX_FETCH_RETRIES) throw error
-        consola.warn(
-          `Copilot fetch attempt ${attempt}/${MAX_FETCH_RETRIES} failed (${error.message}), retrying…`,
-        )
-      }
-    }
-
-    if (!strippingResult) throw lastError
-
-    clearInterval(pingTimer)
-    pingTimer = undefined
-
     const { response: copilotResponse, strippedBase64Chars } = strippingResult
     const imageTokenOverhead =
       estimateTokensForStrippedImages(strippedBase64Chars)
@@ -371,42 +445,13 @@ async function handleStreaming(
       })
     }
   } catch (error) {
-    clearInterval(pingTimer)
-    pingTimer = undefined
-
-    // 413 cascade exhausted — all images stripped, still too large.
-    // Emit invalid_request_error to trigger Claude Code auto-compaction.
-    if (error instanceof CompactionNeededError) {
-      const errorEvent = translateErrorToAnthropicErrorEvent(
-        "Request too large. Conversation context exceeds model limit.",
-        "invalid_request_error",
-      )
-      await stream.writeSSE({
-        event: errorEvent.type,
-        data: JSON.stringify(errorEvent),
-      })
-      return
-    }
-
-    if (error instanceof HTTPError) {
-      consola.error("Copilot HTTP error during streaming fetch:", error)
-    } else {
-      consola.error("Copilot connection error (fetch-level):", error)
-    }
-
-    // Extract the actual error message so Claude Code gets useful diagnostics,
-    // but ALWAYS use "api_error" as the type in SSE streams.  The HTTP response
-    // is already committed to status 200; sending "invalid_request_error" would
-    // trick Claude Code into thinking it can fix the request (e.g. by truncating)
-    // and retrying in a loop — each retry adds more context, making the prompt
-    // even larger.
-    const { errorMessage } = await extractStreamingErrorDetails(error)
-
-    const errorEvent = translateErrorToAnthropicErrorEvent(errorMessage)
-    await stream.writeSSE({
-      event: errorEvent.type,
-      data: JSON.stringify(errorEvent),
-    })
+    // Errors here occur during stream piping (after the initial fetch
+    // succeeded).  The SSE connection is already committed to HTTP 200,
+    // so we can only emit SSE error events — not HTTP-level errors.
+    // Context window errors and CompactionNeededError are already handled
+    // in handleCompletion (before the SSE stream starts).
+    consola.error("Error during stream piping:", error)
+    await emitStreamingError(stream, error, anthropicPayload.model)
   }
 }
 
@@ -538,6 +583,7 @@ async function retryEmptyResponse(
   await emitSyntheticFallbackResponse(stream, anthropicPayload)
 }
 
+// eslint-disable-next-line complexity
 async function pipeStreamToClient(
   stream: SSEStreamingApi,
   response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
@@ -612,10 +658,24 @@ async function pipeStreamToClient(
         })
       }
 
-      // Once message_stop has been sent, all content is delivered to the client.
-      // Break immediately instead of waiting for [DONE] — the upstream Copilot
-      // API may keep the HTTP connection open after the last content chunk.
+      // Once finish_reason has been deferred AND we've consumed the usage
+      // chunk (or exhausted the stream), flush the deferred message_delta +
+      // message_stop.  We continue reading after the finish_reason chunk to
+      // capture the usage-only chunk that arrives with `stream_options`.
       if (streamState.messageStopSent) break
+      if (
+        streamState.deferredFinishReason !== undefined
+        && streamState.lastSeenUsage
+      ) {
+        await emitDeferredFinish(stream, streamState, imageTokenOverhead)
+        break
+      }
+    }
+
+    // If the stream ended (DONE / timeout) before usage arrived, flush
+    // the deferred finish with whatever usage we have (possibly 0).
+    if (streamState.deferredFinishReason !== undefined) {
+      await emitDeferredFinish(stream, streamState, imageTokenOverhead)
     }
 
     await handleIncompleteStream(stream, streamState)
@@ -645,6 +705,28 @@ async function pipeStreamToClient(
     clearTimeout(chunkTimer)
   }
   return true
+}
+
+/**
+ * Flushes deferred `message_delta` + `message_stop` events to the SSE stream.
+ * Applies image token overhead inflation if needed.
+ */
+async function emitDeferredFinish(
+  stream: SSEStreamingApi,
+  streamState: AnthropicStreamState,
+  imageTokenOverhead: number,
+): Promise<void> {
+  const finishEvents = flushDeferredFinish(streamState)
+  for (const event of finishEvents) {
+    if (imageTokenOverhead > 0) {
+      inflateEventInputTokens(event, imageTokenOverhead)
+    }
+    consola.debug("Deferred finish event:", JSON.stringify(event))
+    await stream.writeSSE({
+      event: event.type,
+      data: JSON.stringify(event),
+    })
+  }
 }
 
 /**
@@ -852,6 +934,41 @@ function mapStatusToAnthropicErrorType(status: number): string {
   if (status >= 400 && status < 500) return "invalid_request_error"
   if (status >= 500) return "api_error"
   return "api_error"
+}
+
+/**
+ * Emits an SSE error event for a streaming request.
+ *
+ * Generally uses "api_error" to prevent Claude Code from retrying in a loop
+ * (the HTTP response is already committed to status 200).  However, when the
+ * upstream explicitly says the input exceeds the model's context window, we
+ * use "invalid_request_error" so Claude Code triggers auto-compaction —
+ * compaction reduces the conversation context, which fixes the root cause.
+ */
+async function emitStreamingError(
+  stream: SSEStreamingApi,
+  error: unknown,
+  modelId?: string,
+): Promise<void> {
+  const { errorMessage, errorType } = await extractStreamingErrorDetails(error)
+
+  const contextWindowError = isContextWindowError(errorMessage)
+  const effectiveErrorType =
+    contextWindowError ? "invalid_request_error" : errorType
+  const modelLimit = modelId ? lookupModelLimit(modelId) : undefined
+  const effectiveMessage =
+    contextWindowError ?
+      formatAnthropicContextWindowError(errorMessage, modelLimit)
+    : errorMessage
+
+  const errorEvent = translateErrorToAnthropicErrorEvent(
+    effectiveMessage,
+    effectiveErrorType,
+  )
+  await stream.writeSSE({
+    event: errorEvent.type,
+    data: JSON.stringify(errorEvent),
+  })
 }
 
 /**

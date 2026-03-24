@@ -2,7 +2,12 @@ import type { Context } from "hono"
 
 import { describe, test, expect, mock } from "bun:test"
 
-import { HTTPError, forwardError } from "~/lib/error"
+import {
+  HTTPError,
+  forwardError,
+  isContextWindowError,
+  formatAnthropicContextWindowError,
+} from "~/lib/error"
 
 function makeContext(jsonFn = mock()) {
   return { json: jsonFn } as unknown as Context
@@ -14,7 +19,7 @@ function makeHTTPError(body: string, status: number): HTTPError {
 }
 
 describe("forwardError — HTTPError with JSON body", () => {
-  test("forwards Copilot JSON error object directly", async () => {
+  test("converts context-window Copilot error to Anthropic format with token numbers", async () => {
     const jsonFn = mock()
     const c = makeContext(jsonFn)
     const err = makeHTTPError(
@@ -30,8 +35,16 @@ describe("forwardError — HTTPError with JSON body", () => {
     expect(jsonFn).toHaveBeenCalledTimes(1)
     const [body, status] = jsonFn.mock.calls[0] as [unknown, number]
     expect(status).toBe(400)
-    expect((body as { error: { code: string } }).error.code).toBe(
-      "model_max_prompt_tokens_exceeded",
+    const typed = body as {
+      type: string
+      request_id: string
+      error: { type: string; message: string }
+    }
+    expect(typed.type).toBe("error")
+    expect(typed.request_id).toMatch(/^req_/)
+    expect(typed.error.type).toBe("invalid_request_error")
+    expect(typed.error.message).toBe(
+      "prompt is too long: 55059 tokens > 12288 maximum",
     )
   })
 
@@ -73,5 +86,79 @@ describe("forwardError — non-HTTPError", () => {
     expect((body as { error: { message: string } }).error.message).toBe(
       "something broke",
     )
+  })
+})
+
+describe("isContextWindowError", () => {
+  test("detects Copilot 'exceeds the limit' format", () => {
+    expect(
+      isContextWindowError(
+        "prompt token count of 622303 exceeds the limit of 168000",
+      ),
+    ).toBe(true)
+  })
+
+  test("detects model_max_prompt_tokens_exceeded code", () => {
+    expect(
+      isContextWindowError(
+        '{"error":{"message":"prompt too big","code":"model_max_prompt_tokens_exceeded"}}',
+      ),
+    ).toBe(true)
+  })
+
+  test("detects 'exceeds the context window'", () => {
+    expect(
+      isContextWindowError("This request exceeds the context window"),
+    ).toBe(true)
+  })
+
+  test("detects context_length_exceeded", () => {
+    expect(isContextWindowError("context_length_exceeded")).toBe(true)
+  })
+
+  test("detects 'maximum context length'", () => {
+    expect(
+      isContextWindowError(
+        "This model's maximum context length is 128000 tokens",
+      ),
+    ).toBe(true)
+  })
+
+  test("detects 'input exceeds'", () => {
+    expect(isContextWindowError("input exceeds model limit")).toBe(true)
+  })
+
+  test("returns false for unrelated errors", () => {
+    expect(isContextWindowError("rate limit exceeded")).toBe(false)
+    expect(isContextWindowError("internal server error")).toBe(false)
+    expect(isContextWindowError("model not found")).toBe(false)
+  })
+})
+
+describe("formatAnthropicContextWindowError", () => {
+  test("extracts token numbers from Copilot error format", () => {
+    expect(
+      formatAnthropicContextWindowError(
+        "prompt token count of 622303 exceeds the limit of 168000",
+      ),
+    ).toBe("prompt is too long: 622303 tokens > 168000 maximum")
+  })
+
+  test("handles comma-separated numbers", () => {
+    expect(
+      formatAnthropicContextWindowError(
+        "prompt token count of 622,303 exceeds the limit of 168,000",
+      ),
+    ).toBe("prompt is too long: 622303 tokens > 168000 maximum")
+  })
+
+  test("falls back to defaults when no numbers found", () => {
+    const result = formatAnthropicContextWindowError("context_length_exceeded")
+    expect(result).toMatch(/^prompt is too long: \d+ tokens > \d+ maximum$/)
+  })
+
+  test("falls back to defaults for empty string", () => {
+    const result = formatAnthropicContextWindowError("")
+    expect(result).toMatch(/^prompt is too long: \d+ tokens > \d+ maximum$/)
   })
 })

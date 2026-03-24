@@ -4,10 +4,19 @@ import consola from "consola"
 
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
+import {
+  type Model,
+  getModelContextWindow,
+} from "~/services/copilot/get-models"
 
 import { type AnthropicMessagesPayload, isTypedTool } from "./anthropic-types"
 import { getSessionId, hasStrippedImages } from "./image-stripping"
 import { translateToOpenAI } from "./non-stream-translation"
+
+// The default context window size Claude Code assumes for unknown models.
+// This is the effective window Claude Code uses for compaction thresholds
+// when it doesn't recognize the model (typically ~200K for Claude models).
+const CLAUDE_CODE_DEFAULT_WINDOW = 200_000
 
 // Token overhead for Anthropic-typed tools (per Anthropic pricing docs).
 // Custom tools use the existing flat +346 for the entire tools array.
@@ -110,6 +119,17 @@ export async function handleCountTokens(c: Context) {
       finalTokenCount = Math.round(finalTokenCount * 1.2)
     } else if (anthropicPayload.model.startsWith("grok")) {
       finalTokenCount = Math.round(finalTokenCount * 1.03)
+    } else {
+      // For non-Claude/Grok models (GPT, Gemini, etc.), dynamically scale
+      // token counts based on the model's actual prompt token limit.  Claude
+      // Code uses an internal "effective window" (typically ~200K) for compaction
+      // thresholds.  If the model's actual prompt limit is smaller, we scale
+      // up so Claude Code's proactive compaction fires before the model rejects.
+      //
+      // Example: GPT-5-mini has a 128K prompt limit, Claude Code assumes ~200K.
+      // Scale factor: 200_000 / 128_000 ≈ 1.56.  At 120K actual tokens,
+      // we report ~187K, which crosses Claude Code's ~190K threshold.
+      finalTokenCount = scaleTokensForModel(finalTokenCount, selectedModel)
     }
 
     consola.debug("Token count:", finalTokenCount)
@@ -128,4 +148,32 @@ export async function handleCountTokens(c: Context) {
       input_tokens: 200_000,
     })
   }
+}
+
+/**
+ * Scales token counts for non-Claude/Grok models so Claude Code's proactive
+ * compaction fires before the model's actual prompt token limit is exhausted.
+ *
+ * Claude Code tracks context usage against an internal "effective window"
+ * (typically ~200K for Claude models).  When using models with smaller prompt
+ * limits (e.g. GPT-5-mini at 128K), the raw token count won't trigger
+ * compaction in time — Claude Code would wait until ~190K tokens, but the
+ * model rejects at 128K.
+ *
+ * The scale factor maps the model's actual prompt limit to Claude Code's
+ * expected window: `scale = CLAUDE_CODE_DEFAULT_WINDOW / modelPromptLimit`.
+ * Only scales up (never down) to avoid artificially shrinking large windows.
+ */
+function scaleTokensForModel(tokenCount: number, model: Model): number {
+  const modelWindow = getModelContextWindow(model)
+  if (!modelWindow || modelWindow >= CLAUDE_CODE_DEFAULT_WINDOW) {
+    // Model has a large enough context window — no scaling needed.
+    return tokenCount
+  }
+  const scale = CLAUDE_CODE_DEFAULT_WINDOW / modelWindow
+  consola.debug(
+    `Scaling token count for ${model.id}: ${tokenCount} × ${scale.toFixed(2)} `
+      + `(model window: ${modelWindow}, effective: ${CLAUDE_CODE_DEFAULT_WINDOW})`,
+  )
+  return Math.round(tokenCount * scale)
 }

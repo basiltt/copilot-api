@@ -54,3 +54,34 @@ export interface Model {
     terms: string
   }
 }
+
+/**
+ * Safely extracts the effective input token limit from a model.
+ *
+ * Copilot's `/models` API exposes two relevant fields:
+ * - `max_prompt_tokens` — the actual input ceiling Copilot enforces.
+ * - `max_context_window_tokens` — the total window (prompt + output).
+ *
+ * We prefer `max_prompt_tokens` because that is the limit Copilot rejects
+ * against, and it is what Claude Code needs as `max_input_tokens` to
+ * trigger proactive compaction at the right time.
+ *
+ * Some models at runtime lack `capabilities` or `limits` entirely,
+ * despite the TypeScript types marking them as required.
+ */
+export function getModelContextWindow(model: Model): number | undefined {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
+  const limits = model.capabilities?.limits
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime guard
+  if (!limits) return undefined
+  return limits.max_prompt_tokens ?? limits.max_context_window_tokens
+}
+
+/**
+ * Safely extracts the max output tokens from a model.
+ * Some models at runtime lack `capabilities` or `limits` entirely.
+ */
+export function getModelMaxOutput(model: Model): number | undefined {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
+  return model.capabilities?.limits?.max_output_tokens
+}
