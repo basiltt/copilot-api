@@ -85,3 +85,13 @@ export function getModelMaxOutput(model: Model): number | undefined {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
   return model.capabilities?.limits?.max_output_tokens
 }
+
+/**
+ * Safely extracts the total context window (prompt + output) from a model.
+ * This is `max_context_window_tokens` — the full window size, NOT the
+ * enforced input limit.  Use `getModelContextWindow()` for the input ceiling.
+ */
+export function getModelTotalContext(model: Model): number | undefined {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
+  return model.capabilities?.limits?.max_context_window_tokens
+}

@@ -16,6 +16,7 @@ import { server } from "./server"
 import {
   getModelContextWindow,
   getModelMaxOutput,
+  getModelTotalContext,
 } from "./services/copilot/get-models"
 
 interface RunServerOptions {
@@ -93,10 +94,12 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   const modelList = state.models?.data
     .map((model) => {
+      const totalCtx = getModelTotalContext(model)
+      const inputLimit = getModelContextWindow(model)
       const maxOut = getModelMaxOutput(model)
-      const ctxWindow = getModelContextWindow(model)
       const parts: Array<string> = []
-      if (ctxWindow) parts.push(`ctx: ${formatK(ctxWindow)}`)
+      if (totalCtx) parts.push(`total: ${formatK(totalCtx)}`)
+      if (inputLimit) parts.push(`in: ${formatK(inputLimit)}`)
       if (maxOut) parts.push(`out: ${formatK(maxOut)}`)
       const suffix = parts.length > 0 ? ` (${parts.join(", ")})` : ""
       return `- ${model.id}${suffix}`
