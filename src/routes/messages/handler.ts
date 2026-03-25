@@ -39,6 +39,7 @@ import {
   type ImageStrippingResult,
   updateImageFlag,
 } from "./image-stripping"
+import { applyLargeEditGuidance } from "./large-edit-guidance"
 import {
   translateToAnthropic,
   translateToOpenAI,
@@ -510,6 +511,10 @@ async function fetchCopilotResponse(
     (m) => m.id === openAIPayload.model,
   )
   clampMaxTokens(openAIPayload, selectedModel)
+  applyLargeEditGuidance(
+    openAIPayload,
+    selectedModel.capabilities.limits.max_output_tokens,
+  )
   consola.debug(
     `[routing] model=${openAIPayload.model} found=${selectedModel !== undefined} requiresResponses=${selectedModel !== undefined && requiresResponsesApi(selectedModel)} endpoints=${JSON.stringify(selectedModel?.supported_endpoints)}`,
   )
