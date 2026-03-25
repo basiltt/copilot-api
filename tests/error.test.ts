@@ -4,13 +4,15 @@ import { describe, test, expect, mock } from "bun:test"
 
 import {
   HTTPError,
+  buildAnthropicContextWindowErrorResponse,
   forwardError,
   isContextWindowError,
   formatAnthropicContextWindowError,
+  sendAnthropicInvalidRequestError,
 } from "~/lib/error"
 
-function makeContext(jsonFn = mock()) {
-  return { json: jsonFn } as unknown as Context
+function makeContext(jsonFn = mock(), headerFn = mock()) {
+  return { json: jsonFn, header: headerFn } as unknown as Context
 }
 
 function makeHTTPError(body: string, status: number): HTTPError {
@@ -21,7 +23,8 @@ function makeHTTPError(body: string, status: number): HTTPError {
 describe("forwardError — HTTPError with JSON body", () => {
   test("converts context-window Copilot error to Anthropic format with token numbers", async () => {
     const jsonFn = mock()
-    const c = makeContext(jsonFn)
+    const headerFn = mock()
+    const c = makeContext(jsonFn, headerFn)
     const err = makeHTTPError(
       JSON.stringify({
         error: {
@@ -42,6 +45,7 @@ describe("forwardError — HTTPError with JSON body", () => {
     }
     expect(typed.type).toBe("error")
     expect(typed.request_id).toMatch(/^req_/)
+    expect(headerFn).toHaveBeenCalledWith("request-id", typed.request_id)
     expect(typed.error.type).toBe("invalid_request_error")
     expect(typed.error.message).toBe(
       "prompt is too long: 55059 tokens > 12288 maximum",
@@ -160,5 +164,41 @@ describe("formatAnthropicContextWindowError", () => {
   test("falls back to defaults for empty string", () => {
     const result = formatAnthropicContextWindowError("")
     expect(result).toMatch(/^prompt is too long: \d+ tokens > \d+ maximum$/)
+  })
+})
+
+describe("buildAnthropicContextWindowErrorResponse", () => {
+  test("uses the same request id in the header payload and body", () => {
+    const result = buildAnthropicContextWindowErrorResponse(
+      "prompt token count of 622303 exceeds the limit of 168000",
+    )
+    expect(result.requestId).toMatch(/^req_/)
+    expect(result.body.request_id).toBe(result.requestId)
+    expect(result.body.error.message).toBe(
+      "prompt is too long: 622303 tokens > 168000 maximum",
+    )
+  })
+})
+
+describe("sendAnthropicInvalidRequestError", () => {
+  test("returns Anthropic-shaped invalid_request_error with request-id header", () => {
+    const jsonFn = mock()
+    const headerFn = mock()
+    const c = makeContext(jsonFn, headerFn)
+
+    sendAnthropicInvalidRequestError(c, "Embedded image is too small.")
+
+    const [body, status] = jsonFn.mock.calls[0] as [unknown, number]
+    const typed = body as {
+      type: string
+      request_id: string
+      error: { type: string; message: string }
+    }
+    expect(status).toBe(400)
+    expect(typed.type).toBe("error")
+    expect(typed.request_id).toMatch(/^req_/)
+    expect(typed.error.type).toBe("invalid_request_error")
+    expect(typed.error.message).toBe("Embedded image is too small.")
+    expect(headerFn).toHaveBeenCalledWith("request-id", typed.request_id)
   })
 })

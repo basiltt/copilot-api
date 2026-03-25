@@ -48,9 +48,8 @@ function isRiskyLargeEditRequest(payload: ChatCompletionsPayload): boolean {
   return payload.messages.some((message) => {
     if (message.role !== "user") return false
     if (typeof message.content !== "string") return false
-    return RISKY_REQUEST_PATTERNS.some((pattern) =>
-      pattern.test(message.content),
-    )
+    const content = message.content
+    return RISKY_REQUEST_PATTERNS.some((pattern) => pattern.test(content))
   })
 }
 

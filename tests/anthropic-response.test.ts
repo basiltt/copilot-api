@@ -191,6 +191,7 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
   })
 })
 
+// eslint-disable-next-line max-lines-per-function
 describe("OpenAI to Anthropic Streaming Response Translation", () => {
   test("should translate a simple text stream correctly", () => {
     const openAIStream: Array<ChatCompletionChunk> = [
@@ -368,5 +369,164 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
     for (const event of translatedStream) {
       expect(isValidAnthropicStreamEvent(event)).toBe(true)
     }
+  })
+
+  test("does not inject synthetic tool narration for Claude tool-call streams", () => {
+    const openAIStream: Array<ChatCompletionChunk> = [
+      {
+        id: "cmpl-claude-tool",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "claude-opus-4",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-claude-tool",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "claude-opus-4",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_claude",
+                  type: "function",
+                  function: {
+                    name: "Read",
+                    arguments: '{"file_path":"a.txt"}',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-claude-tool",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "claude-opus-4",
+        choices: [
+          { index: 0, delta: {}, finish_reason: "tool_calls", logprobs: null },
+        ],
+      },
+    ]
+
+    const streamState: AnthropicStreamState = {
+      messageStartSent: false,
+      messageStopSent: false,
+      contentBlockIndex: 0,
+      contentBlockOpen: false,
+      thinkingBlockOpen: false,
+      hasEmittedText: false,
+      toolCalls: {},
+      thinkingEnabled: false,
+    }
+
+    const translatedStream = openAIStream.flatMap((chunk) =>
+      translateChunkToAnthropicEvents(chunk, streamState),
+    )
+
+    const textDeltas = translatedStream.filter(
+      (event) =>
+        event.type === "content_block_delta"
+        && event.delta.type === "text_delta",
+    )
+    expect(textDeltas).toHaveLength(0)
+
+    const toolStarts = translatedStream.filter(
+      (event) =>
+        event.type === "content_block_start"
+        && event.content_block.type === "tool_use",
+    )
+    expect(toolStarts).toHaveLength(1)
+  })
+
+  test("still injects synthetic tool narration for non-Claude tool-call streams", () => {
+    const openAIStream: Array<ChatCompletionChunk> = [
+      {
+        id: "cmpl-gemini-tool",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "gemini-2.5-pro",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-gemini-tool",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "gemini-2.5-pro",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_gemini",
+                  type: "function",
+                  function: {
+                    name: "Read",
+                    arguments: '{"file_path":"a.txt"}',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-gemini-tool",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "gemini-2.5-pro",
+        choices: [
+          { index: 0, delta: {}, finish_reason: "tool_calls", logprobs: null },
+        ],
+      },
+    ]
+
+    const streamState: AnthropicStreamState = {
+      messageStartSent: false,
+      messageStopSent: false,
+      contentBlockIndex: 0,
+      contentBlockOpen: false,
+      thinkingBlockOpen: false,
+      hasEmittedText: false,
+      toolCalls: {},
+      thinkingEnabled: false,
+    }
+
+    const translatedStream = openAIStream.flatMap((chunk) =>
+      translateChunkToAnthropicEvents(chunk, streamState),
+    )
+
+    const textDeltas = translatedStream.filter(
+      (event) =>
+        event.type === "content_block_delta"
+        && event.delta.type === "text_delta",
+    )
+    expect(textDeltas.length).toBeGreaterThan(0)
   })
 })

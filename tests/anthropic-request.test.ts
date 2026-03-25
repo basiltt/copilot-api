@@ -393,9 +393,15 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
     }
     const result = translateToOpenAI(anthropicPayload)
     const toolMsg = result.messages.find((m) => m.role === "tool")
-    // Should be an array with an image_url part
-    expect(Array.isArray(toolMsg?.content)).toBe(true)
-    const parts = toolMsg?.content as Array<{ type: string }>
+    expect(typeof toolMsg?.content).toBe("string")
+    expect(toolMsg?.content).toContain(
+      "Non-text tool result forwarded in the following user message",
+    )
+
+    const userMsgs = result.messages.filter((m) => m.role === "user")
+    const followUpMsg = userMsgs.at(-1)
+    expect(Array.isArray(followUpMsg?.content)).toBe(true)
+    const parts = followUpMsg?.content as Array<{ type: string }>
     expect(parts[0].type).toBe("image_url")
   })
 
@@ -432,6 +438,60 @@ describe("handleUserMessage array tool_result content and web_search_tool_result
     const toolMsg = result.messages.find((m) => m.role === "tool")
     expect(typeof toolMsg?.content).toBe("string")
     expect(toolMsg?.content).toContain("file1.txt")
+  })
+
+  test("oversized tool_result text is condensed with head, middle, tail, and compaction guidance", () => {
+    const largeText =
+      "A".repeat(9000)
+      + "MIDDLE"
+      + "B".repeat(9000)
+      + "C".repeat(4500)
+      + "TAILMARK"
+      + "D".repeat(4500)
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4",
+      messages: [
+        { role: "user", content: "Run a verbose command." },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_large",
+              name: "Bash",
+              input: { command: "verbose" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_large",
+              content: [{ type: "text", text: largeText }],
+            },
+          ],
+        },
+      ],
+      max_tokens: 100,
+    }
+
+    const result = translateToOpenAI(anthropicPayload)
+    const toolMsg = result.messages.find((m) => m.role === "tool")
+    expect(typeof toolMsg?.content).toBe("string")
+    expect(toolMsg?.content).toContain("[Tool result condensed by proxy:")
+    expect(toolMsg?.content).toContain(
+      "compact older conversation state before discarding this fresh tool result",
+    )
+    expect(toolMsg?.content).toContain("=== BEGIN TOOL RESULT HEAD ===")
+    expect(toolMsg?.content).toContain(
+      "=== BEGIN TOOL RESULT MIDDLE SAMPLE ===",
+    )
+    expect(toolMsg?.content).toContain("=== BEGIN TOOL RESULT TAIL ===")
+    expect(toolMsg?.content).toContain("AAAA")
+    expect(toolMsg?.content).toContain("MIDDLE")
+    expect(toolMsg?.content).toContain("TAILMARK")
   })
 
   test("web_search_tool_result block is serialized as user message", () => {

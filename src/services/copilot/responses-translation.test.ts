@@ -212,6 +212,41 @@ describe("translateToResponsesPayload", () => {
       { role: "user", content: "Hello again" },
     ])
   })
+
+  test("translates multimodal user content to Responses input parts", () => {
+    const payload: ChatCompletionsPayload = {
+      model: "gpt-5.4",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this image." },
+            {
+              type: "image_url",
+              image_url: {
+                url: "data:image/png;base64,abc123",
+                detail: "high",
+              },
+            },
+          ],
+        },
+      ],
+    }
+    const result = translateToResponsesPayload(payload)
+    expect(result.input).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Describe this image." },
+          {
+            type: "input_image",
+            image_url: "data:image/png;base64,abc123",
+            detail: "high",
+          },
+        ],
+      },
+    ])
+  })
 })
 
 // ─── translateFromResponsesResponse ───────────────────────────────────────

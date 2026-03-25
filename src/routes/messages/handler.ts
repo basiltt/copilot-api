@@ -11,7 +11,8 @@ import {
   HTTPError,
   isContextWindowError,
   formatAnthropicContextWindowError,
-  buildAnthropicContextWindowErrorResponse,
+  sendAnthropicContextWindowError,
+  sendAnthropicInvalidRequestError,
 } from "~/lib/error"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
@@ -21,7 +22,10 @@ import {
   type ChatCompletionChunk,
   type ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
-import { getModelContextWindow } from "~/services/copilot/get-models"
+import {
+  getModelContextWindow,
+  getModelMaxOutput,
+} from "~/services/copilot/get-models"
 import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 import {
   prepareWebSearchPayload,
@@ -39,6 +43,7 @@ import {
   type ImageStrippingResult,
   updateImageFlag,
 } from "./image-stripping"
+import { findInvalidEmbeddedImage } from "./image-validation"
 import { applyLargeEditGuidance } from "./large-edit-guidance"
 import {
   translateToAnthropic,
@@ -115,6 +120,18 @@ export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
+  const invalidImage = findInvalidEmbeddedImage(anthropicPayload)
+  if (invalidImage) {
+    return sendAnthropicInvalidRequestError(
+      c,
+      `Embedded ${invalidImage.mediaType} image is too small to process reliably `
+        + `(${invalidImage.width}x${invalidImage.height}). `
+        + "This guard only blocks tiny placeholder-style images and does not "
+        + "affect normal screenshots or UI attachments. Use an image at least "
+        + "4x4 pixels.",
+    )
+  }
+
   // Check if compaction has removed images from this session's conversation.
   // This clears the per-session image-stripped flag so count_tokens stops
   // returning the inflated 200K value for this session.
@@ -157,13 +174,10 @@ export async function handleCompletion(c: Context) {
       consola.debug(
         `[context-window] Upstream error: "${contextWindowMessage}", modelLimit=${modelLimit}`,
       )
-      return c.json(
-        buildAnthropicContextWindowErrorResponse(
-          contextWindowMessage ?? "",
-          modelLimit,
-        ),
-        400,
-      )
+      return sendAnthropicContextWindowError(c, contextWindowMessage ?? "", {
+        status: 400,
+        modelLimit,
+      })
     }
 
     // All other errors: let route-level forwardError handle them
@@ -232,10 +246,10 @@ async function handleNonStreaming(
     // reduce the text content, producing a convergently smaller request.
     if (error instanceof CompactionNeededError) {
       const modelLimit = lookupModelLimit(anthropicPayload.model)
-      return c.json(
-        buildAnthropicContextWindowErrorResponse("", modelLimit),
-        400,
-      )
+      return sendAnthropicContextWindowError(c, "", {
+        status: 400,
+        modelLimit,
+      })
     }
 
     // Re-throw non-413 HTTPErrors so they bubble up to the route-level
@@ -513,7 +527,7 @@ async function fetchCopilotResponse(
   clampMaxTokens(openAIPayload, selectedModel)
   applyLargeEditGuidance(
     openAIPayload,
-    selectedModel.capabilities.limits.max_output_tokens,
+    selectedModel ? getModelMaxOutput(selectedModel) : undefined,
   )
   consola.debug(
     `[routing] model=${openAIPayload.model} found=${selectedModel !== undefined} requiresResponses=${selectedModel !== undefined && requiresResponsesApi(selectedModel)} endpoints=${JSON.stringify(selectedModel?.supported_endpoints)}`,

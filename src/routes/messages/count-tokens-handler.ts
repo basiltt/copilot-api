@@ -10,6 +10,7 @@ import {
 } from "~/services/copilot/get-models"
 
 import { type AnthropicMessagesPayload, isTypedTool } from "./anthropic-types"
+import { estimateAdditionalAttachmentTokens } from "./attachment-overhead"
 import { getSessionId, hasStrippedImages } from "./image-stripping"
 import { translateToOpenAI } from "./non-stream-translation"
 
@@ -96,6 +97,7 @@ export async function handleCountTokens(c: Context) {
     }
 
     const tokenCount = await getTokenCount(openAIPayload, selectedModel)
+    tokenCount.input += estimateAdditionalAttachmentTokens(anthropicPayload)
 
     if (anthropicPayload.tools && anthropicPayload.tools.length > 0) {
       let mcpToolExist = false

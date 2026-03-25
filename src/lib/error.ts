@@ -35,7 +35,7 @@ export async function forwardError(c: Context, error: unknown) {
       consola.debug(
         `Context window exceeded — extracted message: "${errorMessage}"`,
       )
-      return c.json(buildAnthropicContextWindowErrorResponse(errorMessage), 400)
+      return sendAnthropicContextWindowError(c, errorMessage, { status: 400 })
     }
 
     if (errorJson !== null && typeof errorJson === "object") {
@@ -104,14 +104,54 @@ export function buildAnthropicContextWindowErrorResponse(
   upstreamMessage: string,
   modelLimit?: number,
 ) {
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
   return {
-    type: "error",
-    request_id: `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-    error: {
-      type: "invalid_request_error",
-      message: formatAnthropicContextWindowError(upstreamMessage, modelLimit),
+    requestId,
+    body: {
+      type: "error",
+      request_id: requestId,
+      error: {
+        type: "invalid_request_error",
+        message: formatAnthropicContextWindowError(upstreamMessage, modelLimit),
+      },
     },
   }
+}
+
+export function sendAnthropicContextWindowError(
+  c: Context,
+  upstreamMessage: string,
+  options: {
+    modelLimit?: number
+    status?: ContentfulStatusCode
+  } = {},
+) {
+  const { requestId, body } = buildAnthropicContextWindowErrorResponse(
+    upstreamMessage,
+    options.modelLimit,
+  )
+  c.header("request-id", requestId)
+  return c.json(body, options.status ?? 400)
+}
+
+export function sendAnthropicInvalidRequestError(
+  c: Context,
+  message: string,
+  status: ContentfulStatusCode = 400,
+) {
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+  c.header("request-id", requestId)
+  return c.json(
+    {
+      type: "error",
+      request_id: requestId,
+      error: {
+        type: "invalid_request_error",
+        message,
+      },
+    },
+    status,
+  )
 }
 
 /**

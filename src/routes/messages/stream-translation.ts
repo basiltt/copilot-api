@@ -88,6 +88,16 @@ function isThinkingBlockOpen(state: AnthropicStreamState): boolean {
   return state.contentBlockOpen && state.thinkingBlockOpen
 }
 
+/**
+ * Claude clients persist/replay Anthropic-style tool streams more reliably
+ * when the assistant turn contains only the actual tool_use blocks.
+ * Synthetic pre-tool text is mainly needed for models like Gemini that often
+ * jump straight to tool calls without any visible narration.
+ */
+function shouldInjectSyntheticToolDescription(model: string): boolean {
+  return !model.toLowerCase().startsWith("claude")
+}
+
 // eslint-disable-next-line max-lines-per-function, complexity
 export function translateChunkToAnthropicEvents(
   chunk: ChatCompletionChunk,
@@ -266,7 +276,10 @@ export function translateChunkToAnthropicEvents(
         // would show a loading animation with no indication of progress.
         // The description extracts key details from tool arguments (e.g.
         // file paths, commands) so the user sees what's actually happening.
-        if (!state.hasEmittedText) {
+        if (
+          !state.hasEmittedText
+          && shouldInjectSyntheticToolDescription(chunk.model)
+        ) {
           const description = describeToolCall(
             toolCall.function.name,
             toolCall.function.arguments,

@@ -9,6 +9,7 @@
 import type { SSEMessage } from "hono/streaming"
 
 import type {
+  ContentPart,
   ChatCompletionResponse,
   ChatCompletionsPayload,
   ToolCall,
@@ -56,9 +57,13 @@ export interface ResponsesPayload {
 // 2. A function_call (assistant deciding to call a tool)
 // 3. A function_call_output (tool result)
 type ResponsesInputItem =
-  | { role: string; content: unknown }
+  | { role: string; content: string | Array<ResponsesContentPart> }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
   | { type: "function_call_output"; call_id: string; output: string }
+
+type ResponsesContentPart =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail?: "low" | "high" | "auto" }
 
 // ─── Responses API response types ────────────────────────────────────────────
 
@@ -171,11 +176,38 @@ function translateMessagesToResponsesInput(
     // Regular messages — ensure content is never null
     items.push({
       role: msg.role,
-      content: msg.content ?? "",
+      content: translateMessageContentToResponses(msg.content),
     })
   }
 
   return items
+}
+
+function translateMessageContentToResponses(
+  content: import("./create-chat-completions").Message["content"],
+): string | Array<ResponsesContentPart> {
+  if (content === null) return ""
+  if (typeof content === "string") return content
+  return content.map((part) => translateContentPartToResponses(part))
+}
+
+function translateContentPartToResponses(
+  part: ContentPart,
+): ResponsesContentPart {
+  if (part.type === "text") {
+    return {
+      type: "input_text",
+      text: part.text,
+    }
+  }
+
+  return {
+    type: "input_image",
+    image_url: part.image_url.url,
+    ...(part.image_url.detail !== undefined && {
+      detail: part.image_url.detail,
+    }),
+  }
 }
 
 function buildSystemInstruction(
