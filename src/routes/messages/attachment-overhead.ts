@@ -1,4 +1,5 @@
 import type {
+  AnthropicImageBlock,
   AnthropicDocumentBlock,
   AnthropicMessagesPayload,
 } from "./anthropic-types"
@@ -17,6 +18,8 @@ const PDF_BASE64_CHARS_PER_TOKEN = 80
 // URL/file-backed documents still consume meaningful context once expanded by
 // Claude Code, but we do not know their exact size at count-time.
 const DEFAULT_REMOTE_DOCUMENT_TOKENS = 2_500
+const MIN_IMAGE_TOKENS = 1_600
+const IMAGE_BASE64_CHARS_PER_TOKEN = 120
 
 function estimateDocumentTokens(block: AnthropicDocumentBlock): number {
   const source = block.source
@@ -37,6 +40,13 @@ function estimateDocumentTokens(block: AnthropicDocumentBlock): number {
   }
 
   return DEFAULT_REMOTE_DOCUMENT_TOKENS
+}
+
+function estimateImageTokens(block: AnthropicImageBlock): number {
+  return Math.max(
+    MIN_IMAGE_TOKENS,
+    Math.ceil(block.source.data.length / IMAGE_BASE64_CHARS_PER_TOKEN),
+  )
 }
 
 function getDocumentBlocksFromContent(
@@ -64,6 +74,31 @@ function getDocumentBlocksFromContent(
   return documents
 }
 
+function getImageBlocksFromContent(
+  content: NonNullable<AnthropicMessagesPayload["messages"][number]["content"]>,
+): Array<AnthropicImageBlock> {
+  if (typeof content === "string") return []
+
+  const images: Array<AnthropicImageBlock> = []
+
+  for (const block of content) {
+    if (block.type === "image") {
+      images.push(block)
+      continue
+    }
+
+    if (block.type === "tool_result" && Array.isArray(block.content)) {
+      for (const nested of block.content) {
+        if (nested.type === "image") {
+          images.push(nested)
+        }
+      }
+    }
+  }
+
+  return images
+}
+
 export function estimateAdditionalAttachmentTokens(
   payload: AnthropicMessagesPayload,
 ): number {
@@ -74,6 +109,10 @@ export function estimateAdditionalAttachmentTokens(
 
     for (const document of getDocumentBlocksFromContent(message.content)) {
       tokens += estimateDocumentTokens(document)
+    }
+
+    for (const image of getImageBlocksFromContent(message.content)) {
+      tokens += estimateImageTokens(image)
     }
   }
 

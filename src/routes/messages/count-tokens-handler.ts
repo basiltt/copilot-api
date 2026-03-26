@@ -18,6 +18,8 @@ import { translateToOpenAI } from "./non-stream-translation"
 // This is the effective window Claude Code uses for compaction thresholds
 // when it doesn't recognize the model (typically ~200K for Claude models).
 const CLAUDE_CODE_DEFAULT_WINDOW = 200_000
+const NON_CLAUDE_COMPACTION_SAFETY_MARGIN = 1.08
+const GEMINI_CONTEXT_SAFETY_BUFFER_TOKENS = 8_000
 
 // Token overhead for Anthropic-typed tools (per Anthropic pricing docs).
 // Custom tools use the existing flat +346 for the entire tools array.
@@ -166,16 +168,24 @@ export async function handleCountTokens(c: Context) {
  * expected window: `scale = CLAUDE_CODE_DEFAULT_WINDOW / modelPromptLimit`.
  * Only scales up (never down) to avoid artificially shrinking large windows.
  */
-function scaleTokensForModel(tokenCount: number, model: Model): number {
+export function scaleTokensForModel(tokenCount: number, model: Model): number {
   const modelWindow = getModelContextWindow(model)
   if (!modelWindow || modelWindow >= CLAUDE_CODE_DEFAULT_WINDOW) {
     // Model has a large enough context window — no scaling needed.
     return tokenCount
   }
-  const scale = CLAUDE_CODE_DEFAULT_WINDOW / modelWindow
+  const safeModelWindow =
+    model.id.startsWith("gemini") ?
+      Math.max(1, modelWindow - GEMINI_CONTEXT_SAFETY_BUFFER_TOKENS)
+    : modelWindow
+  const effectiveWindow = Math.round(
+    CLAUDE_CODE_DEFAULT_WINDOW * NON_CLAUDE_COMPACTION_SAFETY_MARGIN,
+  )
+  const scale = effectiveWindow / safeModelWindow
   consola.debug(
     `Scaling token count for ${model.id}: ${tokenCount} × ${scale.toFixed(2)} `
-      + `(model window: ${modelWindow}, effective: ${CLAUDE_CODE_DEFAULT_WINDOW})`,
+      + `(model window: ${modelWindow}, safe window: ${safeModelWindow}, `
+      + `effective: ${effectiveWindow})`,
   )
   return Math.round(tokenCount * scale)
 }

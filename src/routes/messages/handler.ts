@@ -154,6 +154,29 @@ export async function handleCompletion(c: Context) {
     return handleNonStreaming(c, anthropicPayload)
   }
 
+  if (looksLikeCompactionRequest(anthropicPayload)) {
+    try {
+      const result = await fetchCompactionResponse(anthropicPayload)
+      return streamSSE(c, async (stream) => {
+        await emitNonStreamingAsSSE(
+          stream,
+          result.response,
+          estimateTokensForStrippedImages(result.strippedBase64Chars),
+        )
+      })
+    } catch (error) {
+      const contextWindowMessage = await extractContextWindowMessage(error)
+      if (error instanceof CompactionNeededError || contextWindowMessage) {
+        const modelLimit = lookupModelLimit(anthropicPayload.model)
+        return sendAnthropicContextWindowError(c, contextWindowMessage ?? "", {
+          status: 400,
+          modelLimit,
+        })
+      }
+      throw error
+    }
+  }
+
   // Attempt upstream fetch BEFORE opening the SSE connection so context-window
   // errors surface as HTTP-level responses (400 + invalid_request_error) that
   // Claude Code recognizes for auto-compaction.  SSE error events inside an
@@ -230,6 +253,10 @@ async function handleNonStreaming(
   c: Context,
   anthropicPayload: AnthropicMessagesPayload,
 ) {
+  if (looksLikeCompactionRequest(anthropicPayload)) {
+    return handleNonStreamingCompaction(c, anthropicPayload)
+  }
+
   let result: ImageStrippingResult<
     Awaited<ReturnType<typeof createChatCompletions>>
   >
@@ -304,6 +331,20 @@ async function handleNonStreaming(
     return c.json(buildSyntheticFallbackJson(anthropicPayload, result.response))
   }
 
+  if (shouldUsePlainTextCompactionFallback(anthropicPayload, result.response)) {
+    consola.debug(
+      "Non-streaming compaction response lacked usable text — retrying with tools stripped",
+    )
+    const fallbackResponse = await fetchPlainTextCompactionResponse(
+      anthropicPayload,
+      result.response,
+    )
+    result = {
+      ...result,
+      response: fallbackResponse,
+    }
+  }
+
   const anthropicResponse = translateToAnthropic(result.response)
 
   // Inflate input_tokens to account for images stripped before sending.
@@ -322,6 +363,329 @@ async function handleNonStreaming(
     JSON.stringify(anthropicResponse),
   )
   return c.json(anthropicResponse)
+}
+
+async function handleNonStreamingCompaction(
+  c: Context,
+  anthropicPayload: AnthropicMessagesPayload,
+) {
+  try {
+    return c.json(await fetchNonStreamingAnthropicResponse(anthropicPayload))
+  } catch (error) {
+    if (error instanceof CompactionNeededError) {
+      const modelLimit = lookupModelLimit(anthropicPayload.model)
+      return sendAnthropicContextWindowError(c, "", {
+        status: 400,
+        modelLimit,
+      })
+    }
+    if (error instanceof HTTPError) throw error
+
+    consola.error("Copilot connection error (fetch-level):", error)
+    return c.json(
+      {
+        type: "error",
+        error: {
+          type: "api_error",
+          message:
+            error instanceof Error ?
+              error.message
+            : "An unexpected error occurred.",
+        },
+      },
+      500,
+    )
+  }
+}
+
+export function looksLikeCompactionRequest(
+  payload: AnthropicMessagesPayload,
+): boolean {
+  const latestUserMessage = [...payload.messages]
+    .reverse()
+    .find((message) => message.role === "user")
+
+  const fragments: Array<string> = []
+  if (latestUserMessage) {
+    if (typeof latestUserMessage.content === "string") {
+      fragments.push(latestUserMessage.content)
+    } else {
+      for (const block of latestUserMessage.content) {
+        if (block.type === "text") {
+          fragments.push(block.text)
+        }
+      }
+    }
+  }
+
+  const text = fragments.join("\n").toLowerCase()
+  if (
+    containsAny(text, [
+      "<command-name>/compact</command-name>",
+      "<command-message>compact</command-message>",
+    ])
+  ) {
+    return true
+  }
+
+  const asksToCompactConversation =
+    containsAny(text, ["summarize", "summarise", "compact"])
+    && containsAny(text, ["conversation", "chat", "session"])
+
+  const asksToGenerateSummary =
+    containsAny(text, ["create", "generate", "write"])
+    && containsAny(text, [
+      "conversation continuation summary",
+      "conversation summary",
+      "compact summary",
+      "summary for continuation",
+    ])
+
+  return asksToCompactConversation || asksToGenerateSummary
+}
+
+function containsAny(text: string, candidates: Array<string>): boolean {
+  return candidates.some((candidate) => text.includes(candidate))
+}
+
+function hasUsableNonStreamingText(response: ChatCompletionResponse): boolean {
+  if (response.choices.length === 0) return false
+  const choice = response.choices[0]
+  return (
+    typeof choice.message.content === "string"
+    && choice.message.content.trim().length > 0
+  )
+}
+
+export function shouldUsePlainTextCompactionFallback(
+  payload: AnthropicMessagesPayload,
+  response: ChatCompletionResponse,
+): boolean {
+  if (!looksLikeCompactionRequest(payload)) return false
+  if (!payload.tools || payload.tools.length === 0) return false
+  if (response.choices.length === 0) return false
+
+  const choice = response.choices[0]
+  return (
+    !hasUsableNonStreamingText(response)
+    || choice.finish_reason === "tool_calls"
+    || (Boolean(choice.message.tool_calls)
+      && choice.message.tool_calls.length > 0)
+  )
+}
+
+function buildPlainTextCompactionPayload(
+  payload: AnthropicMessagesPayload,
+): AnthropicMessagesPayload {
+  const systemInstruction =
+    "Respond with plain text only. Do not call tools. Produce only the "
+    + "requested conversation summary or compaction text."
+
+  let mergedSystem: AnthropicMessagesPayload["system"]
+  if (typeof payload.system === "string") {
+    mergedSystem = [payload.system, systemInstruction]
+  } else if (Array.isArray(payload.system)) {
+    mergedSystem = [
+      ...payload.system,
+      {
+        type: "text",
+        text: systemInstruction,
+      },
+    ]
+  } else {
+    mergedSystem = systemInstruction
+  }
+
+  return {
+    ...payload,
+    system: mergedSystem,
+    tools: undefined,
+    tool_choice: { type: "none" },
+  }
+}
+
+function extractCompactionFragments(
+  payload: AnthropicMessagesPayload,
+): Array<string> {
+  const fragments: Array<string> = []
+
+  for (const message of payload.messages.slice(-12)) {
+    if (typeof message.content === "string") {
+      fragments.push(`[${message.role}] ${message.content}`)
+      continue
+    }
+    for (const block of message.content) {
+      if (block.type === "text" && block.text.trim().length > 0) {
+        fragments.push(`[${message.role}] ${block.text}`)
+      }
+    }
+  }
+
+  return fragments
+}
+
+function clampCompactionFragment(text: string, maxLength: number): string {
+  const normalized = text.replaceAll(/\s+/g, " ").trim()
+  if (normalized.length <= maxLength) return normalized
+  const headLength = Math.max(80, Math.floor((maxLength - 5) / 2))
+  const tailLength = Math.max(40, maxLength - headLength - 5)
+  return `${normalized.slice(0, headLength)} ... ${normalized.slice(-tailLength)}`
+}
+
+function buildCompactionSummaryText(payload: AnthropicMessagesPayload): string {
+  const fragments = extractCompactionFragments(payload)
+    .slice(-8)
+    .map((fragment) => clampCompactionFragment(fragment, 400))
+
+  return (
+    "Conversation continuation summary:\n"
+    + fragments.join("\n")
+    + "\n\nContinue from the latest state above. Older context was compacted "
+    + "to fit the model context window."
+  )
+}
+
+export function buildSyntheticCompactionResponse(
+  payload: AnthropicMessagesPayload,
+  usage?: ChatCompletionResponse["usage"],
+): ChatCompletionResponse {
+  const content = buildCompactionSummaryText(payload)
+
+  return {
+    id: `chatcmpl_compact_${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: payload.model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content,
+        },
+        finish_reason: "stop",
+        logprobs: null,
+      },
+    ],
+    usage: usage ?? {
+      prompt_tokens: 0,
+      completion_tokens: 1,
+      total_tokens: 1,
+    },
+  }
+}
+
+async function fetchNonStreamingAnthropicResponse(
+  anthropicPayload: AnthropicMessagesPayload,
+): Promise<AnthropicResponse> {
+  const result = await fetchWithImageStripping(
+    fetchCopilotResponse,
+    anthropicPayload,
+  )
+
+  if (!isNonStreaming(result.response)) {
+    throw new Error("Unexpected streaming response.")
+  }
+
+  consola.debug(
+    "Non-streaming response from Copilot:",
+    JSON.stringify(result.response).slice(-400),
+  )
+
+  let response = result.response
+  if (isEmptyNonStreamingResponse(response)) {
+    consola.debug(
+      "Empty non-streaming response detected — returning synthetic fallback",
+    )
+    return buildSyntheticFallbackJson(anthropicPayload, response)
+  }
+
+  if (shouldUsePlainTextCompactionFallback(anthropicPayload, response)) {
+    consola.debug(
+      "Non-streaming compaction response lacked usable text — retrying with tools stripped",
+    )
+    response = await fetchPlainTextCompactionResponse(
+      anthropicPayload,
+      response,
+    )
+  }
+
+  const anthropicResponse = translateToAnthropic(response)
+  if (result.strippedBase64Chars > 0) {
+    anthropicResponse.usage.input_tokens += estimateTokensForStrippedImages(
+      result.strippedBase64Chars,
+    )
+  }
+
+  consola.debug(
+    "Translated Anthropic response:",
+    JSON.stringify(anthropicResponse),
+  )
+  return anthropicResponse
+}
+
+async function fetchCompactionResponse(
+  anthropicPayload: AnthropicMessagesPayload,
+): Promise<{ response: ChatCompletionResponse; strippedBase64Chars: number }> {
+  const result = await fetchWithImageStripping(fetchCopilotResponse, {
+    ...anthropicPayload,
+    stream: false,
+  })
+
+  if (!isNonStreaming(result.response)) {
+    throw new Error("Unexpected streaming response during compaction.")
+  }
+
+  let response = result.response
+  if (isEmptyNonStreamingResponse(response)) {
+    response = buildSyntheticCompactionResponse(
+      anthropicPayload,
+      response.usage,
+    )
+  } else if (shouldUsePlainTextCompactionFallback(anthropicPayload, response)) {
+    response = await fetchPlainTextCompactionResponse(
+      anthropicPayload,
+      response,
+    )
+  }
+
+  return {
+    response,
+    strippedBase64Chars: result.strippedBase64Chars,
+  }
+}
+
+async function fetchPlainTextCompactionResponse(
+  payload: AnthropicMessagesPayload,
+  originalResponse: ChatCompletionResponse,
+): Promise<ChatCompletionResponse> {
+  try {
+    const fallbackPayload = buildPlainTextCompactionPayload(payload)
+    const fallbackResult = await fetchWithImageStripping(
+      fetchCopilotResponse,
+      fallbackPayload,
+    )
+
+    if (!isNonStreaming(fallbackResult.response)) {
+      return buildSyntheticCompactionResponse(payload, originalResponse.usage)
+    }
+    if (isEmptyNonStreamingResponse(fallbackResult.response)) {
+      return buildSyntheticCompactionResponse(
+        payload,
+        fallbackResult.response.usage,
+      )
+    }
+    if (!hasUsableNonStreamingText(fallbackResult.response)) {
+      return buildSyntheticCompactionResponse(
+        payload,
+        fallbackResult.response.usage,
+      )
+    }
+    return fallbackResult.response
+  } catch (error) {
+    consola.warn("Plain-text compaction fallback failed:", error)
+    return buildSyntheticCompactionResponse(payload, originalResponse.usage)
+  }
 }
 
 /**

@@ -59,6 +59,36 @@ describe("estimateAdditionalAttachmentTokens", () => {
     expect(estimateAdditionalAttachmentTokens(payload)).toBe(5_000)
   })
 
+  test("counts nested image attachments inside tool_result blocks", () => {
+    const payload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4.6",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_img",
+              content: [
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: "image/png",
+                    data: "A".repeat(240_000),
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    }
+
+    expect(estimateAdditionalAttachmentTokens(payload)).toBeGreaterThan(1_600)
+  })
+
   test("ignores plain text conversations without attachments", () => {
     const payload: AnthropicMessagesPayload = {
       model: "claude-opus-4.6",
