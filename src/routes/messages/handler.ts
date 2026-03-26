@@ -419,6 +419,24 @@ export function looksLikeCompactionRequest(
   }
 
   const text = fragments.join("\n").toLowerCase()
+
+  const looksLikeResumeScaffold =
+    containsAny(text, [
+      "continue the conversation from where it left off",
+      "continue from the latest state above",
+      "resume directly",
+      "pick up the last task as if the break never happened",
+    ])
+    && containsAny(text, [
+      "this session is being continued from a previous conversation",
+      "older context was compacted to fit the model context window",
+      "conversation continuation summary:",
+    ])
+
+  if (looksLikeResumeScaffold) {
+    return false
+  }
+
   if (
     containsAny(text, [
       "<command-name>/compact</command-name>",

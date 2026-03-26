@@ -90,6 +90,8 @@ type ImageRef = {
   parent: Array<unknown>
   index: number
   base64Length: number
+  messageIndex: number
+  processed: boolean
 }
 
 /** Collects image refs from a tool_result's nested content array. */
@@ -98,6 +100,7 @@ function collectToolResultImages(
     AnthropicTextBlock | AnthropicImageBlock | AnthropicDocumentBlock
   >,
   refs: Array<ImageRef>,
+  messageIndex: number,
 ): void {
   for (let j = 0; j < content.length; j++) {
     const nested = content[j]
@@ -106,8 +109,106 @@ function collectToolResultImages(
         parent: content as Array<unknown>,
         index: j,
         base64Length: nested.source.data.length,
+        messageIndex,
+        processed: false,
       })
     }
+  }
+}
+
+function parseImageTrimmingMessageThreshold(): number {
+  const raw = process.env.IMAGE_CONTEXT_TRIMMING_BEFORE_MESSAGES
+  if (!raw) return 6
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 6
+}
+
+function isImageContextTrimmingEnabled(): boolean {
+  const raw = process.env.IMAGE_CONTEXT_TRIMMING_ENABLED?.trim().toLowerCase()
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on"
+}
+
+function messageHasAssistantText(
+  message: AnthropicMessagesPayload["messages"][number],
+): boolean {
+  if (message.role !== "assistant") return false
+  if (typeof message.content === "string") {
+    return message.content.trim().length > 0
+  }
+
+  return message.content.some(
+    (block) => block.type === "text" && block.text.trim().length > 0,
+  )
+}
+
+function collectImageRefs(payload: AnthropicMessagesPayload): Array<ImageRef> {
+  const imageRefs: Array<ImageRef> = []
+  const pendingRefs: Array<ImageRef> = []
+
+  for (const [messageIndex, message] of payload.messages.entries()) {
+    if (message.role === "user" && typeof message.content !== "string") {
+      for (let i = 0; i < message.content.length; i++) {
+        const block = message.content[i]
+
+        if (block.type === "image") {
+          const ref = {
+            parent: message.content as Array<unknown>,
+            index: i,
+            base64Length: block.source.data.length,
+            messageIndex,
+            processed: false,
+          }
+          imageRefs.push(ref)
+          pendingRefs.push(ref)
+        }
+
+        if (block.type === "tool_result" && Array.isArray(block.content)) {
+          const before = imageRefs.length
+          collectToolResultImages(block.content, imageRefs, messageIndex)
+          pendingRefs.push(...imageRefs.slice(before))
+        }
+      }
+    }
+
+    if (messageHasAssistantText(message)) {
+      for (const ref of pendingRefs) {
+        ref.processed = true
+      }
+      pendingRefs.length = 0
+    }
+  }
+
+  return imageRefs
+}
+
+function trimProcessedImages(payload: AnthropicMessagesPayload): {
+  payload: AnthropicMessagesPayload
+  trimmedCount: number
+} {
+  if (!isImageContextTrimmingEnabled()) {
+    return { payload, trimmedCount: 0 }
+  }
+
+  const threshold = parseImageTrimmingMessageThreshold()
+  const cloned = structuredClone(payload)
+  const imageRefs = collectImageRefs(cloned)
+  const lastMessageIndex = cloned.messages.length - 1
+  const placeholder = {
+    type: "text" as const,
+    text: "[Processed image trimmed to reduce request size]",
+  }
+
+  let trimmedCount = 0
+  for (const ref of imageRefs) {
+    const laterMessages = lastMessageIndex - ref.messageIndex
+    if (!ref.processed || laterMessages < threshold) continue
+    ref.parent[ref.index] = placeholder
+    trimmedCount += 1
+  }
+
+  return {
+    payload: trimmedCount > 0 ? cloned : payload,
+    trimmedCount,
   }
 }
 
@@ -129,35 +230,7 @@ function stripImages(
 } {
   // Deep-clone to avoid mutating the original
   const cloned = structuredClone(payload)
-
-  // Collect references to all base64 image blocks in conversation order.
-  // Each entry holds the parent array and the index within that array so
-  // we can replace the block in-place after deciding which ones to keep.
-  const imageRefs: Array<ImageRef> = []
-
-  for (const message of cloned.messages) {
-    if (message.role !== "user") continue
-    if (typeof message.content === "string") continue
-
-    for (let i = 0; i < message.content.length; i++) {
-      const block = message.content[i]
-
-      // AnthropicImageBlock.source.type is always "base64" per current
-      // type definitions, so narrowing on type === "image" is sufficient.
-      if (block.type === "image") {
-        imageRefs.push({
-          parent: message.content as Array<unknown>,
-          index: i,
-          base64Length: block.source.data.length,
-        })
-      }
-
-      // Walk nested tool_result content arrays
-      if (block.type === "tool_result" && Array.isArray(block.content)) {
-        collectToolResultImages(block.content, imageRefs)
-      }
-    }
-  }
+  const imageRefs = collectImageRefs(cloned)
 
   // Determine which images to strip
   const toStrip =
@@ -207,18 +280,24 @@ export async function fetchWithImageStripping<T>(
   fetchFn: (payload: AnthropicMessagesPayload) => Promise<T>,
   anthropicPayload: AnthropicMessagesPayload,
 ): Promise<ImageStrippingResult<T>> {
-  const sessionId = getSessionId(anthropicPayload)
+  const proactivelyTrimmed = trimProcessedImages(anthropicPayload)
+  const sessionId = getSessionId(proactivelyTrimmed.payload)
+  if (proactivelyTrimmed.trimmedCount > 0) {
+    consola.debug(
+      `${sessionId ? `[${sessionId}] ` : ""}Trimmed ${proactivelyTrimmed.trimmedCount} processed image(s) before upstream request.`,
+    )
+  }
 
   // Stage 1: Try with all images intact — let the model see everything.
   try {
-    const response = await fetchFn(anthropicPayload)
+    const response = await fetchFn(proactivelyTrimmed.payload)
     return { response, strippedBase64Chars: 0 }
   } catch (error) {
     if (!is413(error)) throw error
   }
 
   // Stage 2: Strip older images, keep the most recent one
-  const stage2 = stripImages(anthropicPayload, true)
+  const stage2 = stripImages(proactivelyTrimmed.payload, true)
   if (stage2.strippedCount > 0) {
     consola.debug(
       `${sessionId ? `[${sessionId}] ` : ""}413 — stripped ${stage2.strippedCount} older image(s) (keeping last), retrying.`,
@@ -232,7 +311,7 @@ export async function fetchWithImageStripping<T>(
   }
 
   // Stage 3: Strip ALL images
-  const stage3 = stripImages(anthropicPayload, false)
+  const stage3 = stripImages(proactivelyTrimmed.payload, false)
   if (stage3.strippedCount > 0) {
     if (sessionId) sessionsWithStrippedImages.add(sessionId)
     consola.warn(

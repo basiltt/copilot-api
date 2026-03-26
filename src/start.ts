@@ -48,6 +48,20 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     consola.info("Verbose logging enabled")
   }
 
+  const imageTrimmingEnabled =
+    process.env.IMAGE_CONTEXT_TRIMMING_ENABLED?.trim().toLowerCase()
+  if (
+    imageTrimmingEnabled === "1"
+    || imageTrimmingEnabled === "true"
+    || imageTrimmingEnabled === "yes"
+    || imageTrimmingEnabled === "on"
+  ) {
+    const threshold = process.env.IMAGE_CONTEXT_TRIMMING_BEFORE_MESSAGES ?? "6"
+    consola.info(
+      `Processed image trimming enabled (older than ${threshold} message(s))`,
+    )
+  }
+
   state.accountType = options.accountType
   if (options.accountType !== "individual") {
     consola.info(`Using ${options.accountType} plan GitHub account`)

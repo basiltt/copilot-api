@@ -193,6 +193,27 @@ describe("Gemini compaction safeguards", () => {
     expect(looksLikeCompactionRequest(payload)).toBe(false)
   })
 
+  test("does not treat claude auto-compact continuation payloads as compaction requests", () => {
+    const payload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4.6",
+      max_tokens: 2048,
+      messages: [
+        {
+          role: "user",
+          content:
+            "This session is being continued from a previous conversation that ran out of context. "
+            + "The summary below covers the earlier portion of the conversation. "
+            + "Conversation continuation summary: [assistant] prior work summary. "
+            + "Continue from the latest state above. Older context was compacted to fit the model context window. "
+            + "Continue the conversation from where it left off without asking the user any further questions. "
+            + "Resume directly — do not acknowledge the summary, do not recap what was happening.",
+        },
+      ],
+    }
+
+    expect(looksLikeCompactionRequest(payload)).toBe(false)
+  })
+
   test("uses plain-text fallback when compaction response tries to call tools", () => {
     const payload: AnthropicMessagesPayload = {
       model: "gemini-3.1-pro-preview",
