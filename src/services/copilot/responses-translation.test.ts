@@ -21,6 +21,13 @@ describe("requiresResponsesApi", () => {
     expect(requiresResponsesApi(model)).toBe(true)
   })
 
+  test("returns true when endpoints exist but /chat/completions is absent", () => {
+    const model = {
+      supported_endpoints: ["/responses", "/some-other"],
+    } as Partial<Model> as Model
+    expect(requiresResponsesApi(model)).toBe(true)
+  })
+
   test("returns false when model supports /chat/completions", () => {
     const model = {
       supported_endpoints: ["/chat/completions"],

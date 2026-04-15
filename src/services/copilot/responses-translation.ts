@@ -18,13 +18,17 @@ import type { Model } from "./get-models"
 
 // ─── Routing helper ──────────────────────────────────────────────────────────
 
-/** Returns true if the model's only supported endpoint is /responses. */
+/**
+ * Returns true if the model does not support /chat/completions and should
+ * be routed through the /responses endpoint instead.
+ *
+ * This handles models like gpt-5.4-mini that appear in the model list but
+ * whose `supported_endpoints` either explicitly excludes /chat/completions
+ * or only lists /responses.
+ */
 export function requiresResponsesApi(model: Model): boolean {
-  return (
-    Array.isArray(model.supported_endpoints)
-    && model.supported_endpoints.length === 1
-    && model.supported_endpoints[0] === "/responses"
-  )
+  if (!Array.isArray(model.supported_endpoints)) return false
+  return !model.supported_endpoints.includes("/chat/completions")
 }
 
 // ─── Responses API payload types ─────────────────────────────────────────────
