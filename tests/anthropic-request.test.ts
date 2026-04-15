@@ -812,3 +812,56 @@ describe("isTypedTool discriminator", () => {
     expect(isTypedTool(customTool as AnthropicTool)).toBe(false)
   })
 })
+
+describe("output_config.format → response_format translation", () => {
+  test("translates json_schema output_config to OpenAI response_format", () => {
+    const result = translateToOpenAI({
+      model: "claude-haiku-4.5",
+      messages: [{ role: "user", content: "Hello" }],
+      max_tokens: 1000,
+      output_config: {
+        format: {
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: { title: { type: "string" } },
+            required: ["title"],
+            additionalProperties: false,
+          },
+        },
+      },
+    })
+    expect(result.response_format).toEqual({
+      type: "json_schema",
+      json_schema: {
+        name: "response",
+        schema: {
+          type: "object",
+          properties: { title: { type: "string" } },
+          required: ["title"],
+          additionalProperties: false,
+        },
+        strict: true,
+      },
+    })
+  })
+
+  test("returns undefined response_format when no output_config", () => {
+    const result = translateToOpenAI({
+      model: "claude-haiku-4.5",
+      messages: [{ role: "user", content: "Hello" }],
+      max_tokens: 1000,
+    })
+    expect(result.response_format).toBeUndefined()
+  })
+
+  test("returns undefined response_format when output_config has no format", () => {
+    const result = translateToOpenAI({
+      model: "claude-haiku-4.5",
+      messages: [{ role: "user", content: "Hello" }],
+      max_tokens: 1000,
+      output_config: { effort: "high" },
+    })
+    expect(result.response_format).toBeUndefined()
+  })
+})

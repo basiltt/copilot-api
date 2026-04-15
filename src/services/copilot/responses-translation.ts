@@ -53,7 +53,14 @@ export interface ResponsesPayload {
   stream?: boolean | null
   tools?: Array<ResponsesTool>
   tool_choice?: ChatCompletionsPayload["tool_choice"]
-  text?: { format: { type: string } }
+  text?: {
+    format: {
+      type: string
+      name?: string
+      schema?: Record<string, unknown>
+      strict?: boolean
+    }
+  }
 }
 
 // Responses API accepts three kinds of input items:
@@ -260,6 +267,18 @@ function buildTextFormat(
   responseFormat: ChatCompletionsPayload["response_format"],
 ): Pick<ResponsesPayload, "text"> | Record<string, never> {
   if (responseFormat !== null && responseFormat !== undefined) {
+    if (responseFormat.type === "json_schema") {
+      return {
+        text: {
+          format: {
+            type: "json_schema",
+            name: responseFormat.json_schema.name,
+            schema: responseFormat.json_schema.schema,
+            strict: responseFormat.json_schema.strict,
+          },
+        },
+      }
+    }
     return { text: { format: { type: responseFormat.type } } }
   }
   return {}

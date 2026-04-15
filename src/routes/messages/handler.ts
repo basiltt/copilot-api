@@ -34,6 +34,7 @@ import {
 
 import {
   type AnthropicMessagesPayload,
+  type AnthropicResponse,
   type AnthropicStreamEventData,
   type AnthropicStreamState,
 } from "./anthropic-types"
@@ -345,7 +346,9 @@ async function handleNonStreaming(
     }
   }
 
-  const anthropicResponse = translateToAnthropic(result.response)
+  const anthropicResponse = translateToAnthropic(
+    result.response as ChatCompletionResponse,
+  )
 
   // Inflate input_tokens to account for images stripped before sending.
   // Copilot reports prompt_tokens based on the smaller (stripped) payload,
@@ -487,7 +490,7 @@ export function shouldUsePlainTextCompactionFallback(
   return (
     !hasUsableNonStreamingText(response)
     || choice.finish_reason === "tool_calls"
-    || (Boolean(choice.message.tool_calls)
+    || (choice.message.tool_calls !== undefined
       && choice.message.tool_calls.length > 0)
   )
 }
@@ -501,7 +504,10 @@ function buildPlainTextCompactionPayload(
 
   let mergedSystem: AnthropicMessagesPayload["system"]
   if (typeof payload.system === "string") {
-    mergedSystem = [payload.system, systemInstruction]
+    mergedSystem = [
+      { type: "text", text: payload.system },
+      { type: "text", text: systemInstruction },
+    ]
   } else if (Array.isArray(payload.system)) {
     mergedSystem = [
       ...payload.system,

@@ -72,6 +72,7 @@ export function translateToOpenAI(
     user: payload.metadata?.user_id,
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
+    response_format: translateOutputConfig(payload.output_config),
   }
 }
 
@@ -80,6 +81,27 @@ function translateModelName(model: string): string {
   // Only applies to generation 4+ where minor version numbers are subagent-build-specific.
   // eslint-disable-next-line regexp/no-super-linear-backtracking, regexp/optimal-quantifier-concatenation
   return model.replace(/^(claude-[a-z]+-4)-\d+.*$/, "$1")
+}
+
+/**
+ * Translates Anthropic's `output_config.format` to OpenAI's `response_format`.
+ *
+ * Claude Code sends `output_config.format.type = "json_schema"` for structured
+ * output requests like title generation.  Without this translation, the model
+ * ignores the JSON constraint and returns free-form text instead.
+ */
+function translateOutputConfig(
+  outputConfig: AnthropicMessagesPayload["output_config"],
+): ChatCompletionsPayload["response_format"] {
+  if (!outputConfig?.format) return undefined
+  return {
+    type: "json_schema",
+    json_schema: {
+      name: "response",
+      schema: outputConfig.format.schema,
+      strict: true,
+    },
+  }
 }
 
 function translateAnthropicMessagesToOpenAI(
