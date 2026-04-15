@@ -18,6 +18,7 @@ import {
   type AnthropicMessagesPayload,
   type AnthropicRedactedThinkingBlock,
   type AnthropicResponse,
+  type AnthropicServerToolResultBlock,
   type AnthropicServerToolUseBlock,
   type AnthropicSystemBlock,
   type AnthropicTextBlock,
@@ -27,7 +28,6 @@ import {
   type AnthropicToolUseBlock,
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
-  type AnthropicWebSearchToolResultBlock,
   isTypedTool,
 } from "./anthropic-types"
 import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
@@ -36,6 +36,17 @@ const MAX_TOOL_RESULT_CHARS = 20_000
 const TOOL_RESULT_HEAD_CHARS = 5_000
 const TOOL_RESULT_MIDDLE_CHARS = 3_000
 const TOOL_RESULT_TAIL_CHARS = 5_000
+
+/**
+ * Type guard for server tool result blocks. Matches web_search_tool_result,
+ * web_fetch_tool_result, code_execution_tool_result, etc.
+ * Explicitly excludes plain "tool_result" (which has its own handler).
+ */
+function isServerToolResultBlock(
+  block: AnthropicUserContentBlock | AnthropicAssistantContentBlock,
+): block is AnthropicServerToolResultBlock {
+  return block.type.endsWith("_tool_result") && block.type !== "tool_result"
+}
 
 // Payload translation
 
@@ -113,13 +124,12 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
       (block): block is AnthropicToolResultBlock =>
         block.type === "tool_result",
     )
-    const webSearchResultBlocks = message.content.filter(
-      (block): block is AnthropicWebSearchToolResultBlock =>
-        block.type === "web_search_tool_result",
+    const serverToolResultBlocks = message.content.filter((block) =>
+      isServerToolResultBlock(block),
     )
     const otherBlocks = message.content.filter(
       (block) =>
-        block.type !== "tool_result" && block.type !== "web_search_tool_result",
+        block.type !== "tool_result" && !isServerToolResultBlock(block),
       // document blocks remain here intentionally — mapContent handles them
     )
 
@@ -171,10 +181,10 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
       }
     }
 
-    // Web search result blocks → serialize as user message
-    if (webSearchResultBlocks.length > 0) {
-      const text = webSearchResultBlocks
-        .map((b) => `[Web search result: ${JSON.stringify(b.content)}]`)
+    // Server tool result blocks → serialize as user message
+    if (serverToolResultBlocks.length > 0) {
+      const text = serverToolResultBlocks
+        .map((b) => `[${b.type}: ${JSON.stringify(b.content)}]`)
         .join("\n\n")
       newMessages.push({ role: "user", content: text })
     }
@@ -213,6 +223,10 @@ function handleAssistantMessage(
       block.type === "server_tool_use",
   )
 
+  const serverToolResultBlocks = message.content.filter((block) =>
+    isServerToolResultBlock(block),
+  )
+
   // Strip thinking + redacted_thinking — Copilot doesn't understand them and
   // they massively inflate the prompt token count (thinking blocks from Claude
   // Code's internal reasoning can be thousands of tokens each).
@@ -232,8 +246,11 @@ function handleAssistantMessage(
     ...serverToolUseBlocks.map(
       (b) => `[Server tool use: ${JSON.stringify(b)}]`,
     ),
+    ...serverToolResultBlocks.map(
+      (b) => `[${b.type}: ${JSON.stringify(b.content)}]`,
+    ),
   ]
-    .filter(Boolean) // strip empty strings to avoid spurious \n\n
+    .filter(Boolean)
     .join("\n\n")
 
   return toolUseBlocks.length > 0 ?
@@ -383,6 +400,44 @@ function mergeMessageContents(
   return merged
 }
 
+/**
+ * Serializes a content block to a plain-text representation.
+ * Used by both paths of mapContent for non-image/non-text blocks.
+ * Returns null for blocks that should be silently skipped.
+ */
+function serializeBlockToText(
+  block: AnthropicUserContentBlock | AnthropicAssistantContentBlock,
+): string | null {
+  switch (block.type) {
+    case "text": {
+      return block.text
+    }
+    case "document": {
+      return "[Document: PDF content not displayable]"
+    }
+    case "server_tool_use": {
+      return `[Server tool use: ${JSON.stringify(block)}]`
+    }
+    case "search_result": {
+      return `[Search: ${block.title}]\nSource: ${block.source}\n${block.content}`
+    }
+    case "container_upload": {
+      return `[Container upload: ${block.file_id}]`
+    }
+    default: {
+      // Catch-all: server tool results and future unknown types
+      if (
+        "content" in block
+        && (block.type as string) !== "thinking"
+        && (block.type as string) !== "redacted_thinking"
+      ) {
+        return `[${block.type}: ${JSON.stringify((block as { content: unknown }).content)}]`
+      }
+      return null
+    }
+  }
+}
+
 function mapContent(
   content:
     | string
@@ -398,58 +453,32 @@ function mapContent(
   const hasImage = content.some((block) => block.type === "image")
   if (!hasImage) {
     return content
-      .filter(
-        (block) =>
-          block.type === "text"
-          || block.type === "document" // user messages: PDF → placeholder
-          || block.type === "server_tool_use", // assistant messages: serialise to JSON
-      )
-      .map((block) => {
-        if (block.type === "text") return block.text
-        if (block.type === "document")
-          return "[Document: PDF content not displayable]"
-        // server_tool_use
-        return `[Server tool use: ${JSON.stringify(block)}]`
-      })
+      .map((block) => serializeBlockToText(block))
+      .filter(Boolean)
       .join("\n\n")
   }
 
   const contentParts: Array<ContentPart> = []
   for (const block of content) {
-    switch (block.type) {
-      case "text": {
-        contentParts.push({ type: "text", text: block.text })
-
-        break
-      }
-      case "image": {
+    if (block.type === "image") {
+      if (block.source.type === "url") {
+        contentParts.push({
+          type: "image_url",
+          image_url: { url: block.source.url },
+        })
+      } else {
         contentParts.push({
           type: "image_url",
           image_url: {
             url: `data:${block.source.media_type};base64,${block.source.data}`,
           },
         })
-
-        break
       }
-      case "document": {
-        contentParts.push({
-          type: "text",
-          text: "[Document: PDF content not displayable]",
-        })
-
-        break
+    } else {
+      const text = serializeBlockToText(block)
+      if (text) {
+        contentParts.push({ type: "text", text })
       }
-      case "server_tool_use": {
-        contentParts.push({
-          type: "text",
-          text: `[Server tool use: ${JSON.stringify(block)}]`,
-        })
-
-        break
-      }
-      // redacted_thinking: silently skip — opaque binary data, no OpenAI equivalent
-      // No default
     }
   }
   return contentParts

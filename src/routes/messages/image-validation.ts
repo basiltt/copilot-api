@@ -51,6 +51,8 @@ function findInvalidImageInToolResult(
 function getInvalidImageReason(
   block: AnthropicImageBlock,
 ): InvalidImage | undefined {
+  if (block.source.type !== "base64") return undefined // URL images: can't validate dimensions
+
   const size =
     block.source.media_type === "image/png" ?
       readPngSize(block.source.data)

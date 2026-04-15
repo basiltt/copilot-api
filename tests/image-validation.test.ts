@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
 
+import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
+
 import { findInvalidEmbeddedImage } from "~/routes/messages/image-validation"
 
 describe("findInvalidEmbeddedImage", () => {
   test("flags degenerate 1x1 PNG user images", () => {
-    const payload = {
+    const payload: AnthropicMessagesPayload = {
       model: "claude-opus-4.6",
       max_tokens: 16,
       messages: [
@@ -32,7 +34,7 @@ describe("findInvalidEmbeddedImage", () => {
   })
 
   test("allows normal PNG images", () => {
-    const payload = {
+    const payload: AnthropicMessagesPayload = {
       model: "claude-opus-4.6",
       max_tokens: 16,
       messages: [
@@ -56,7 +58,7 @@ describe("findInvalidEmbeddedImage", () => {
   })
 
   test("checks images nested inside tool results", () => {
-    const payload = {
+    const payload: AnthropicMessagesPayload = {
       model: "claude-opus-4.6",
       max_tokens: 16,
       messages: [

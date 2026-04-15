@@ -24,12 +24,23 @@ export interface AnthropicMessagesPayload {
     budget_tokens?: number
   }
   service_tier?: "auto" | "standard_only"
+  output_config?: {
+    effort?: "low" | "medium" | "high" | "max"
+    format?: { type: "json_schema"; schema: Record<string, unknown> }
+  }
+  speed?: "standard" | "fast"
+  cache_control?: { type: "ephemeral"; ttl?: number }
+  container?: Record<string, unknown>
+  mcp_servers?: Array<Record<string, unknown>>
+  context_management?: Record<string, unknown>
+  inference_geo?: string
 }
 
 export interface AnthropicTextBlock {
   type: "text"
   text: string
   cache_control?: { type: "ephemeral"; ttl?: number }
+  citations?: Array<unknown> // pass-through, not interpreted by proxy
 }
 
 /**
@@ -48,11 +59,13 @@ export type AnthropicSystemBlock =
 
 export interface AnthropicImageBlock {
   type: "image"
-  source: {
-    type: "base64"
-    media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-    data: string
-  }
+  source:
+    | {
+        type: "base64"
+        media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        data: string
+      }
+    | { type: "url"; url: string }
 }
 
 // New: document block (PDFs sent via Read tool)
@@ -82,6 +95,8 @@ export interface AnthropicToolUseBlock {
   id: string
   name: string
   input: Record<string, unknown>
+  cache_control?: { type: "ephemeral"; ttl?: number }
+  caller?: Record<string, unknown>
 }
 
 export interface AnthropicThinkingBlock {
@@ -113,12 +128,68 @@ export interface AnthropicWebSearchToolResultBlock {
   content: unknown
 }
 
+export interface AnthropicSearchResultBlock {
+  type: "search_result"
+  source: string
+  title: string
+  content: string
+  cache_control?: { type: "ephemeral"; ttl?: number }
+  citations?: Array<unknown>
+  search_result_index?: number
+  start_block_index?: number
+  end_block_index?: number
+}
+
+export interface AnthropicContainerUploadBlock {
+  type: "container_upload"
+  file_id: string
+  cache_control?: { type: "ephemeral"; ttl?: number }
+}
+
+interface ServerToolResultBase {
+  tool_use_id: string
+  content: unknown
+  cache_control?: { type: "ephemeral"; ttl?: number }
+}
+
+interface AnthropicWebFetchToolResultBlock extends ServerToolResultBase {
+  type: "web_fetch_tool_result"
+}
+
+interface AnthropicCodeExecutionToolResultBlock extends ServerToolResultBase {
+  type: "code_execution_tool_result"
+}
+
+interface AnthropicBashCodeExecutionToolResultBlock
+  extends ServerToolResultBase {
+  type: "bash_code_execution_tool_result"
+}
+
+interface AnthropicTextEditorCodeExecutionToolResultBlock
+  extends ServerToolResultBase {
+  type: "text_editor_code_execution_tool_result"
+}
+
+interface AnthropicToolSearchToolResultBlock extends ServerToolResultBase {
+  type: "tool_search_tool_result"
+}
+
+export type AnthropicServerToolResultBlock =
+  | AnthropicWebSearchToolResultBlock
+  | AnthropicWebFetchToolResultBlock
+  | AnthropicCodeExecutionToolResultBlock
+  | AnthropicBashCodeExecutionToolResultBlock
+  | AnthropicTextEditorCodeExecutionToolResultBlock
+  | AnthropicToolSearchToolResultBlock
+
 export type AnthropicUserContentBlock =
   | AnthropicTextBlock
   | AnthropicImageBlock
   | AnthropicDocumentBlock
   | AnthropicToolResultBlock
-  | AnthropicWebSearchToolResultBlock
+  | AnthropicSearchResultBlock
+  | AnthropicContainerUploadBlock
+  | AnthropicServerToolResultBlock
 
 export type AnthropicAssistantContentBlock =
   | AnthropicTextBlock
@@ -126,6 +197,7 @@ export type AnthropicAssistantContentBlock =
   | AnthropicThinkingBlock
   | AnthropicRedactedThinkingBlock
   | AnthropicServerToolUseBlock
+  | AnthropicServerToolResultBlock
 
 export interface AnthropicUserMessage {
   role: "user"
@@ -149,11 +221,12 @@ export interface AnthropicCustomTool {
   defer_loading?: boolean
   input_examples?: Array<unknown>
   eager_input_streaming?: boolean
+  allowed_callers?: Array<string>
 }
 
 // Anthropic-typed tool (versioned type string, no input_schema)
 // Examples: bash_20250124, text_editor_20250728, computer_20251124, web_search_20250305
-export interface AnthropicTypedTool {
+interface AnthropicTypedTool {
   type: string
   name: string
   [key: string]: unknown
@@ -216,6 +289,13 @@ export interface AnthropicContentBlockStartEvent {
         input: Record<string, unknown>
       })
     | { type: "thinking"; thinking: string }
+    | {
+        type: "server_tool_use"
+        id: string
+        name: string
+        input: Record<string, unknown>
+      }
+    | AnthropicServerToolResultBlock
 }
 
 export interface AnthropicContentBlockDeltaEvent {
@@ -226,6 +306,8 @@ export interface AnthropicContentBlockDeltaEvent {
     | { type: "input_json_delta"; partial_json: string }
     | { type: "thinking_delta"; thinking: string }
     | { type: "signature_delta"; signature: string }
+    | { type: "citations_delta"; citation: unknown }
+    | { type: "compaction_delta"; content: unknown }
 }
 
 export interface AnthropicContentBlockStopEvent {

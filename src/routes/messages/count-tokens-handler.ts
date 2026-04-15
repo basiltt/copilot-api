@@ -32,6 +32,19 @@ const ANTHROPIC_TYPED_TOOL_TOKEN_OVERHEAD: Record<string, number> = {
   bash_20250124: 700,
   bash_20241022: 700,
   // computer_use and web_search: overhead included in beta pricing, not additive
+  // --- new (estimates for compaction heuristic, not billing) ---
+  web_fetch_20250910: 500,
+  web_fetch_20260209: 500,
+  web_fetch_20260309: 500,
+  code_execution_20250522: 500,
+  code_execution_20250825: 500,
+  code_execution_20260120: 500,
+  advisor_20260301: 500,
+  tool_search_tool_bm25_20251119: 200,
+  tool_search_tool_regex_20251119: 200,
+  tool_search_tool_bm25: 200,
+  tool_search_tool_regex: 200,
+  mcp_toolset: 300,
 }
 
 function applyToolTokenOverhead(

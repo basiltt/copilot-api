@@ -2,6 +2,7 @@ import type {
   AnthropicImageBlock,
   AnthropicDocumentBlock,
   AnthropicMessagesPayload,
+  AnthropicSearchResultBlock,
 } from "./anthropic-types"
 
 // Approximation for text-like attachments where we only have raw characters.
@@ -43,10 +44,16 @@ function estimateDocumentTokens(block: AnthropicDocumentBlock): number {
 }
 
 function estimateImageTokens(block: AnthropicImageBlock): number {
+  if (block.source.type !== "base64") return MIN_IMAGE_TOKENS // URL images: use minimum estimate
+
   return Math.max(
     MIN_IMAGE_TOKENS,
     Math.ceil(block.source.data.length / IMAGE_BASE64_CHARS_PER_TOKEN),
   )
+}
+
+function estimateSearchResultTokens(block: AnthropicSearchResultBlock): number {
+  return Math.max(500, Math.ceil(block.content.length / 4))
 }
 
 function getDocumentBlocksFromContent(
@@ -99,6 +106,37 @@ function getImageBlocksFromContent(
   return images
 }
 
+function getSearchResultBlocksFromContent(
+  content: NonNullable<AnthropicMessagesPayload["messages"][number]["content"]>,
+): Array<AnthropicSearchResultBlock> {
+  if (typeof content === "string") return []
+
+  const results: Array<AnthropicSearchResultBlock> = []
+
+  for (const block of content) {
+    if (block.type === "search_result") {
+      results.push(block)
+    }
+    // Note: search_result blocks do NOT appear inside tool_result.content
+    // (tool_result.content is typed as string | Array<Text|Image|Document>),
+    // so we don't need to check nested content here.
+  }
+
+  return results
+}
+
+function getContainerUploadBlocksFromContent(
+  content: NonNullable<AnthropicMessagesPayload["messages"][number]["content"]>,
+): number {
+  if (typeof content === "string") return 0
+
+  let count = 0
+  for (const block of content) {
+    if (block.type === "container_upload") count++
+  }
+  return count
+}
+
 export function estimateAdditionalAttachmentTokens(
   payload: AnthropicMessagesPayload,
 ): number {
@@ -114,6 +152,16 @@ export function estimateAdditionalAttachmentTokens(
     for (const image of getImageBlocksFromContent(message.content)) {
       tokens += estimateImageTokens(image)
     }
+
+    // search_result blocks
+    for (const searchResult of getSearchResultBlocksFromContent(
+      message.content,
+    )) {
+      tokens += estimateSearchResultTokens(searchResult)
+    }
+
+    // container_upload blocks (fixed overhead — just a file ID reference)
+    tokens += getContainerUploadBlocksFromContent(message.content) * 100
   }
 
   return tokens

@@ -65,19 +65,22 @@ export function updateImageFlag(payload: AnthropicMessagesPayload): void {
   const sessionId = getSessionId(payload)
   if (!sessionId || !sessionsWithStrippedImages.has(sessionId)) return
 
-  const hasImages = payload.messages.some((msg) => {
+  const hasBase64Images = payload.messages.some((msg) => {
     if (msg.role !== "user") return false
     if (typeof msg.content === "string") return false
     return msg.content.some((block) => {
-      if (block.type === "image") return true
+      if (block.type === "image" && block.source.type === "base64") return true
       if (block.type === "tool_result" && Array.isArray(block.content)) {
-        return block.content.some((nested) => nested.type === "image")
+        return block.content.some(
+          (nested) =>
+            nested.type === "image" && nested.source.type === "base64",
+        )
       }
       return false
     })
   })
 
-  if (!hasImages) {
+  if (!hasBase64Images) {
     consola.debug(
       `[${sessionId}] No images in conversation — compaction succeeded, clearing image flag.`,
     )
@@ -105,6 +108,7 @@ function collectToolResultImages(
   for (let j = 0; j < content.length; j++) {
     const nested = content[j]
     if (nested.type === "image") {
+      if (nested.source.type !== "base64") continue // URL images: no base64 data to strip
       refs.push({
         parent: content as Array<unknown>,
         index: j,
@@ -150,7 +154,7 @@ function collectImageRefs(payload: AnthropicMessagesPayload): Array<ImageRef> {
       for (let i = 0; i < message.content.length; i++) {
         const block = message.content[i]
 
-        if (block.type === "image") {
+        if (block.type === "image" && block.source.type === "base64") {
           const ref = {
             parent: message.content as Array<unknown>,
             index: i,
