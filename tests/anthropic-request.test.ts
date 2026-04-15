@@ -814,54 +814,45 @@ describe("isTypedTool discriminator", () => {
 })
 
 describe("output_config.format → response_format translation", () => {
-  test("translates json_schema output_config to OpenAI response_format", () => {
-    const result = translateToOpenAI({
-      model: "claude-haiku-4.5",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 1000,
-      output_config: {
-        format: {
-          type: "json_schema",
-          schema: {
-            type: "object",
-            properties: { title: { type: "string" } },
-            required: ["title"],
-            additionalProperties: false,
-          },
-        },
-      },
-    })
-    expect(result.response_format).toEqual({
-      type: "json_schema",
-      json_schema: {
-        name: "response",
+  const titlePayload = {
+    model: "claude-haiku-4.5",
+    messages: [{ role: "user" as const, content: "Hello" }],
+    max_tokens: 1000,
+    system: "Generate a title.",
+    output_config: {
+      format: {
+        type: "json_schema" as const,
         schema: {
           type: "object",
           properties: { title: { type: "string" } },
           required: ["title"],
           additionalProperties: false,
         },
-        strict: true,
       },
-    })
+    },
+  }
+
+  test("translates to json_object and enforces JSON in system prompt", () => {
+    const result = translateToOpenAI(titlePayload)
+    expect(result.response_format).toEqual({ type: "json_object" })
+    const sys = result.messages.find((m) => m.role === "system")
+    expect(sys).toBeDefined()
+    const content = sys?.content as string
+    expect(content).toContain("Generate a title.")
+    expect(content).toContain(
+      "IMPORTANT: You MUST respond with valid JSON only",
+    )
   })
 
-  test("returns undefined response_format when no output_config", () => {
+  test("does not enforce JSON when output_config.format is absent", () => {
     const result = translateToOpenAI({
       model: "claude-haiku-4.5",
       messages: [{ role: "user", content: "Hello" }],
       max_tokens: 1000,
+      system: "You are helpful.",
     })
     expect(result.response_format).toBeUndefined()
-  })
-
-  test("returns undefined response_format when output_config has no format", () => {
-    const result = translateToOpenAI({
-      model: "claude-haiku-4.5",
-      messages: [{ role: "user", content: "Hello" }],
-      max_tokens: 1000,
-      output_config: { effort: "high" },
-    })
-    expect(result.response_format).toBeUndefined()
+    const content = result.messages[0]?.content as string
+    expect(content).not.toContain("IMPORTANT: You MUST respond")
   })
 })

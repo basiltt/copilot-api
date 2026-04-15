@@ -53,12 +53,22 @@ function isServerToolResultBlock(
 export function translateToOpenAI(
   payload: AnthropicMessagesPayload,
 ): ChatCompletionsPayload {
+  const messages = translateAnthropicMessagesToOpenAI(
+    payload.messages,
+    payload.system,
+  )
+
+  // When structured output is requested (e.g. title generation), reinforce
+  // the JSON constraint directly in the messages.  The Copilot Chat
+  // Completions API ignores the `response_format` parameter, so the model
+  // only obeys the instruction if it appears prominently in the prompt.
+  if (payload.output_config?.format) {
+    enforceJsonOutput(messages)
+  }
+
   return {
     model: translateModelName(payload.model),
-    messages: translateAnthropicMessagesToOpenAI(
-      payload.messages,
-      payload.system,
-    ),
+    messages,
     max_tokens: payload.max_tokens,
     stop: payload.stop_sequences,
     stream: payload.stream,
@@ -87,20 +97,39 @@ function translateModelName(model: string): string {
  * Translates Anthropic's `output_config.format` to OpenAI's `response_format`.
  *
  * Claude Code sends `output_config.format.type = "json_schema"` for structured
- * output requests like title generation.  Without this translation, the model
- * ignores the JSON constraint and returns free-form text instead.
+ * output requests like title generation.  The Copilot Chat Completions API does
+ * not support `json_schema` structured outputs, so we downgrade to `json_object`
+ * which instructs the model to produce valid JSON.  The system prompt already
+ * describes the expected JSON shape, so this is sufficient.
  */
 function translateOutputConfig(
   outputConfig: AnthropicMessagesPayload["output_config"],
 ): ChatCompletionsPayload["response_format"] {
   if (!outputConfig?.format) return undefined
-  return {
-    type: "json_schema",
-    json_schema: {
-      name: "response",
-      schema: outputConfig.format.schema,
-      strict: true,
-    },
+  return { type: "json_object" }
+}
+
+/**
+ * Appends a JSON enforcement instruction to the system message when structured
+ * output is requested.  The Copilot Chat Completions API does not support the
+ * `response_format` parameter, so models ignore the JSON constraint unless it
+ * is spelled out in the prompt itself.  Without this, title generation requests
+ * (which use `output_config.format`) produce free-form text answers instead of
+ * the expected `{"title": "..."}` JSON, causing Claude Code to fall back to
+ * "Conversation continuation summary".
+ */
+function enforceJsonOutput(messages: Array<Message>): void {
+  const enforcement =
+    "\n\nIMPORTANT: You MUST respond with valid JSON only. "
+    + "Do not include any text, explanation, or markdown outside the JSON object. "
+    + "Your entire response must be a single JSON object."
+
+  const systemMsg = messages.find((m) => m.role === "system")
+  if (systemMsg && typeof systemMsg.content === "string") {
+    systemMsg.content += enforcement
+  } else {
+    // No system message — add one
+    messages.unshift({ role: "system", content: enforcement.trim() })
   }
 }
 

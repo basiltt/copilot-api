@@ -149,6 +149,15 @@ export async function handleCompletion(c: Context) {
   // through to Copilot and rely on forwardError to return the raw Copilot
   // error JSON (not Anthropic format), which Claude Code won't retry.
 
+  // Structured output requests (e.g. title generation) use output_config.format.
+  // The Copilot Chat Completions API does not enforce response_format, so the
+  // model may return free text instead of JSON.  Handle these specially: force
+  // non-streaming, validate/repair the JSON, and emit as SSE if the original
+  // request was streaming.
+  if (anthropicPayload.output_config?.format) {
+    return handleStructuredOutput(c, anthropicPayload)
+  }
+
   // For non-streaming requests just fetch and translate synchronously —
   // no SSE connection needed, so no ping mechanism required.
   if (!anthropicPayload.stream) {
@@ -368,6 +377,149 @@ async function handleNonStreaming(
   return c.json(anthropicResponse)
 }
 
+/**
+ * Handles structured output requests (output_config.format present).
+ *
+ * Claude Code uses structured output for lightweight tasks like title
+ * generation — it sends output_config.format.type = "json_schema" and
+ * expects the response text to be valid JSON matching the schema.
+ *
+ * The Copilot Chat Completions API silently ignores `response_format`, so
+ * the model may return free text instead of JSON.  To work around this:
+ *
+ * 1. Force the upstream request to **non-streaming** so we get the full
+ *    response text before committing anything to the client.
+ * 2. Validate the response text as JSON.  If invalid, try to extract a
+ *    JSON object from the free-text response.
+ * 3. If the original Anthropic request was streaming, emit the validated
+ *    response as a proper SSE event sequence; otherwise return as JSON.
+ */
+async function handleStructuredOutput(
+  c: Context,
+  anthropicPayload: AnthropicMessagesPayload,
+) {
+  const wasStreaming = anthropicPayload.stream
+
+  // Force non-streaming so we can validate the full response
+  const nonStreamingPayload: AnthropicMessagesPayload = {
+    ...anthropicPayload,
+    stream: false,
+  }
+
+  const openAIPayload = translateToOpenAI(nonStreamingPayload)
+  consola.debug(
+    "Translated OpenAI request payload (structured output):",
+    JSON.stringify(openAIPayload),
+  )
+
+  const selectedModel = state.models?.data.find(
+    (m) => m.id === openAIPayload.model,
+  )
+  clampMaxTokens(openAIPayload, selectedModel)
+
+  consola.debug(
+    `[structured-output] model=${openAIPayload.model} found=${selectedModel !== undefined}`,
+  )
+
+  let response: ChatCompletionResponse
+  try {
+    const result = await createChatCompletions(openAIPayload)
+    // Non-streaming should return ChatCompletionResponse directly
+    response = result as ChatCompletionResponse
+  } catch (error) {
+    consola.error("[structured-output] Upstream fetch failed:", error)
+    if (error instanceof HTTPError) throw error
+    return c.json(
+      {
+        type: "error",
+        error: {
+          type: "api_error",
+          message:
+            error instanceof Error ?
+              error.message
+            : "Structured output fetch failed.",
+        },
+      },
+      500,
+    )
+  }
+
+  // Extract the response text
+  const rawText = response.choices[0]?.message.content ?? ""
+
+  // Try to validate/repair the JSON
+  const repairedText = repairJsonResponse(rawText)
+  consola.debug(
+    `[structured-output] raw=${JSON.stringify(rawText).slice(0, 200)} repaired=${JSON.stringify(repairedText).slice(0, 200)}`,
+  )
+
+  // Replace the response content with the repaired text
+  if (response.choices[0]) {
+    response.choices[0].message.content = repairedText
+  }
+
+  if (wasStreaming) {
+    // Emit as SSE event sequence
+    return streamSSE(c, async (stream) => {
+      await emitNonStreamingAsSSE(stream, response)
+    })
+  }
+
+  // Non-streaming: translate and return
+  const anthropicResponse = translateToAnthropic(response)
+  consola.debug(
+    "Translated Anthropic response (structured output):",
+    JSON.stringify(anthropicResponse),
+  )
+  return c.json(anthropicResponse)
+}
+
+/**
+ * Attempts to ensure the response text is valid JSON.
+ *
+ * When the Copilot API ignores response_format, the model may wrap JSON
+ * in markdown code fences, add explanatory text around it, or return
+ * entirely free-form text.  This function tries progressively more
+ * aggressive extraction strategies:
+ *
+ * 1. If the text is already valid JSON, return as-is.
+ * 2. Strip markdown code fences and try again.
+ * 3. Extract the first JSON object literal from the text.
+ * 4. If all else fails, return the original text unchanged (Claude Code
+ *    will fall back to its default title).
+ */
+function repairJsonResponse(text: string): string {
+  const trimmed = text.trim()
+
+  // 1. Already valid JSON
+  if (isValidJson(trimmed)) return trimmed
+
+  // 2. Markdown code fence: ```json ... ``` or ``` ... ```
+  // eslint-disable-next-line regexp/no-super-linear-backtracking, regexp/optimal-quantifier-concatenation
+  const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/)
+  if (fenceMatch?.[1] && isValidJson(fenceMatch[1].trim())) {
+    return fenceMatch[1].trim()
+  }
+
+  // 3. Extract first JSON object from anywhere in the text
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
+  if (jsonMatch?.[0] && isValidJson(jsonMatch[0])) {
+    return jsonMatch[0]
+  }
+
+  // 4. Give up — return original
+  return text
+}
+
+function isValidJson(text: string): boolean {
+  try {
+    JSON.parse(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function handleNonStreamingCompaction(
   c: Context,
   anthropicPayload: AnthropicMessagesPayload,
@@ -421,7 +573,7 @@ export function looksLikeCompactionRequest(
     }
   }
 
-  const text = fragments.join("\n").toLowerCase()
+  const text = stripSystemReminders(fragments.join("\n")).toLowerCase()
 
   const looksLikeResumeScaffold =
     containsAny(text, [
@@ -467,6 +619,20 @@ export function looksLikeCompactionRequest(
 
 function containsAny(text: string, candidates: Array<string>): boolean {
   return candidates.some((candidate) => text.includes(candidate))
+}
+
+/**
+ * Strips `<system-reminder>...</system-reminder>` blocks from text.
+ *
+ * Claude Code injects system-reminder tags into user messages containing
+ * skill descriptions, CLAUDE.md content, MCP server instructions, and other
+ * metadata.  These injected blocks often contain words like "compact",
+ * "summarize", "conversation", "session" that cause false positives in
+ * `looksLikeCompactionRequest`.  By stripping them before pattern matching,
+ * we only inspect the user's actual message text.
+ */
+function stripSystemReminders(text: string): string {
+  return text.replaceAll(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
 }
 
 function hasUsableNonStreamingText(response: ChatCompletionResponse): boolean {

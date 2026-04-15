@@ -325,4 +325,43 @@ describe("Gemini compaction safeguards", () => {
     const gemini = makeModel("gemini-3.1-pro-preview", 136_000, 200_000)
     expect(scaleTokensForModel(128_000, gemini)).toBeGreaterThan(210_000)
   })
+
+  test("does not false-positive on system-reminder content containing compaction keywords", () => {
+    // Claude Code injects <system-reminder> tags into user messages with
+    // skill descriptions that contain words like "compact", "conversation",
+    // "session".  These should not trigger compaction detection.
+    const payload: AnthropicMessagesPayload = {
+      model: "claude-opus-4.6",
+      max_tokens: 32000,
+      tools: [
+        {
+          name: "Read",
+          description: "read tool",
+          input_schema: { type: "object", properties: {} },
+        },
+      ],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "<system-reminder>\nThe following skills are available:\n"
+                + "- claude-api: caching, thinking, compaction, tool use\n"
+                + "- insights: Generate a report analyzing your Claude Code sessions\n"
+                + "- auto-memory, persists across conversations\n"
+                + "</system-reminder>",
+            },
+            {
+              type: "text",
+              text: "open the below page in playwright mcp\n\nhttps://example.com/api-details",
+            },
+          ],
+        },
+      ],
+    }
+
+    expect(looksLikeCompactionRequest(payload)).toBe(false)
+  })
 })
