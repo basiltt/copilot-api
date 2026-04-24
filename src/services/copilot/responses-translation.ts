@@ -36,7 +36,7 @@ export function requiresResponsesApi(model: Model): boolean {
 // Tool format for the Responses API — name/description/parameters are top-level,
 // unlike Chat Completions where they are nested inside a `function` object.
 export interface ResponsesTool {
-  type: "function"
+  type: string
   name: string
   description?: string
   parameters?: Record<string, unknown>
@@ -284,7 +284,370 @@ function buildTextFormat(
   return {}
 }
 
-// ─── Response translation: Responses API → Chat Completions ──────────────────
+// ─── Routing helper: Claude models need Chat Completions ────────────────────
+
+export function requiresChatCompletionsApi(model: string): boolean {
+  return model.startsWith("claude-")
+}
+
+// ─── Payload translation: Responses API → Chat Completions ──────────────────
+
+export function translateFromResponsesPayloadToCC(
+  payload: ResponsesPayload,
+): ChatCompletionsPayload {
+  const messages: Array<import("./create-chat-completions").Message> = []
+
+  if (payload.instructions) {
+    messages.push({ role: "system", content: payload.instructions })
+  }
+
+  for (const item of payload.input) {
+    messages.push(translateInputItemToMessage(item))
+  }
+
+  const result: ChatCompletionsPayload = {
+    model: payload.model,
+    messages,
+  }
+
+  applyOptionalPayloadFields(payload, result)
+
+  return result
+}
+
+function translateInputItemToMessage(
+  item: ResponsesInputItem,
+): import("./create-chat-completions").Message {
+  const rawItem = item as Record<string, unknown>
+  const type = rawItem.type as string | undefined
+
+  if (type === "function_call") {
+    return {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: rawItem.call_id as string,
+          type: "function",
+          function: {
+            name: rawItem.name as string,
+            arguments: rawItem.arguments as string,
+          },
+        },
+      ],
+    }
+  }
+  if (type === "function_call_output") {
+    return {
+      role: "tool",
+      content: rawItem.output as string,
+      tool_call_id: rawItem.call_id as string,
+    }
+  }
+  return {
+    role: rawItem.role as string as
+      | "user"
+      | "assistant"
+      | "system"
+      | "developer",
+    content: translateResponsesContentToCC(
+      rawItem.content as string | Array<ResponsesContentPart>,
+    ),
+  }
+}
+
+function applyOptionalPayloadFields(
+  payload: ResponsesPayload,
+  result: ChatCompletionsPayload,
+): void {
+  if (payload.max_output_tokens !== undefined)
+    result.max_tokens = payload.max_output_tokens
+  if (payload.temperature !== undefined)
+    result.temperature = payload.temperature
+  if (payload.top_p !== undefined) result.top_p = payload.top_p
+  if (payload.stream !== undefined) result.stream = payload.stream
+  if (payload.tool_choice !== undefined)
+    result.tool_choice = payload.tool_choice
+
+  if (payload.tools && payload.tools.length > 0) {
+    const functionTools = payload.tools.filter(
+      (t) => t.type === "function" && t.name,
+    )
+    if (functionTools.length > 0) {
+      result.tools = functionTools.map((t) => ({
+        type: "function" as const,
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters ?? {},
+          ...(t.strict !== undefined && { strict: t.strict }),
+        },
+      }))
+    }
+  }
+
+  if (payload.text?.format) {
+    const fmt = payload.text.format
+    if (fmt.type === "json_schema" && fmt.name && fmt.schema) {
+      result.response_format = {
+        type: "json_schema",
+        json_schema: {
+          name: fmt.name,
+          schema: fmt.schema,
+          strict: fmt.strict,
+        },
+      }
+    } else if (fmt.type === "json_object") {
+      result.response_format = { type: "json_object" }
+    }
+  }
+}
+
+function translateResponsesContentToCC(
+  content: string | Array<ResponsesContentPart>,
+): string | Array<ContentPart> | null {
+  if (typeof content === "string") return content
+  return content.map((part) => {
+    if (part.type === "input_text") {
+      return { type: "text" as const, text: part.text }
+    }
+    return {
+      type: "image_url" as const,
+      image_url: {
+        url: part.image_url,
+        ...(part.detail && { detail: part.detail }),
+      },
+    }
+  })
+}
+
+// ─── Response translation: Chat Completions → Responses API ─────────────────
+
+export function translateFromCCToResponsesResponse(
+  resp: ChatCompletionResponse,
+  responsesId?: string,
+): Record<string, unknown> {
+  const id = responsesId ?? `resp_${Date.now()}`
+  const choice = resp.choices.at(0)
+  if (!choice) {
+    return { id, object: "response", model: resp.model, output: [], usage: {} }
+  }
+
+  const output: Array<Record<string, unknown>> = []
+
+  if (choice.message.content) {
+    output.push({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: choice.message.content }],
+    })
+  }
+
+  if (choice.message.tool_calls) {
+    for (const tc of choice.message.tool_calls) {
+      output.push({
+        type: "function_call",
+        call_id: tc.id,
+        name: tc.function.name,
+        arguments: tc.function.arguments,
+      })
+    }
+  }
+
+  return {
+    id,
+    object: "response",
+    model: resp.model,
+    output,
+    usage: {
+      input_tokens: resp.usage?.prompt_tokens ?? 0,
+      output_tokens: resp.usage?.completion_tokens ?? 0,
+      total_tokens: resp.usage?.total_tokens ?? 0,
+    },
+  }
+}
+
+// ─── Stream translation: CC SSE chunk → Responses API SSE events ────────────
+
+export interface CCToResponsesStreamState {
+  outputIndex: number
+  textItemAdded: boolean
+  pendingToolCalls: Map<number, { id: string; name: string }>
+  toolItemsAdded: Set<number>
+}
+
+export function createCCToResponsesStreamState(): CCToResponsesStreamState {
+  return {
+    outputIndex: 0,
+    textItemAdded: false,
+    pendingToolCalls: new Map(),
+    toolItemsAdded: new Set(),
+  }
+}
+
+interface ResponsesSSEEvent {
+  event: string
+  data: string
+}
+
+export function translateFromCCStreamToResponsesEvents(
+  chunk: Record<string, unknown>,
+  streamState: CCToResponsesStreamState,
+): Array<ResponsesSSEEvent> {
+  const choices = chunk.choices as Array<Record<string, unknown>> | undefined
+  if (!choices || choices.length === 0) return []
+
+  const choice = choices[0]
+  const delta = choice.delta as Record<string, unknown> | undefined
+  if (!delta) return []
+
+  const result: Array<ResponsesSSEEvent> = []
+  const responseId = chunk.id as string
+  const model = chunk.model as string
+
+  if (delta.content && typeof delta.content === "string") {
+    handleCCTextDelta(delta.content, streamState, result)
+  }
+
+  const toolCalls = delta.tool_calls as
+    | Array<Record<string, unknown>>
+    | undefined
+  if (toolCalls) {
+    handleCCToolCallDeltas(toolCalls, streamState, result)
+  }
+
+  const finishReason = choice.finish_reason as string | null
+  if (finishReason) {
+    handleCCFinishReason(finishReason, responseId, { model, out: result })
+  }
+
+  return result
+}
+
+function handleCCTextDelta(
+  content: string,
+  streamState: CCToResponsesStreamState,
+  out: Array<ResponsesSSEEvent>,
+): void {
+  if (!streamState.textItemAdded) {
+    streamState.textItemAdded = true
+    out.push(
+      {
+        event: "response.output_item.added",
+        data: JSON.stringify({
+          type: "response.output_item.added",
+          output_index: streamState.outputIndex,
+          item: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "" }],
+          },
+        }),
+      },
+      {
+        event: "response.content_part.added",
+        data: JSON.stringify({
+          type: "response.content_part.added",
+          output_index: streamState.outputIndex,
+          content_index: 0,
+          part: { type: "output_text", text: "" },
+        }),
+      },
+    )
+  }
+  out.push({
+    event: "response.output_text.delta",
+    data: JSON.stringify({
+      type: "response.output_text.delta",
+      output_index: 0,
+      content_index: 0,
+      delta: content,
+    }),
+  })
+}
+
+function getToolOutputIndex(
+  tcIndex: number,
+  streamState: CCToResponsesStreamState,
+): number {
+  return streamState.textItemAdded ?
+      streamState.outputIndex + 1 + tcIndex
+    : streamState.outputIndex + tcIndex
+}
+
+function handleCCToolCallDeltas(
+  toolCalls: Array<Record<string, unknown>>,
+  streamState: CCToResponsesStreamState,
+  out: Array<ResponsesSSEEvent>,
+): void {
+  for (const tc of toolCalls) {
+    const index = (tc.index as number | undefined) ?? 0
+    const fn = tc.function as Record<string, unknown> | undefined
+
+    if (tc.id && fn?.name) {
+      streamState.pendingToolCalls.set(index, {
+        id: tc.id as string,
+        name: fn.name as string,
+      })
+    }
+
+    if (
+      !streamState.toolItemsAdded.has(index)
+      && streamState.pendingToolCalls.has(index)
+    ) {
+      streamState.toolItemsAdded.add(index)
+      const info = streamState.pendingToolCalls.get(index)
+      if (info) {
+        out.push({
+          event: "response.output_item.added",
+          data: JSON.stringify({
+            type: "response.output_item.added",
+            output_index: getToolOutputIndex(index, streamState),
+            item: {
+              type: "function_call",
+              call_id: info.id,
+              name: info.name,
+              arguments: "",
+            },
+          }),
+        })
+      }
+    }
+
+    if (fn?.arguments && typeof fn.arguments === "string") {
+      out.push({
+        event: "response.function_call_arguments.delta",
+        data: JSON.stringify({
+          type: "response.function_call_arguments.delta",
+          output_index: getToolOutputIndex(index, streamState),
+          delta: fn.arguments,
+        }),
+      })
+    }
+  }
+}
+
+function handleCCFinishReason(
+  finishReason: string,
+  responseId: string,
+  { model, out }: { model: string; out: Array<ResponsesSSEEvent> },
+): void {
+  const status = finishReason === "length" ? "incomplete" : "completed"
+  out.push({
+    event: "response.completed",
+    data: JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: responseId,
+        object: "response",
+        model,
+        status,
+        output: [],
+        usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      },
+    }),
+  })
+}
 
 export function translateFromResponsesResponse(
   resp: ResponsesResponse,

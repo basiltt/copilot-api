@@ -4,11 +4,21 @@ import consola from "consola"
 import { events } from "fetch-event-stream"
 import { streamSSE } from "hono/streaming"
 
+import type { ResponsesPayload } from "~/services/copilot/responses-translation"
+
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { awaitApproval } from "~/lib/approval"
 import { HTTPError } from "~/lib/error"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
+import { createChatCompletions } from "~/services/copilot/create-chat-completions"
+import {
+  requiresChatCompletionsApi,
+  translateFromResponsesPayloadToCC,
+  translateFromCCToResponsesResponse,
+  translateFromCCStreamToResponsesEvents,
+  createCCToResponsesStreamState,
+} from "~/services/copilot/responses-translation"
 
 const INACTIVITY_TIMEOUT_MS = 3 * 60 * 1000
 
@@ -49,6 +59,13 @@ export async function handleResponses(c: Context) {
   consola.debug("Responses API request:", JSON.stringify(payload).slice(-400))
 
   if (state.manualApprove) await awaitApproval()
+
+  const model = typeof payload.model === "string" ? payload.model : ""
+
+  // Claude models don't support the Responses API — translate to Chat Completions
+  if (requiresChatCompletionsApi(model)) {
+    return handleClaudeViaCC(c, payload as unknown as ResponsesPayload)
+  }
 
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
@@ -124,4 +141,53 @@ export async function handleResponses(c: Context) {
   inactivity.clear()
   const data = await response.json()
   return c.json(data)
+}
+
+async function handleClaudeViaCC(c: Context, payload: ResponsesPayload) {
+  const ccPayload = translateFromResponsesPayloadToCC(payload)
+  const isStreaming = payload.stream === true
+
+  consola.debug(
+    `[responses→cc] Routing ${payload.model} through /chat/completions`,
+  )
+
+  const result = await createChatCompletions(ccPayload)
+
+  if (isStreaming && Symbol.asyncIterator in Object(result)) {
+    const streamState = createCCToResponsesStreamState()
+
+    return streamSSE(c, async (stream) => {
+      for await (const event of result as AsyncIterable<{
+        data?: string
+        event?: string
+      }>) {
+        const data = event.data ?? (event as Record<string, unknown>).data
+        if (!data || data === "[DONE]") continue
+
+        let parsed: Record<string, unknown>
+        try {
+          parsed = JSON.parse(data as string) as Record<string, unknown>
+        } catch {
+          continue
+        }
+
+        const responsesEvents = translateFromCCStreamToResponsesEvents(
+          parsed,
+          streamState,
+        )
+        for (const evt of responsesEvents) {
+          await stream.writeSSE({ event: evt.event, data: evt.data })
+        }
+      }
+      await stream.writeSSE({ data: "[DONE]" })
+    })
+  }
+
+  // Non-streaming
+  const responsesId = `resp_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
+  const responsesResponse = translateFromCCToResponsesResponse(
+    result as import("~/services/copilot/create-chat-completions").ChatCompletionResponse,
+    responsesId,
+  )
+  return c.json(responsesResponse)
 }

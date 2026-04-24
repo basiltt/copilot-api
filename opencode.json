@@ -16,5 +16,73 @@
       "enabled": true
     }
   },
-  "$schema": "https://opencode.ai/config.json"
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "copilot-anthropic": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Copilot (Anthropic)",
+      "options": {
+        "baseURL": "http://localhost:4141/v1"
+      },
+      "models": {
+        "claude-opus-4.6": {
+          "name": "Claude Opus 4.6",
+          "limit": {
+            "context": 200000,
+            "output": 32000
+          },
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
+          }
+        },
+        "claude-sonnet-4.6": {
+          "name": "Claude Sonnet 4.6",
+          "limit": {
+            "context": 200000,
+            "output": 32000
+          },
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
+          }
+        },
+        "claude-haiku-4.5": {
+          "name": "Claude Haiku 4.5",
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
+          }
+        }
+      }
+    },
+    "copilot-openai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Copilot (OpenAI)",
+      "options": {
+        "baseURL": "http://localhost:1515/v1"
+      },
+      "models": {
+        "gpt-5.4": {
+          "name": "GPT 5.4",
+          "limit": {
+            "context": 400000,
+            "output": 128000
+          },
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        }
+      }
+    }
+  }
 }

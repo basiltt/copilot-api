@@ -23,7 +23,8 @@
       "Bash(npx eslint:*)",
       "Bash(curl -s http://localhost:4141/v1/models)",
       "Bash(python -m json.tool)",
-      "Bash(powershell -Command \"Remove-Item -Recurse -Force ''c:\\\\Users\\\\ttbasil\\\\Desktop\\\\Projects\\\\PublicProjects\\\\copilot-api\\\\test-output''\")"
+      "Bash(powershell -Command \"Remove-Item -Recurse -Force ''c:\\\\Users\\\\ttbasil\\\\Desktop\\\\Projects\\\\PublicProjects\\\\copilot-api\\\\test-output''\")",
+      "Bash(bunx eslint *)"
     ]
   }
 }
