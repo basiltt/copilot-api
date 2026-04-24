@@ -155,8 +155,31 @@ async function handleClaudeViaCC(c: Context, payload: ResponsesPayload) {
 
   if (isStreaming && Symbol.asyncIterator in Object(result)) {
     const streamState = createCCToResponsesStreamState()
+    const responsesId = `resp_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
 
     return streamSSE(c, async (stream) => {
+      const responseStub = {
+        id: responsesId,
+        object: "response",
+        model: payload.model,
+        status: "in_progress",
+        output: [],
+      }
+      await stream.writeSSE({
+        event: "response.created",
+        data: JSON.stringify({
+          type: "response.created",
+          response: responseStub,
+        }),
+      })
+      await stream.writeSSE({
+        event: "response.in_progress",
+        data: JSON.stringify({
+          type: "response.in_progress",
+          response: responseStub,
+        }),
+      })
+
       for await (const event of result as AsyncIterable<{
         data?: string
         event?: string
