@@ -259,7 +259,12 @@ function buildOptionalScalars(
         strict: tool.function.strict,
       }),
     }))
-  if (payload.tool_choice !== null && payload.tool_choice !== undefined)
+  if (
+    payload.tool_choice !== null
+    && payload.tool_choice !== undefined
+    && out.tools
+    && out.tools.length > 0
+  )
     out.tool_choice = payload.tool_choice
   return out
 }
@@ -285,6 +290,82 @@ function buildTextFormat(
   return {}
 }
 
+// ─── Repair orphaned tool calls/results ───────────────────────────────────────
+
+interface RepairRange {
+  messages: Array<import("./create-chat-completions").Message>
+  start: number
+  end: number
+  callIds: Set<string>
+}
+
+function removeOrphanedResults(range: RepairRange): number {
+  const { messages, start, callIds } = range
+  let j = range.end
+  for (let k = j - start - 2; k >= 0; k--) {
+    const id = messages[start + 1 + k].tool_call_id
+    if (id && !callIds.has(id)) {
+      messages.splice(start + 1 + k, 1)
+      j--
+    }
+  }
+  return j
+}
+
+function insertMissingResults(range: RepairRange): number {
+  const { messages, start, end, callIds } = range
+  const existingIds = new Set(
+    messages
+      .slice(start + 1, end)
+      .map((m) => m.tool_call_id)
+      .filter(Boolean),
+  )
+  const missing = [...callIds].filter((id) => !existingIds.has(id))
+  if (missing.length > 0) {
+    const placeholders = missing.map((id) => ({
+      role: "tool" as const,
+      tool_call_id: id,
+      content: "",
+    }))
+    messages.splice(start + 1, 0, ...placeholders)
+    return end + missing.length
+  }
+  return end
+}
+
+function repairOrphanedToolCalls(
+  messages: Array<import("./create-chat-completions").Message>,
+): void {
+  let i = 0
+  while (i < messages.length) {
+    const msg = messages[i]
+    if (msg.role === "assistant" && msg.tool_calls?.length) {
+      const callIds = new Set(msg.tool_calls.map((tc) => tc.id))
+
+      let j = i + 1
+      while (j < messages.length && messages[j].role === "tool") j++
+
+      const range: RepairRange = { messages, start: i, end: j, callIds }
+      j = removeOrphanedResults(range)
+      range.end = j
+      j = insertMissingResults(range)
+
+      i = j
+      continue
+    }
+
+    if (msg.role === "tool" && msg.tool_call_id) {
+      const prev = i > 0 ? messages[i - 1] : null
+      if (!prev || prev.role !== "assistant" || !prev.tool_calls?.length) {
+        messages.splice(i, 1)
+        continue
+      }
+    }
+
+    i++
+  }
+}
+
 // ─── Routing helper: Claude models need Chat Completions ────────────────────
 export function requiresChatCompletionsApi(model: string): boolean {
   return model.startsWith("claude-")
@@ -304,6 +385,8 @@ export function translateFromResponsesPayloadToCC(
     const msg = translateInputItemToMessage(item)
     if (msg) messages.push(msg)
   }
+
+  repairOrphanedToolCalls(messages)
 
   const result: ChatCompletionsPayload = {
     model: payload.model,
@@ -373,10 +456,15 @@ function applyOptionalPayloadFields(
   if (payload.stream) {
     result.stream_options = { include_usage: true }
   }
-  if (payload.tool_choice !== undefined)
-    result.tool_choice = payload.tool_choice
 
   applyToolsAndFormat(payload, result)
+
+  if (
+    payload.tool_choice !== undefined
+    && result.tools
+    && result.tools.length > 0
+  )
+    result.tool_choice = payload.tool_choice
 }
 
 function applyToolsAndFormat(
@@ -847,7 +935,20 @@ function emitDoneEvents(
   for (const index of streamState.toolItemsAdded) {
     const info = streamState.pendingToolCalls.get(index)
     if (!info) continue
-    const args = streamState.accumulatedToolArgs.get(index) ?? ""
+    let args = streamState.accumulatedToolArgs.get(index) ?? ""
+
+    // If the stream was truncated (finish_reason: "length"), tool call
+    // arguments may be incomplete JSON.  Try to repair by closing open
+    // braces/brackets; if that fails, skip emitting this tool call entirely
+    // so the client doesn't choke on unparseable arguments.
+    try {
+      JSON.parse(args)
+    } catch {
+      const repaired = tryRepairJson(args)
+      if (repaired === null) continue
+      args = repaired
+    }
+
     out.push(
       {
         event: "response.function_call_arguments.done",
@@ -956,6 +1057,14 @@ export interface ResponsesStreamState {
   hasToolCalls: boolean
   /** Whether any text content was seen during this response. */
   hasTextContent: boolean
+  /** Index of the current tool call (increments per tool call for OpenAI delta format). */
+  toolCallIndex: number
+  /** Usage data extracted from response.completed event. */
+  usage?: {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+  }
 }
 
 export function createResponsesStreamState(): ResponsesStreamState {
@@ -964,6 +1073,7 @@ export function createResponsesStreamState(): ResponsesStreamState {
     currentToolCallSent: false,
     hasToolCalls: false,
     hasTextContent: false,
+    toolCallIndex: -1,
   }
 }
 
@@ -976,7 +1086,7 @@ export interface TranslateStreamOptions {
 export function translateFromResponsesStream(
   event: Record<string, unknown>,
   options: TranslateStreamOptions,
-): SSEMessage | null {
+): SSEMessage | Array<SSEMessage> | null {
   const { responseId, model, streamState } = options
   const type = event.type as string
 
@@ -1026,18 +1136,47 @@ export function translateFromResponsesStream(
   }
 
   if (type === "response.completed") {
-    // Emit the final finish chunk with the appropriate finish_reason,
-    // then signal end-of-stream. This is the ONLY place we emit
-    // finish_reason, ensuring the Anthropic message_delta + message_stop
-    // sequence is sent exactly once per response.
-    return makeFinishChunk(
-      responseId,
-      model,
-      streamState.hasToolCalls ? "tool_calls" : "stop",
-    )
+    return handleResponseCompleted(event, { responseId, model, streamState })
   }
 
   return null
+}
+
+function handleResponseCompleted(
+  event: Record<string, unknown>,
+  options: Pick<TranslateStreamOptions, "responseId" | "model" | "streamState">,
+): Array<SSEMessage> {
+  const { responseId, model, streamState } = options
+  const resp = event.response as Record<string, unknown> | undefined
+  const usage = resp?.usage as Record<string, number> | undefined
+  if (usage) {
+    streamState.usage = {
+      prompt_tokens: usage.input_tokens || usage.prompt_tokens || 0,
+      completion_tokens: usage.output_tokens || usage.completion_tokens || 0,
+      total_tokens: usage.total_tokens || 0,
+    }
+  }
+
+  const chunks: Array<SSEMessage> = []
+
+  chunks.push(
+    makeFinishChunk({
+      id: responseId,
+      model,
+      finishReason: streamState.hasToolCalls ? "tool_calls" : "stop",
+    }),
+  )
+
+  if (streamState.usage) {
+    chunks.push(
+      makeChunk(responseId, model, {
+        choices: [],
+        usage: streamState.usage,
+      }),
+    )
+  }
+
+  return chunks
 }
 
 /** Stash tool-call identity so argument deltas can reference it later. */
@@ -1076,7 +1215,9 @@ function handleFnCallArgsDelta(
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const pending = streamState.pendingToolCalls.shift()!
     streamState.currentToolCallSent = true
+    streamState.toolCallIndex++
     return makeToolCallChunk(responseId, model, {
+      index: streamState.toolCallIndex,
       args: event.delta as string,
       identity: {
         id: pending.call_id,
@@ -1087,6 +1228,7 @@ function handleFnCallArgsDelta(
   }
 
   return makeToolCallChunk(responseId, model, {
+    index: streamState.toolCallIndex,
     args: event.delta as string,
   })
 }
@@ -1120,15 +1262,21 @@ function makeReasoningDeltaChunk(
   })
 }
 
-function makeFinishChunk(
-  id: string,
-  model: string,
-  finishReason: string,
-): SSEMessage {
-  return makeChunk(id, model, {
+function makeFinishChunk(opts: {
+  id: string
+  model: string
+  finishReason: string
+  usage?: {
+    prompt_tokens: number
+    completion_tokens: number
+    total_tokens: number
+  }
+}): SSEMessage {
+  return makeChunk(opts.id, opts.model, {
     choices: [
-      { index: 0, delta: {}, finish_reason: finishReason, logprobs: null },
+      { index: 0, delta: {}, finish_reason: opts.finishReason, logprobs: null },
     ],
+    ...(opts.usage && { usage: opts.usage }),
   })
 }
 
@@ -1136,13 +1284,14 @@ function makeToolCallChunk(
   id: string,
   model: string,
   toolCallData: {
+    index: number
     args: string
     identity?: { id: string; type: string; name: string }
   },
 ): SSEMessage {
-  const { args, identity } = toolCallData
+  const { index, args, identity } = toolCallData
   const toolCall: Record<string, unknown> = {
-    index: 0,
+    index,
     ...(identity && { id: identity.id, type: identity.type }),
     function: {
       ...(identity && { name: identity.name }),
@@ -1174,5 +1323,64 @@ function makeChunk(
       model,
       ...extra,
     }),
+  }
+}
+
+function tryRepairJson(input: string): string | null {
+  const trimmed = input.trimEnd()
+  if (!trimmed) return null
+
+  // Strip a trailing incomplete string (no closing quote)
+  let s = trimmed
+  // Track bracket/brace nesting to close them
+  let inString = false
+  let escape = false
+  const stack: Array<string> = []
+
+  for (const ch of s) {
+    if (escape) {
+      escape = false
+      continue
+    }
+    if (ch === "\\") {
+      escape = true
+      continue
+    }
+    if (ch === '"') {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+    switch (ch) {
+      case "{": {
+        stack.push("}")
+        break
+      }
+      case "[": {
+        stack.push("]")
+        break
+      }
+      case "}":
+      case "]": {
+        stack.pop()
+        break
+      }
+      default: {
+        break
+      }
+    }
+  }
+
+  // If we ended inside a string, close it
+  if (inString) s += '"'
+
+  // Close any open brackets/braces
+  while (stack.length > 0) s += stack.pop() ?? ""
+
+  try {
+    JSON.parse(s)
+    return s
+  } catch {
+    return null
   }
 }

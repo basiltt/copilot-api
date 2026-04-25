@@ -128,6 +128,15 @@ describe("translateToResponsesPayload", () => {
       model: "gpt-5.4",
       messages: [{ role: "user", content: "Hi" }],
       tool_choice: "auto",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "get_weather",
+            parameters: { type: "object", properties: {} },
+          },
+        },
+      ],
     }
     const result = translateToResponsesPayload(payload)
     expect(result.tool_choice).toBe("auto")
@@ -156,7 +165,11 @@ describe("translateToResponsesPayload", () => {
     expect(result).not.toHaveProperty("temperature")
     expect(result).not.toHaveProperty("text")
   })
+})
 
+// ─── translateToResponsesPayload (tool calls & message repair) ───────────
+
+describe("translateToResponsesPayload (tool calls & repair)", () => {
   test("translates assistant messages with tool_calls into function_call items", () => {
     const payload: ChatCompletionsPayload = {
       model: "gpt-5.4",
@@ -370,7 +383,7 @@ describe("translateFromResponsesStream", () => {
       streamState: state,
     })
     expect(chunk).not.toBeNull()
-    if (!chunk) throw new Error("chunk is null")
+    if (!chunk || Array.isArray(chunk)) throw new Error("unexpected result")
     const parsed = JSON.parse(chunk.data as string) as {
       id: string
       object: string
@@ -390,15 +403,16 @@ describe("translateFromResponsesStream", () => {
   test("translates response.completed event to finish chunk (not [DONE])", () => {
     const state = createResponsesStreamState()
     const event = { type: "response.completed", response: { id: "resp_xyz" } }
-    const chunk = translateFromResponsesStream(event, {
+    const chunks = translateFromResponsesStream(event, {
       responseId: "resp_xyz",
       model: "gpt-5.4",
       streamState: state,
     })
-    expect(chunk).not.toBeNull()
-    if (!chunk) throw new Error("chunk is null")
-    // response.completed now emits a finish chunk with finish_reason
-    const parsed = JSON.parse(chunk.data as string) as {
+    expect(chunks).not.toBeNull()
+    expect(Array.isArray(chunks)).toBe(true)
+    const arr = chunks as Array<{ data: string }>
+    // First chunk: finish with stop reason
+    const parsed = JSON.parse(arr[0].data) as {
       choices: Array<{ delta: Record<string, unknown>; finish_reason: string }>
     }
     expect(parsed.choices[0].delta).toEqual({})
@@ -424,14 +438,15 @@ describe("translateFromResponsesStream", () => {
       type: "response.completed",
       response: { id: "resp_xyz" },
     }
-    const chunk = translateFromResponsesStream(completedEvent, {
+    const chunks = translateFromResponsesStream(completedEvent, {
       responseId: "resp_xyz",
       model: "gpt-5.4",
       streamState: state,
     })
-    expect(chunk).not.toBeNull()
-    if (!chunk) throw new Error("chunk is null")
-    const parsed = JSON.parse(chunk.data as string) as {
+    expect(chunks).not.toBeNull()
+    expect(Array.isArray(chunks)).toBe(true)
+    const arr = chunks as Array<{ data: string }>
+    const parsed = JSON.parse(arr[0].data) as {
       choices: Array<{ delta: Record<string, unknown>; finish_reason: string }>
     }
     expect(parsed.choices[0].finish_reason).toBe("tool_calls")
@@ -474,7 +489,7 @@ describe("translateFromResponsesStream (tool calls)", () => {
       streamState: state,
     })
     expect(chunk).not.toBeNull()
-    if (!chunk) throw new Error("chunk is null")
+    if (!chunk || Array.isArray(chunk)) throw new Error("unexpected result")
     const parsed = JSON.parse(chunk.data as string) as {
       choices: Array<{
         delta: { tool_calls: Array<{ function: { arguments: string } }> }
@@ -523,7 +538,7 @@ describe("translateFromResponsesStream (tool calls)", () => {
       streamState: state,
     })
     expect(chunk).not.toBeNull()
-    if (!chunk) throw new Error("chunk is null")
+    if (!chunk || Array.isArray(chunk)) throw new Error("unexpected result")
     const parsed = JSON.parse(chunk.data as string) as {
       choices: Array<{
         delta: {
@@ -555,7 +570,7 @@ describe("translateFromResponsesStream (tool calls)", () => {
       streamState: state,
     })
     expect(chunk2).not.toBeNull()
-    if (!chunk2) throw new Error("chunk2 is null")
+    if (!chunk2 || Array.isArray(chunk2)) throw new Error("unexpected result")
     const parsed2 = JSON.parse(chunk2.data as string) as {
       choices: Array<{
         delta: {
@@ -604,7 +619,7 @@ describe("translateFromResponsesStream (reasoning)", () => {
       streamState: state,
     })
     expect(chunk).not.toBeNull()
-    if (!chunk) throw new Error("chunk is null")
+    if (!chunk || Array.isArray(chunk)) throw new Error("unexpected result")
     const parsed = JSON.parse(chunk.data as string) as {
       choices: Array<{
         delta: { reasoning_content?: string; content?: string }

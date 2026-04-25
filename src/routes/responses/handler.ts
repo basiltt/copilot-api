@@ -97,6 +97,14 @@ export async function handleResponses(c: Context) {
     "X-Initiator": isAgentCall ? "agent" : "user",
   }
 
+  // Drop tool_choice when no tools are present — the API rejects this combination
+  if (payload.tool_choice !== undefined) {
+    const tools = payload.tools as Array<unknown> | undefined
+    if (!tools || tools.length === 0) {
+      delete payload.tool_choice
+    }
+  }
+
   const inactivity = createInactivityAbort()
 
   const response = await fetch(`${copilotBaseUrl(state)}/responses`, {

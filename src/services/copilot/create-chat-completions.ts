@@ -59,11 +59,9 @@ function createInactivityAbort(timeoutMs: number = INACTIVITY_TIMEOUT_MS) {
   }
 }
 
-export const createResponsesCompletion = async (
+function buildRequestHeaders(
   payload: ChatCompletionsPayload,
-): Promise<
-  ChatCompletionResponse | AsyncIterable<import("hono/streaming").SSEMessage>
-> => {
+): Record<string, string> {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
   const enableVision = payload.messages.some(
@@ -76,10 +74,18 @@ export const createResponsesCompletion = async (
     ["assistant", "tool"].includes(msg.role),
   )
 
-  const headers: Record<string, string> = {
+  return {
     ...copilotHeaders(state, enableVision),
     "X-Initiator": isAgentCall ? "agent" : "user",
   }
+}
+
+export const createResponsesCompletion = async (
+  payload: ChatCompletionsPayload,
+): Promise<
+  ChatCompletionResponse | AsyncIterable<import("hono/streaming").SSEMessage>
+> => {
+  const headers = buildRequestHeaders(payload)
 
   const responsesPayload = translateToResponsesPayload(payload)
 
@@ -141,12 +147,15 @@ export const createResponsesCompletion = async (
             streamState,
           })
           if (chunk) {
-            yieldCount++
-            consola.debug(
-              `[responses-stream] Yielding chunk #${yieldCount}:`,
-              JSON.stringify(chunk).slice(0, 200),
-            )
-            yield chunk
+            const chunks = Array.isArray(chunk) ? chunk : [chunk]
+            for (const c of chunks) {
+              yieldCount++
+              consola.debug(
+                `[responses-stream] Yielding chunk #${yieldCount}:`,
+                JSON.stringify(c).slice(0, 200),
+              )
+              yield c
+            }
           } else {
             consola.debug(
               `[responses-stream] translateFromResponsesStream returned null for type: ${parsed.type as string}`,
@@ -179,32 +188,22 @@ export const createResponsesCompletion = async (
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
 ) => {
-  if (!state.copilotToken) throw new Error("Copilot token not found")
-
-  const enableVision = payload.messages.some(
-    (x) =>
-      typeof x.content !== "string"
-      && x.content?.some((x) => x.type === "image_url"),
-  )
-
-  // Agent/user check for X-Initiator header
-  // Determine if any message is from an agent ("assistant" or "tool")
-  const isAgentCall = payload.messages.some((msg) =>
-    ["assistant", "tool"].includes(msg.role),
-  )
-
-  // Build headers and add X-Initiator
-  const headers: Record<string, string> = {
-    ...copilotHeaders(state, enableVision),
-    "X-Initiator": isAgentCall ? "agent" : "user",
-  }
+  const headers = buildRequestHeaders(payload)
 
   const inactivity = createInactivityAbort()
+
+  // Newer models (gpt-5.x) reject `max_tokens` and require
+  // `max_completion_tokens`. Translate the field transparently.
+  const { max_tokens, ...rest } = payload
+  const body =
+    max_tokens !== null && max_tokens !== undefined ?
+      { ...rest, max_completion_tokens: max_tokens }
+    : rest
 
   const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
     signal: inactivity.signal,
     // Bun's internal fetch timer defaults to ~4 minutes and fires mid-stream
     // when Copilot pauses between chunks on large (6000+ line) file edits.

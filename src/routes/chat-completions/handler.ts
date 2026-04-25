@@ -68,8 +68,10 @@ export async function handleCompletion(c: Context) {
     consola.debug("Set max_tokens to:", JSON.stringify(payload.max_tokens))
   }
 
+  const hasTools = Array.isArray(payload.tools) && payload.tools.length > 0
   const usesResponsesApi =
-    selectedModel !== undefined && requiresResponsesApi(selectedModel)
+    (selectedModel !== undefined && requiresResponsesApi(selectedModel))
+    || (hasTools && payload.model.startsWith("gpt-5"))
 
   const response =
     usesResponsesApi ?
