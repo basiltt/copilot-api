@@ -31,7 +31,7 @@ export async function forwardError(c: Context, error: unknown) {
     // The raw Copilot error JSON uses a non-Anthropic format that Claude
     // Code doesn't recognize as retriable.
     const errorMessage = extractErrorMessage(errorJson, errorText)
-    if (isContextWindowError(errorMessage)) {
+    if (isContextWindowError(errorMessage, error.response.status)) {
       consola.debug(
         `Context window exceeded — extracted message: "${errorMessage}"`,
       )
@@ -80,7 +80,12 @@ function extractErrorMessage(errorJson: unknown, fallback: string): string {
  * Detects whether an error message indicates the input exceeds the model's
  * context window.
  */
-export function isContextWindowError(message: string): boolean {
+export function isContextWindowError(
+  message: string,
+  statusCode?: number,
+): boolean {
+  if (statusCode === 413) return true
+
   const lower = message.toLowerCase()
   return (
     lower.includes("exceeds the context window")
@@ -91,6 +96,7 @@ export function isContextWindowError(message: string): boolean {
     // with code "model_max_prompt_tokens_exceeded"
     || lower.includes("exceeds the limit")
     || lower.includes("model_max_prompt_tokens_exceeded")
+    || lower.includes("failed to parse request")
   )
 }
 

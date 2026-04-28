@@ -20,7 +20,7 @@ import {
   createCCToResponsesStreamState,
 } from "~/services/copilot/responses-translation"
 
-const INACTIVITY_TIMEOUT_MS = 3 * 60 * 1000
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000
 
 function createInactivityAbort(timeoutMs: number = INACTIVITY_TIMEOUT_MS) {
   const controller = new AbortController()

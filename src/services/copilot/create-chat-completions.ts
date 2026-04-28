@@ -17,7 +17,7 @@ import {
 // slow-but-active stream (e.g. a 6000-line Write tool call) won't be killed
 // as long as chunks keep flowing.  The timeout only fires when the upstream
 // goes completely silent for this duration, indicating a stalled connection.
-const INACTIVITY_TIMEOUT_MS = 3 * 60 * 1000 // 3 minutes of silence
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes of silence
 
 /**
  * Creates an AbortController with an inactivity timer that resets on each
@@ -193,12 +193,16 @@ export const createChatCompletions = async (
   const inactivity = createInactivityAbort()
 
   // Newer models (gpt-5.x) reject `max_tokens` and require
-  // `max_completion_tokens`. Translate the field transparently.
+  // `max_completion_tokens`. Claude models still use `max_tokens`.
   const { max_tokens, ...rest } = payload
-  const body =
-    max_tokens !== null && max_tokens !== undefined ?
-      { ...rest, max_completion_tokens: max_tokens }
-    : rest
+  const usesMaxCompletionTokens =
+    rest.model.startsWith("gpt-5") || rest.model.startsWith("o")
+  let body: Record<string, unknown> = rest
+  if (max_tokens !== null && max_tokens !== undefined) {
+    const tokenKey =
+      usesMaxCompletionTokens ? "max_completion_tokens" : "max_tokens"
+    body = { ...rest, [tokenKey]: max_tokens }
+  }
 
   const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
     method: "POST",
