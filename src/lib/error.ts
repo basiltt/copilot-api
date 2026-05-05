@@ -17,20 +17,25 @@ export async function forwardError(c: Context, error: unknown) {
 
   if (error instanceof HTTPError) {
     const errorText = await error.response.text()
+    const contentType = error.response.headers.get("content-type")
     let errorJson: unknown
     try {
       errorJson = JSON.parse(errorText)
     } catch {
       errorJson = null
     }
-    consola.error("HTTP error:", errorJson ?? errorText)
+    const errorMessage = extractUpstreamErrorMessage(
+      errorJson,
+      errorText,
+      contentType,
+    )
+    consola.error("HTTP error:", errorJson ?? errorMessage)
 
     // Detect context-window-exceeded errors from upstream and return an
     // Anthropic-formatted "invalid_request_error" so Claude Code triggers
     // auto-compaction instead of just displaying a generic API error.
     // The raw Copilot error JSON uses a non-Anthropic format that Claude
     // Code doesn't recognize as retriable.
-    const errorMessage = extractErrorMessage(errorJson, errorText)
     if (isContextWindowError(errorMessage, error.response.status)) {
       consola.debug(
         `Context window exceeded — extracted message: "${errorMessage}"`,
@@ -45,7 +50,7 @@ export async function forwardError(c: Context, error: unknown) {
       )
     }
     return c.json(
-      { error: { message: errorText, type: "error" } },
+      { error: { message: errorMessage, type: "error" } },
       error.response.status as ContentfulStatusCode,
     )
   }
@@ -62,7 +67,11 @@ export async function forwardError(c: Context, error: unknown) {
 }
 
 /** Extracts the error message from a parsed Copilot error response. */
-function extractErrorMessage(errorJson: unknown, fallback: string): string {
+export function extractUpstreamErrorMessage(
+  errorJson: unknown,
+  fallback: string,
+  contentType?: string | null,
+): string {
   if (errorJson !== null && typeof errorJson === "object") {
     const obj = errorJson as Record<string, unknown>
     // Copilot format: { error: { message: "..." } }
@@ -73,7 +82,55 @@ function extractErrorMessage(errorJson: unknown, fallback: string): string {
     // Direct message field
     if (typeof obj.message === "string") return obj.message
   }
-  return fallback
+
+  return summarizeUpstreamErrorBody(fallback, contentType)
+}
+
+export function summarizeUpstreamErrorBody(
+  body: string,
+  contentType?: string | null,
+): string {
+  const trimmed = body.trim()
+  if (!trimmed) return "Upstream request failed."
+  if (!looksLikeHtml(trimmed, contentType)) return trimmed
+
+  const title = extractHtmlText(trimmed, /<title[^>]*>([\s\S]*?)<\/title>/i)
+  const headline = extractHtmlText(
+    trimmed,
+    /<strong[^>]*>([\s\S]*?)<\/strong>/i,
+  )
+  const paragraph = extractHtmlText(trimmed, /<p[^>]*>([\s\S]*?)<\/p>/i)
+
+  const parts = [title, headline ?? paragraph].filter(Boolean)
+  if (parts.length > 0) {
+    return `Upstream returned an HTML error page: ${parts.join(" - ")}`
+  }
+
+  return "Upstream returned an HTML error page."
+}
+
+function looksLikeHtml(body: string, contentType?: string | null): boolean {
+  return (
+    contentType?.toLowerCase().includes("text/html") === true
+    || /^\s*<!doctype html/i.test(body)
+    || /^\s*<html[\s>]/i.test(body)
+  )
+}
+
+function extractHtmlText(html: string, pattern: RegExp): string | undefined {
+  const match = html.match(pattern)
+  if (!match?.[1]) return undefined
+
+  const decoded = match[1]
+    .replaceAll(/<[^>]+>/g, " ")
+    .replaceAll("&nbsp;", " ")
+    .replaceAll("&middot;", "·")
+    .replaceAll("&mdash;", "-")
+    .replaceAll("&amp;", "&")
+    .replaceAll(/\s+/g, " ")
+    .trim()
+
+  return decoded.length > 0 ? decoded : undefined
 }
 
 /**

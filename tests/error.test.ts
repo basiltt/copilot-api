@@ -67,6 +67,21 @@ describe("forwardError — HTTPError with JSON body", () => {
     )
   })
 
+  test("summarizes HTML upstream error pages instead of returning raw markup", async () => {
+    const jsonFn = mock()
+    const c = makeContext(jsonFn)
+    const err = makeHTTPError(
+      "<!DOCTYPE html><html><head><title>Unicorn! &middot; GitHub</title></head><body><p><strong>We had issues producing the response to your request.</strong></p></body></html>",
+      502,
+    )
+    await forwardError(c, err)
+    const [body, status] = jsonFn.mock.calls[0] as [unknown, number]
+    expect(status).toBe(502)
+    expect((body as { error: { message: string } }).error.message).toBe(
+      "Upstream returned an HTML error page: Unicorn! · GitHub - We had issues producing the response to your request.",
+    )
+  })
+
   test("preserves status code from upstream", async () => {
     const jsonFn = mock()
     const c = makeContext(jsonFn)

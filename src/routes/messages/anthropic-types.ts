@@ -1,3 +1,5 @@
+import type { ToolNameMap } from "./tool-name-mapping"
+
 // Anthropic API Types
 
 export interface AnthropicMessagesPayload {
@@ -375,6 +377,8 @@ export interface AnthropicStreamState {
       accumulatedArgs: string
     }
   }
+  /** Maps OpenAI-safe function names back to the original Anthropic tool names. */
+  toolNameMap?: ToolNameMap
   /** Whether the original request included thinking: { type: "enabled" }. */
   thinkingEnabled: boolean
   /**

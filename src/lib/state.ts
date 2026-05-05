@@ -19,7 +19,10 @@ export interface State {
   // Burst rate limiting configuration
   burstCount?: number
   burstWindowSeconds?: number
+  burstMinSpacingMs: number
+  burstScope: "global" | "model"
   burstRequestTimestamps: Array<number>
+  burstPerModelTimestamps: Map<string, Array<number>>
 
   // Web search configuration
   braveApiKey?: string
@@ -32,6 +35,9 @@ export const state: State = {
   rateLimitWait: false,
   showToken: false,
   burstRequestTimestamps: [],
+  burstMinSpacingMs: 0,
+  burstScope: "global",
+  burstPerModelTimestamps: new Map(),
 }
 
 export function isWebSearchEnabled(): boolean {

@@ -53,14 +53,15 @@ function createInactivityAbort(timeoutMs: number = INACTIVITY_TIMEOUT_MS) {
 
 export async function handleResponses(c: Context) {
   await checkRateLimit(state)
-  await checkBurstLimit(state)
 
   const payload = await c.req.json<Record<string, unknown>>()
   consola.debug("Responses API request:", JSON.stringify(payload).slice(-400))
 
-  if (state.manualApprove) await awaitApproval()
-
   const model = typeof payload.model === "string" ? payload.model : ""
+
+  await checkBurstLimit(state, model)
+
+  if (state.manualApprove) await awaitApproval()
 
   // Claude models don't support the Responses API — translate to Chat Completions
   if (requiresChatCompletionsApi(model)) {

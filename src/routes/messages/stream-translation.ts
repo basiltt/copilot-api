@@ -4,6 +4,7 @@ import {
   type AnthropicStreamEventData,
   type AnthropicStreamState,
 } from "./anthropic-types"
+import { toAnthropicToolName } from "./tool-name-mapping"
 import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
 
 /**
@@ -257,6 +258,11 @@ export function translateChunkToAnthropicEvents(
 
   if (delta.tool_calls) {
     for (const toolCall of delta.tool_calls) {
+      const anthropicToolName =
+        toolCall.function?.name ?
+          toAnthropicToolName(toolCall.function.name, state.toolNameMap)
+        : undefined
+
       if (toolCall.id && toolCall.function?.name) {
         // New tool call starting.
         if (state.contentBlockOpen) {
@@ -281,7 +287,7 @@ export function translateChunkToAnthropicEvents(
           && shouldInjectSyntheticToolDescription(chunk.model)
         ) {
           const description = describeToolCall(
-            toolCall.function.name,
+            anthropicToolName ?? toolCall.function.name,
             toolCall.function.arguments,
           )
           events.push(
@@ -310,7 +316,7 @@ export function translateChunkToAnthropicEvents(
         const anthropicBlockIndex = state.contentBlockIndex
         state.toolCalls[toolCall.index] = {
           id: toolCall.id,
-          name: toolCall.function.name,
+          name: anthropicToolName ?? toolCall.function.name,
           anthropicBlockIndex,
           accumulatedArgs: "",
         }
@@ -321,7 +327,7 @@ export function translateChunkToAnthropicEvents(
           content_block: {
             type: "tool_use",
             id: toolCall.id,
-            name: toolCall.function.name,
+            name: anthropicToolName ?? toolCall.function.name,
             input: {},
           },
         })

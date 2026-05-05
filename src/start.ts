@@ -28,6 +28,8 @@ interface RunServerOptions {
   rateLimitWait: boolean
   burstCount?: number
   burstWindowSeconds?: number
+  burstMinSpacingMs: number
+  burstScope: "global" | "model"
   githubToken?: string
   claudeCode: boolean
   showToken: boolean
@@ -72,6 +74,8 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.rateLimitWait = options.rateLimitWait
   state.burstCount = options.burstCount
   state.burstWindowSeconds = options.burstWindowSeconds
+  state.burstMinSpacingMs = options.burstMinSpacingMs
+  state.burstScope = options.burstScope
   state.showToken = options.showToken
 
   const tavilyApiKey = process.env.TAVILY_API_KEY
@@ -235,6 +239,16 @@ export const start = defineCommand({
       description:
         "Burst window duration in seconds (positive number). Must be used with --burst-count.",
     },
+    "min-spacing": {
+      type: "string",
+      description:
+        "Minimum spacing between requests in milliseconds (default: 0). Prevents thundering herd.",
+    },
+    "burst-scope": {
+      type: "string",
+      description:
+        'Burst limit scope: "global" (default) or "model" (per-model burst tracking).',
+    },
     "github-token": {
       alias: "g",
       type: "string",
@@ -302,6 +316,19 @@ export const start = defineCommand({
       process.exit(1)
     }
 
+    const rawMinSpacing = args["min-spacing"]
+    const minSpacingMs = rawMinSpacing ? Number(rawMinSpacing) : 0
+    if (!Number.isFinite(minSpacingMs) || minSpacingMs < 0) {
+      consola.error(
+        `--min-spacing must be a non-negative number in milliseconds (got: ${rawMinSpacing})`,
+      )
+      process.exit(1)
+    }
+
+    const rawBurstScope = args["burst-scope"]
+    const burstScope: "global" | "model" =
+      rawBurstScope === "model" ? "model" : "global"
+
     return runServer({
       port: Number.parseInt(args.port, 10),
       verbose: args.verbose,
@@ -315,6 +342,8 @@ export const start = defineCommand({
       proxyEnv: args["proxy-env"],
       burstCount,
       burstWindowSeconds,
+      burstMinSpacingMs: minSpacingMs,
+      burstScope,
     })
   },
 })

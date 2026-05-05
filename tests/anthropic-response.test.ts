@@ -6,9 +6,19 @@ import type {
   ChatCompletionResponse,
 } from "~/services/copilot/create-chat-completions"
 
-import { type AnthropicStreamState } from "~/routes/messages/anthropic-types"
+import {
+  type AnthropicMessagesPayload,
+  type AnthropicStreamState,
+} from "~/routes/messages/anthropic-types"
 import { translateToAnthropic } from "~/routes/messages/non-stream-translation"
 import { translateChunkToAnthropicEvents } from "~/routes/messages/stream-translation"
+import {
+  createToolNameMapFromAnthropicPayload,
+  toOpenAIToolName,
+} from "~/routes/messages/tool-name-mapping"
+
+const LONG_MCP_TOOL_NAME =
+  "mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_console_message"
 
 const anthropicUsageSchema = z.object({
   input_tokens: z.number().int(),
@@ -154,6 +164,74 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
       expect(anthropicResponse.content[0].name).toBe("get_current_weather")
       expect(anthropicResponse.content[0].input).toEqual({
         location: "Boston, MA",
+      })
+    } else {
+      throw new Error("Expected tool_use block")
+    }
+  })
+
+  test("should restore long MCP tool names from aliased OpenAI tool calls", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4.6",
+      messages: [{ role: "user", content: "Inspect the console output." }],
+      max_tokens: 1000,
+      tools: [
+        {
+          name: LONG_MCP_TOOL_NAME,
+          description: "Fetch a console message from the browser session.",
+          input_schema: {
+            type: "object",
+            properties: {
+              request_id: { type: "string" },
+            },
+            required: ["request_id"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    }
+    const toolNameMap = createToolNameMapFromAnthropicPayload(anthropicPayload)
+    const aliasedToolName = toOpenAIToolName(LONG_MCP_TOOL_NAME, toolNameMap)
+
+    const openAIResponse: ChatCompletionResponse = {
+      id: "chatcmpl-tool-alias",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_alias",
+                type: "function",
+                function: {
+                  name: aliasedToolName,
+                  arguments: '{"request_id":"req_1"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+          logprobs: null,
+        },
+      ],
+      usage: {
+        prompt_tokens: 30,
+        completion_tokens: 20,
+        total_tokens: 50,
+      },
+    }
+
+    const anthropicResponse = translateToAnthropic(openAIResponse, toolNameMap)
+    expect(anthropicResponse.content[0]?.type).toBe("tool_use")
+    if (anthropicResponse.content[0]?.type === "tool_use") {
+      expect(anthropicResponse.content[0].name).toBe(LONG_MCP_TOOL_NAME)
+      expect(anthropicResponse.content[0].input).toEqual({
+        request_id: "req_1",
       })
     } else {
       throw new Error("Expected tool_use block")
@@ -368,6 +446,128 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
     // These tests will fail until the stub is implemented
     for (const event of translatedStream) {
       expect(isValidAnthropicStreamEvent(event)).toBe(true)
+    }
+  })
+
+  test("restores long MCP tool names in streaming tool events", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "claude-sonnet-4.6",
+      messages: [{ role: "user", content: "Inspect the console output." }],
+      max_tokens: 1000,
+      tools: [
+        {
+          name: LONG_MCP_TOOL_NAME,
+          description: "Fetch a console message from the browser session.",
+          input_schema: {
+            type: "object",
+            properties: {
+              request_id: { type: "string" },
+            },
+            required: ["request_id"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    }
+    const toolNameMap = createToolNameMapFromAnthropicPayload(anthropicPayload)
+    const aliasedToolName = toOpenAIToolName(LONG_MCP_TOOL_NAME, toolNameMap)
+
+    const openAIStream: Array<ChatCompletionChunk> = [
+      {
+        id: "cmpl-tool-alias",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "claude-sonnet-4",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-tool-alias",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "claude-sonnet-4",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_alias",
+                  type: "function",
+                  function: { name: aliasedToolName, arguments: "" },
+                },
+              ],
+            },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-tool-alias",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "claude-sonnet-4",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                { index: 0, function: { arguments: '{"request_id":"req_1"}' } },
+              ],
+            },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-tool-alias",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "claude-sonnet-4",
+        choices: [
+          { index: 0, delta: {}, finish_reason: "tool_calls", logprobs: null },
+        ],
+      },
+    ]
+
+    const streamState: AnthropicStreamState = {
+      messageStartSent: false,
+      messageStopSent: false,
+      contentBlockIndex: 0,
+      contentBlockOpen: false,
+      thinkingBlockOpen: false,
+      hasEmittedText: false,
+      toolCalls: {},
+      toolNameMap,
+      thinkingEnabled: false,
+    }
+
+    const translatedStream = openAIStream.flatMap((chunk) =>
+      translateChunkToAnthropicEvents(chunk, streamState),
+    )
+    const toolUseStart = translatedStream.find(
+      (event) =>
+        event.type === "content_block_start"
+        && event.content_block.type === "tool_use",
+    )
+
+    expect(toolUseStart).toBeDefined()
+    if (
+      toolUseStart?.type === "content_block_start"
+      && toolUseStart.content_block.type === "tool_use"
+    ) {
+      expect(toolUseStart.content_block.name).toBe(LONG_MCP_TOOL_NAME)
+    } else {
+      throw new Error("Expected tool_use content_block_start event")
     }
   })
 

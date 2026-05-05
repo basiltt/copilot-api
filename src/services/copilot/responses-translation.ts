@@ -366,9 +366,19 @@ function repairOrphanedToolCalls(
   }
 }
 
-// ─── Routing helper: Claude models need Chat Completions ────────────────────
+// ─── Routing helper: models that don't support the Responses API ─────────────
+const CC_ONLY_PREFIXES = [
+  "claude-",
+  "gpt-3.5-",
+  "gpt-4-",
+  "gpt-4o-mini",
+  "gpt-4o-2024-05-13",
+  "gpt-4o-2024-08-06",
+  "gpt-4o-2024-11-20",
+]
+
 export function requiresChatCompletionsApi(model: string): boolean {
-  return model.startsWith("claude-")
+  return CC_ONLY_PREFIXES.some((p) => model === p || model.startsWith(p))
 }
 
 // ─── Payload translation: Responses API → Chat Completions ──────────────────

@@ -30,6 +30,12 @@ import {
   type AnthropicUserMessage,
   isTypedTool,
 } from "./anthropic-types"
+import {
+  createToolNameMapFromAnthropicPayload,
+  toAnthropicToolName,
+  toOpenAIToolName,
+  type ToolNameMap,
+} from "./tool-name-mapping"
 import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
 
 const MAX_TOOL_RESULT_CHARS = 20_000
@@ -52,10 +58,12 @@ function isServerToolResultBlock(
 
 export function translateToOpenAI(
   payload: AnthropicMessagesPayload,
+  toolNameMap: ToolNameMap = createToolNameMapFromAnthropicPayload(payload),
 ): ChatCompletionsPayload {
   const messages = translateAnthropicMessagesToOpenAI(
     payload.messages,
     payload.system,
+    toolNameMap,
   )
 
   // When structured output is requested (e.g. title generation), reinforce
@@ -80,8 +88,11 @@ export function translateToOpenAI(
     temperature: payload.temperature,
     top_p: payload.top_p,
     user: payload.metadata?.user_id,
-    tools: translateAnthropicToolsToOpenAI(payload.tools),
-    tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
+    tools: translateAnthropicToolsToOpenAI(payload.tools, toolNameMap),
+    tool_choice: translateAnthropicToolChoiceToOpenAI(
+      payload.tool_choice,
+      toolNameMap,
+    ),
     response_format: translateOutputConfig(payload.output_config),
   }
 }
@@ -136,13 +147,14 @@ function enforceJsonOutput(messages: Array<Message>): void {
 function translateAnthropicMessagesToOpenAI(
   anthropicMessages: Array<AnthropicMessage>,
   system: string | Array<AnthropicSystemBlock> | undefined,
+  toolNameMap: ToolNameMap,
 ): Array<Message> {
   const systemMessages = handleSystemPrompt(system)
 
   const otherMessages = anthropicMessages.flatMap((message) =>
     message.role === "user" ?
       handleUserMessage(message)
-    : handleAssistantMessage(message),
+    : handleAssistantMessage(message, toolNameMap),
   )
 
   return [...systemMessages, ...otherMessages]
@@ -251,6 +263,7 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
 
 function handleAssistantMessage(
   message: AnthropicAssistantMessage,
+  toolNameMap: ToolNameMap,
 ): Array<Message> {
   if (!Array.isArray(message.content)) {
     return [
@@ -313,7 +326,7 @@ function handleAssistantMessage(
             id: toolUse.id,
             type: "function",
             function: {
-              name: toolUse.name,
+              name: toOpenAIToolName(toolUse.name, toolNameMap),
               arguments: JSON.stringify(toolUse.input),
             },
           })),
@@ -537,6 +550,7 @@ function mapContent(
 
 function translateAnthropicToolsToOpenAI(
   anthropicTools: Array<AnthropicTool> | undefined,
+  toolNameMap: ToolNameMap,
 ): Array<Tool> | undefined {
   if (!anthropicTools) {
     return undefined
@@ -547,7 +561,7 @@ function translateAnthropicToolsToOpenAI(
     .map((tool) => ({
       type: "function",
       function: {
-        name: tool.name,
+        name: toOpenAIToolName(tool.name, toolNameMap),
         description: tool.description,
         parameters: tool.input_schema,
         // Forward strict for Structured Outputs; strip all other extra fields
@@ -562,6 +576,7 @@ function translateAnthropicToolsToOpenAI(
 
 function translateAnthropicToolChoiceToOpenAI(
   anthropicToolChoice: AnthropicMessagesPayload["tool_choice"],
+  toolNameMap: ToolNameMap,
 ): ChatCompletionsPayload["tool_choice"] {
   if (!anthropicToolChoice) {
     return undefined
@@ -578,7 +593,9 @@ function translateAnthropicToolChoiceToOpenAI(
       if (anthropicToolChoice.name) {
         return {
           type: "function",
-          function: { name: anthropicToolChoice.name },
+          function: {
+            name: toOpenAIToolName(anthropicToolChoice.name, toolNameMap),
+          },
         }
       }
       return undefined
@@ -596,6 +613,7 @@ function translateAnthropicToolChoiceToOpenAI(
 
 export function translateToAnthropic(
   response: ChatCompletionResponse,
+  toolNameMap?: ToolNameMap,
 ): AnthropicResponse {
   // Merge content from all choices
   const allTextBlocks: Array<AnthropicTextBlock> = []
@@ -607,7 +625,10 @@ export function translateToAnthropic(
   // Process all choices to extract text and tool use blocks
   for (const choice of response.choices) {
     const textBlocks = getAnthropicTextBlocks(choice.message.content)
-    const toolUseBlocks = getAnthropicToolUseBlocks(choice.message.tool_calls)
+    const toolUseBlocks = getAnthropicToolUseBlocks(
+      choice.message.tool_calls,
+      toolNameMap,
+    )
 
     allTextBlocks.push(...textBlocks)
     allToolUseBlocks.push(...toolUseBlocks)
@@ -717,6 +738,7 @@ function getAnthropicTextBlocks(
 
 function getAnthropicToolUseBlocks(
   toolCalls: Array<ToolCall> | undefined,
+  toolNameMap?: ToolNameMap,
 ): Array<AnthropicToolUseBlock> {
   if (!toolCalls) {
     return []
@@ -724,7 +746,7 @@ function getAnthropicToolUseBlocks(
   return toolCalls.map((toolCall) => ({
     type: "tool_use",
     id: toolCall.id,
-    name: toolCall.function.name,
+    name: toAnthropicToolName(toolCall.function.name, toolNameMap),
     input: safeParseJson(toolCall.function.arguments),
   }))
 }

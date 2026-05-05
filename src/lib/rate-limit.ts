@@ -45,40 +45,81 @@ export async function checkRateLimit(state: State) {
   return
 }
 
-export async function checkBurstLimit(state: State) {
+const burstQueues = new Map<string, Promise<void>>()
+
+export async function checkBurstLimit(state: State, model?: string) {
   if (state.burstCount === undefined || state.burstWindowSeconds === undefined)
     return
 
-  const windowMs = state.burstWindowSeconds * 1000
+  const key = state.burstScope === "model" && model ? model : "__global__"
+
+  const prev = burstQueues.get(key) ?? Promise.resolve()
+  const ticket = prev.then(() => acquireBurstSlot(state, key))
+  burstQueues.set(
+    key,
+    ticket.catch(() => {}),
+  )
+  return ticket
+}
+
+function getTimestamps(state: State, key: string): Array<number> {
+  if (key === "__global__") return state.burstRequestTimestamps
+  let ts = state.burstPerModelTimestamps.get(key)
+  if (!ts) {
+    ts = []
+    state.burstPerModelTimestamps.set(key, ts)
+  }
+  return ts
+}
+
+function setTimestamps(state: State, key: string, ts: Array<number>) {
+  if (key === "__global__") {
+    state.burstRequestTimestamps = ts
+  } else {
+    state.burstPerModelTimestamps.set(key, ts)
+  }
+}
+
+async function acquireBurstSlot(state: State, key: string) {
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  const windowMs = state.burstWindowSeconds! * 1000
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  const maxBurst = state.burstCount!
+  const minSpacingMs = state.burstMinSpacingMs
+  const label = key === "__global__" ? "" : ` [${key}]`
 
   while (true) {
     const now = Date.now()
 
-    state.burstRequestTimestamps = state.burstRequestTimestamps.filter(
+    const filtered = getTimestamps(state, key).filter(
       (ts) => ts > now - windowMs,
     )
+    setTimestamps(state, key, filtered)
 
-    if (state.burstRequestTimestamps.length < state.burstCount) {
-      // Slot is free — record this request synchronously (no await between
-      // the length check and push, preventing interleaving in async handlers).
-      state.burstRequestTimestamps.push(now)
+    if (filtered.length < maxBurst) {
+      if (minSpacingMs > 0) {
+        const last = filtered.at(-1)
+        const elapsed = last !== undefined ? now - last : Infinity
+        if (elapsed < minSpacingMs) {
+          const gap = minSpacingMs - elapsed
+          const gapLabel =
+            gap < 1000 ? `${gap}ms` : `${(gap / 1000).toFixed(1)}s`
+          consola.debug(`${label} Spacing requests: waiting ${gapLabel}`)
+          await sleep(gap)
+        }
+      }
+      getTimestamps(state, key).push(Date.now())
       return
     }
 
-    // Window is full — wait until the oldest slot expires.
-    // state.burstRequestTimestamps[0] is always defined here because the length
-    // check above guarantees at least burstCount (≥1) entries — but we guard
-    // defensively to make the invariant explicit.
-    const oldest = state.burstRequestTimestamps[0] ?? now
+    const oldest = filtered[0] ?? now
     const waitMs = Math.max(0, oldest + windowMs - now)
-    // Use ms for short waits, seconds for long ones — avoids misleading "1s" for a 100ms wait.
     const waitLabel =
       waitMs < 1000 ? `${waitMs}ms` : `${(waitMs / 1000).toFixed(1)}s`
     consola.warn(
-      `Burst limit reached. Waiting ${waitLabel} before proceeding...`,
+      `${label} Burst limit reached. Waiting ${waitLabel} before proceeding...`,
     )
     await sleep(waitMs)
-    consola.debug("Burst limit wait completed, re-checking...")
-    // Loop back with a fresh Date.now() — do not push unconditionally.
+    consola.debug(`${label} Burst limit wait completed, re-checking...`)
   }
 }

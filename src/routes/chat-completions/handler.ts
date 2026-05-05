@@ -19,10 +19,11 @@ import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
-  await checkBurstLimit(state)
 
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
+
+  await checkBurstLimit(state, payload.model)
 
   // Find the selected model
   let selectedModel = state.models?.data.find(

@@ -8,6 +8,7 @@ import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import {
+  extractUpstreamErrorMessage,
   HTTPError,
   isContextWindowError,
   formatAnthropicContextWindowError,
@@ -57,6 +58,10 @@ import {
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
 } from "./stream-translation"
+import {
+  createToolNameMapFromAnthropicPayload,
+  type ToolNameMap,
+} from "./tool-name-mapping"
 import { toAnthropicMessageId } from "./utils"
 import {
   detectWebSearchIntent,
@@ -116,10 +121,11 @@ function lookupModelLimit(modelId: string): number | undefined {
 
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
-  await checkBurstLimit(state)
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
+
+  await checkBurstLimit(state, anthropicPayload.model)
 
   const invalidImage = findInvalidEmbeddedImage(anthropicPayload)
   if (invalidImage) {
@@ -167,12 +173,15 @@ export async function handleCompletion(c: Context) {
   if (looksLikeCompactionRequest(anthropicPayload)) {
     try {
       const result = await fetchCompactionResponse(anthropicPayload)
+      const toolNameMap =
+        createToolNameMapFromAnthropicPayload(anthropicPayload)
       return streamSSE(c, async (stream) => {
-        await emitNonStreamingAsSSE(
-          stream,
-          result.response,
-          estimateTokensForStrippedImages(result.strippedBase64Chars),
-        )
+        await emitNonStreamingAsSSE(stream, result.response, {
+          imageTokenOverhead: estimateTokensForStrippedImages(
+            result.strippedBase64Chars,
+          ),
+          toolNameMap,
+        })
       })
     } catch (error) {
       const contextWindowMessage = await extractContextWindowMessage(error)
@@ -355,8 +364,10 @@ async function handleNonStreaming(
     }
   }
 
+  const toolNameMap = createToolNameMapFromAnthropicPayload(anthropicPayload)
   const anthropicResponse = translateToAnthropic(
     result.response as ChatCompletionResponse,
+    toolNameMap,
   )
 
   // Inflate input_tokens to account for images stripped before sending.
@@ -406,7 +417,8 @@ async function handleStructuredOutput(
     stream: false,
   }
 
-  const openAIPayload = translateToOpenAI(nonStreamingPayload)
+  const toolNameMap = createToolNameMapFromAnthropicPayload(nonStreamingPayload)
+  const openAIPayload = translateToOpenAI(nonStreamingPayload, toolNameMap)
   consola.debug(
     "Translated OpenAI request payload (structured output):",
     JSON.stringify(openAIPayload),
@@ -461,12 +473,12 @@ async function handleStructuredOutput(
   if (wasStreaming) {
     // Emit as SSE event sequence
     return streamSSE(c, async (stream) => {
-      await emitNonStreamingAsSSE(stream, response)
+      await emitNonStreamingAsSSE(stream, response, { toolNameMap })
     })
   }
 
   // Non-streaming: translate and return
-  const anthropicResponse = translateToAnthropic(response)
+  const anthropicResponse = translateToAnthropic(response, toolNameMap)
   consola.debug(
     "Translated Anthropic response (structured output):",
     JSON.stringify(anthropicResponse),
@@ -800,7 +812,8 @@ async function fetchNonStreamingAnthropicResponse(
     )
   }
 
-  const anthropicResponse = translateToAnthropic(response)
+  const toolNameMap = createToolNameMapFromAnthropicPayload(anthropicPayload)
+  const anthropicResponse = translateToAnthropic(response, toolNameMap)
   if (result.strippedBase64Chars > 0) {
     anthropicResponse.usage.input_tokens += estimateTokensForStrippedImages(
       result.strippedBase64Chars,
@@ -968,6 +981,7 @@ async function handleStreaming(
     const { response: copilotResponse, strippedBase64Chars } = strippingResult
     const imageTokenOverhead =
       estimateTokensForStrippedImages(strippedBase64Chars)
+    const toolNameMap = createToolNameMapFromAnthropicPayload(anthropicPayload)
 
     if (isNonStreaming(copilotResponse)) {
       // Shouldn't happen for a streaming payload, but handle gracefully by
@@ -989,11 +1003,15 @@ async function handleStreaming(
         await retryEmptyResponse(stream, anthropicPayload, {
           thinkingEnabled,
           imageTokenOverhead,
+          toolNameMap,
         })
         return
       }
 
-      await emitNonStreamingAsSSE(stream, copilotResponse, imageTokenOverhead)
+      await emitNonStreamingAsSSE(stream, copilotResponse, {
+        imageTokenOverhead,
+        toolNameMap,
+      })
       return
     }
 
@@ -1001,6 +1019,7 @@ async function handleStreaming(
     const hadContent = await pipeStreamToClient(stream, copilotResponse, {
       thinkingEnabled,
       imageTokenOverhead,
+      toolNameMap,
     })
 
     // When the model returns an empty response (reasoning completed but no
@@ -1011,6 +1030,7 @@ async function handleStreaming(
       await retryEmptyResponse(stream, anthropicPayload, {
         thinkingEnabled,
         imageTokenOverhead,
+        toolNameMap,
       })
     }
   } catch (error) {
@@ -1107,7 +1127,11 @@ async function fetchCopilotResponse(
 async function retryEmptyResponse(
   stream: SSEStreamingApi,
   anthropicPayload: AnthropicMessagesPayload,
-  ctx: { thinkingEnabled: boolean; imageTokenOverhead: number },
+  ctx: {
+    thinkingEnabled: boolean
+    imageTokenOverhead: number
+    toolNameMap: ToolNameMap
+  },
 ): Promise<void> {
   for (
     let emptyRetry = 1;
@@ -1132,13 +1156,17 @@ async function retryEmptyResponse(
         )
         continue
       }
-      await emitNonStreamingAsSSE(stream, retryResponse, ctx.imageTokenOverhead)
+      await emitNonStreamingAsSSE(stream, retryResponse, {
+        imageTokenOverhead: ctx.imageTokenOverhead,
+        toolNameMap: ctx.toolNameMap,
+      })
       return
     }
 
     const retryHadContent = await pipeStreamToClient(stream, retryResponse, {
       thinkingEnabled: ctx.thinkingEnabled,
       imageTokenOverhead: ctx.imageTokenOverhead,
+      toolNameMap: ctx.toolNameMap,
     })
     if (retryHadContent) return
   }
@@ -1160,9 +1188,13 @@ async function retryEmptyResponse(
 async function pipeStreamToClient(
   stream: SSEStreamingApi,
   response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
-  options: { thinkingEnabled: boolean; imageTokenOverhead?: number },
+  options: {
+    thinkingEnabled: boolean
+    imageTokenOverhead?: number
+    toolNameMap?: ToolNameMap
+  },
 ): Promise<boolean> {
-  const { thinkingEnabled, imageTokenOverhead = 0 } = options
+  const { thinkingEnabled, imageTokenOverhead = 0, toolNameMap } = options
   const streamState: AnthropicStreamState = {
     messageStartSent: false,
     messageStopSent: false,
@@ -1171,6 +1203,7 @@ async function pipeStreamToClient(
     thinkingBlockOpen: false,
     hasEmittedText: false,
     toolCalls: {},
+    toolNameMap,
     thinkingEnabled,
   }
 
@@ -1559,12 +1592,20 @@ async function extractStreamingErrorDetails(error: unknown): Promise<{
     try {
       const cloned = error.response.clone()
       const text = await cloned.text()
-      const parsed = JSON.parse(text) as Record<string, unknown>
-      const errorObj = parsed.error as Record<string, unknown> | undefined
-      if (typeof errorObj?.message === "string") {
-        return { errorMessage: errorObj.message, errorType }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(text) as Record<string, unknown>
+      } catch {
+        parsed = null
       }
-      return { errorMessage: text.slice(0, 200), errorType }
+      return {
+        errorMessage: extractUpstreamErrorMessage(
+          parsed,
+          text,
+          error.response.headers.get("content-type"),
+        ),
+        errorType,
+      }
     } catch {
       return { errorMessage: error.message, errorType }
     }
@@ -1585,12 +1626,17 @@ async function extractStreamingErrorDetails(error: unknown): Promise<{
  * body for a streaming request — sending the full response as a single
  * "message_start" event causes Claude Code to miss all tool call input details.
  */
+type EmitNonStreamingAsSSEOptions = {
+  imageTokenOverhead?: number
+  toolNameMap?: ToolNameMap
+}
+
 async function emitNonStreamingAsSSE(
   stream: SSEStreamingApi,
   response: ChatCompletionResponse,
-  imageTokenOverhead: number = 0,
+  { imageTokenOverhead = 0, toolNameMap }: EmitNonStreamingAsSSEOptions = {},
 ): Promise<void> {
-  const anthropicResponse = translateToAnthropic(response)
+  const anthropicResponse = translateToAnthropic(response, toolNameMap)
 
   // 1. message_start (without content, stop_reason, stop_sequence)
   await stream.writeSSE({

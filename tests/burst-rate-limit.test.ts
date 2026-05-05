@@ -11,6 +11,9 @@ function makeState(overrides: Partial<State> = {}): State {
     rateLimitWait: false,
     showToken: false,
     burstRequestTimestamps: [],
+    burstMinSpacingMs: 0,
+    burstScope: "global",
+    burstPerModelTimestamps: new Map(),
     ...overrides,
   }
 }

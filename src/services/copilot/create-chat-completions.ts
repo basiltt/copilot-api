@@ -18,6 +18,9 @@ import {
 // as long as chunks keep flowing.  The timeout only fires when the upstream
 // goes completely silent for this duration, indicating a stalled connection.
 const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes of silence
+const MAX_TRANSIENT_HTTP_RETRIES = 3
+const BASE_HTTP_RETRY_DELAY_MS = 750
+const RETRIABLE_UPSTREAM_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
 
 /**
  * Creates an AbortController with an inactivity timer that resets on each
@@ -57,6 +60,35 @@ function createInactivityAbort(timeoutMs: number = INACTIVITY_TIMEOUT_MS) {
       }
     },
   }
+}
+
+function isRetriableUpstreamStatus(status: number): boolean {
+  return RETRIABLE_UPSTREAM_STATUS_CODES.has(status)
+}
+
+function getRetryAfterDelayMs(retryAfter: string | null): number | undefined {
+  if (!retryAfter) return undefined
+
+  const seconds = Number(retryAfter)
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000)
+  }
+
+  const retryAt = Date.parse(retryAfter)
+  if (Number.isNaN(retryAt)) return undefined
+
+  return Math.max(0, retryAt - Date.now())
+}
+
+function getTransientRetryDelayMs(response: Response, attempt: number): number {
+  return (
+    getRetryAfterDelayMs(response.headers.get("retry-after"))
+    ?? BASE_HTTP_RETRY_DELAY_MS * 2 ** (attempt - 1)
+  )
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function buildRequestHeaders(
@@ -204,25 +236,48 @@ export const createChatCompletions = async (
     body = { ...rest, [tokenKey]: max_tokens }
   }
 
-  const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal: inactivity.signal,
-    // Bun's internal fetch timer defaults to ~4 minutes and fires mid-stream
-    // when Copilot pauses between chunks on large (6000+ line) file edits.
-    // Setting timeout:false disables it; the inactivity abort above is the
-    // safety net — it only fires when the upstream goes completely silent.
-    // @ts-expect-error — Bun-specific option, not in the standard fetch types
-    timeout: false,
-  })
+  let response: Response | undefined
 
-  // Headers arrived — reset the inactivity timer
-  inactivity.keepAlive()
+  for (let attempt = 1; attempt <= MAX_TRANSIENT_HTTP_RETRIES; attempt++) {
+    response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: inactivity.signal,
+      // Bun's internal fetch timer defaults to ~4 minutes and fires mid-stream
+      // when Copilot pauses between chunks on large (6000+ line) file edits.
+      // Setting timeout:false disables it; the inactivity abort above is the
+      // safety net — it only fires when the upstream goes completely silent.
+      // @ts-expect-error — Bun-specific option, not in the standard fetch types
+      timeout: false,
+    })
 
-  if (!response.ok) {
+    // Headers arrived — reset the inactivity timer
+    inactivity.keepAlive()
+
+    if (response.ok) break
+
+    if (
+      !isRetriableUpstreamStatus(response.status)
+      || attempt === MAX_TRANSIENT_HTTP_RETRIES
+    ) {
+      inactivity.clear()
+      throw new HTTPError("Failed to create chat completions", response)
+    }
+
+    const retryDelayMs = getTransientRetryDelayMs(response, attempt)
+    consola.warn(
+      `Copilot upstream returned ${response.status} on attempt ${attempt}/${MAX_TRANSIENT_HTTP_RETRIES}; retrying in ${retryDelayMs}ms`,
+    )
+    if (response.body) {
+      void response.body.cancel().catch(() => undefined)
+    }
+    await sleep(retryDelayMs)
+  }
+
+  if (!response?.ok) {
     inactivity.clear()
-    throw new HTTPError("Failed to create chat completions", response)
+    throw new Error("Copilot upstream did not produce a response")
   }
 
   if (payload.stream) {
