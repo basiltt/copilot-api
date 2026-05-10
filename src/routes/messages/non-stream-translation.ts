@@ -157,7 +157,51 @@ function translateAnthropicMessagesToOpenAI(
     : handleAssistantMessage(message, toolNameMap),
   )
 
-  return [...systemMessages, ...otherMessages]
+  return mergeConsecutiveSameRoleMessages([...systemMessages, ...otherMessages])
+}
+
+/**
+ * Merges consecutive messages with the same role into a single message.
+ *
+ * The Anthropic API allows consecutive user messages (e.g. after compaction,
+ * Claude Code sends a summary user message followed by the actual task as
+ * another user message). The OpenAI/Copilot API expects strictly alternating
+ * user/assistant roles — consecutive same-role messages confuse the model,
+ * causing it to echo the summary instead of acting on the task.
+ */
+function mergeConsecutiveSameRoleMessages(
+  messages: Array<Message>,
+): Array<Message> {
+  if (messages.length <= 1) return messages
+
+  const merged: Array<Message> = [messages[0]]
+
+  for (let i = 1; i < messages.length; i++) {
+    const current = messages[i]
+    const previous = merged.at(-1)
+
+    if (current.role !== previous.role || current.role === "tool") {
+      merged.push(current)
+      continue
+    }
+
+    const prevText = extractTextContent(previous.content)
+    const currText = extractTextContent(current.content)
+    previous.content = prevText + "\n\n" + currText
+  }
+
+  return merged
+}
+
+function extractTextContent(
+  content: string | Array<ContentPart> | null,
+): string {
+  if (content === null) return ""
+  if (typeof content === "string") return content
+  return content
+    .filter((part): part is TextPart => part.type === "text")
+    .map((part) => part.text)
+    .join("\n\n")
 }
 
 function handleSystemPrompt(

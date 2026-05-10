@@ -367,18 +367,16 @@ function repairOrphanedToolCalls(
 }
 
 // ─── Routing helper: models that don't support the Responses API ─────────────
-const CC_ONLY_PREFIXES = [
-  "claude-",
-  "gpt-3.5-",
-  "gpt-4-",
-  "gpt-4o-mini",
-  "gpt-4o-2024-05-13",
-  "gpt-4o-2024-08-06",
-  "gpt-4o-2024-11-20",
-]
+// Allow-list approach: only models known to support /responses go direct.
+// Everything else is routed through /chat/completions.
+const RESPONSES_API_PREFIXES = ["gpt-4.1", "gpt-5", "o1", "o3", "o4"]
+
+const RESPONSES_API_EXACT = new Set(["gpt-41-copilot"])
 
 export function requiresChatCompletionsApi(model: string): boolean {
-  return CC_ONLY_PREFIXES.some((p) => model === p || model.startsWith(p))
+  if (RESPONSES_API_EXACT.has(model)) return false
+  if (RESPONSES_API_PREFIXES.some((p) => model.startsWith(p))) return false
+  return true
 }
 
 // ─── Payload translation: Responses API → Chat Completions ──────────────────

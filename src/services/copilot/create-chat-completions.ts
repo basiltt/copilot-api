@@ -18,7 +18,7 @@ import {
 // as long as chunks keep flowing.  The timeout only fires when the upstream
 // goes completely silent for this duration, indicating a stalled connection.
 const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes of silence
-const MAX_TRANSIENT_HTTP_RETRIES = 3
+const MAX_TRANSIENT_HTTP_RETRIES = 5
 const BASE_HTTP_RETRY_DELAY_MS = 750
 const RETRIABLE_UPSTREAM_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
 
@@ -64,6 +64,17 @@ function createInactivityAbort(timeoutMs: number = INACTIVITY_TIMEOUT_MS) {
 
 function isRetriableUpstreamStatus(status: number): boolean {
   return RETRIABLE_UPSTREAM_STATUS_CODES.has(status)
+}
+
+async function isRetriableBodyError(response: Response): Promise<boolean> {
+  if (response.status !== 400) return false
+  try {
+    const cloned = response.clone()
+    const body = (await cloned.json()) as { error?: { code?: string } }
+    return body.error?.code === "invalid_request_body"
+  } catch {
+    return false
+  }
 }
 
 function getRetryAfterDelayMs(retryAfter: string | null): number | undefined {
@@ -257,10 +268,11 @@ export const createChatCompletions = async (
 
     if (response.ok) break
 
-    if (
-      !isRetriableUpstreamStatus(response.status)
-      || attempt === MAX_TRANSIENT_HTTP_RETRIES
-    ) {
+    const shouldRetry =
+      isRetriableUpstreamStatus(response.status)
+      || (await isRetriableBodyError(response))
+
+    if (!shouldRetry || attempt === MAX_TRANSIENT_HTTP_RETRIES) {
       inactivity.clear()
       throw new HTTPError("Failed to create chat completions", response)
     }
