@@ -1,0 +1,26 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            export PATH=/root/.bun/bin:$PATH
+            cd /root/projects/copilot-api
+            git pull origin master
+            bun install
+            bun run build
+            systemctl restart copilot-api
+            sleep 3
+            systemctl is-active copilot-api
