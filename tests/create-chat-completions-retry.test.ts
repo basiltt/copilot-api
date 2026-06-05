@@ -10,12 +10,15 @@ state.vsCodeVersion = "1.0.0"
 state.accountType = "individual"
 
 const fetchMock = mock(
-  (_url: string, opts: { headers: Record<string, string> }) => {
-    return {
+  (
+    _url: string,
+    opts: { headers: Record<string, string> },
+  ): Promise<unknown> => {
+    return Promise.resolve({
       ok: true,
       json: () => ({ id: "123", object: "chat.completion", choices: [] }),
       headers: opts.headers,
-    }
+    })
   },
 )
 

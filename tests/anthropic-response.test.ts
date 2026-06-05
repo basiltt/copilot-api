@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import { describe, test, expect } from "bun:test"
 import { z } from "zod"
 
@@ -10,8 +11,12 @@ import {
   type AnthropicMessagesPayload,
   type AnthropicStreamState,
 } from "~/routes/messages/anthropic-types"
+import { isEmptyNonStreamingResponse } from "~/routes/messages/handler"
 import { translateToAnthropic } from "~/routes/messages/non-stream-translation"
-import { translateChunkToAnthropicEvents } from "~/routes/messages/stream-translation"
+import {
+  flushDeferredFinish,
+  translateChunkToAnthropicEvents,
+} from "~/routes/messages/stream-translation"
 import {
   createToolNameMapFromAnthropicPayload,
   toOpenAIToolName,
@@ -77,6 +82,7 @@ function isValidAnthropicStreamEvent(payload: unknown): boolean {
   return anthropicStreamEventSchema.safeParse(payload).success
 }
 
+// eslint-disable-next-line max-lines-per-function
 describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
   test("should translate a simple text response correctly", () => {
     const openAIResponse: ChatCompletionResponse = {
@@ -266,6 +272,207 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
 
     expect(isValidAnthropicResponse(anthropicResponse)).toBe(true)
     expect(anthropicResponse.stop_reason).toBe("max_tokens")
+  })
+
+  // Regression: a completed non-streaming message must NEVER carry
+  // stop_reason: null. Anthropic clients (Claude Code, and strict SDK callers)
+  // treat a null stop_reason on a non-stream response as a protocol violation.
+  // Some upstream models (notably Gemini via Copilot) return a degenerate
+  // payload — finish_reason null, or an empty choices array — which previously
+  // mapped straight through to stop_reason: null with empty content.
+  test("coerces a null upstream finish_reason to a non-null stop_reason", () => {
+    const openAIResponse = {
+      id: "chatcmpl-null-finish",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "Partial answer." },
+          // Runtime reality: Copilot can send null here even though the
+          // ChoiceNonStreaming type declares finish_reason as non-null.
+          finish_reason: null,
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
+    } as unknown as ChatCompletionResponse
+
+    const anthropicResponse = translateToAnthropic(openAIResponse)
+
+    expect(anthropicResponse.stop_reason).not.toBeNull()
+    expect(anthropicResponse.stop_reason).toBe("end_turn")
+    expect(isValidAnthropicResponse(anthropicResponse)).toBe(true)
+  })
+
+  test("never returns stop_reason null for an empty choices array", () => {
+    const openAIResponse = {
+      id: "chatcmpl-no-choices",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [],
+      usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+    } as unknown as ChatCompletionResponse
+
+    const anthropicResponse = translateToAnthropic(openAIResponse)
+
+    expect(anthropicResponse.stop_reason).not.toBeNull()
+    expect(anthropicResponse.stop_reason).toBe("end_turn")
+  })
+
+  // Regression (HIGH): tool calls present but a degenerate null finish_reason.
+  // The backstop must NOT label this "end_turn" — that would tell the client
+  // the turn is done and the pending tool calls would never execute. It must
+  // resolve to "tool_use" so the client runs the tools.
+  test("tool calls with a null finish_reason resolve to tool_use, not end_turn", () => {
+    const openAIResponse = {
+      id: "chatcmpl-tool-null-finish",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_x",
+                type: "function",
+                function: {
+                  name: "get_current_weather",
+                  arguments: '{"location":"Boston, MA"}',
+                },
+              },
+            ],
+          },
+          finish_reason: null,
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 30, completion_tokens: 20, total_tokens: 50 },
+    } as unknown as ChatCompletionResponse
+
+    const anthropicResponse = translateToAnthropic(openAIResponse)
+
+    expect(anthropicResponse.stop_reason).toBe("tool_use")
+    expect(anthropicResponse.content[0]?.type).toBe("tool_use")
+  })
+
+  // A length-truncated tool call must stay "max_tokens" (the truncation guard
+  // depends on correctedStopReason === "length"); it must NOT be masked as
+  // tool_use by the coercion.
+  test("tool calls with finish_reason length are not masked as tool_use", () => {
+    const openAIResponse: ChatCompletionResponse = {
+      id: "chatcmpl-tool-length",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_y",
+                type: "function",
+                function: {
+                  name: "get_current_weather",
+                  // Complete JSON → not truncated → passes through as a tool call
+                  arguments: '{"location":"Boston, MA"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "length",
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 30, completion_tokens: 2048, total_tokens: 2078 },
+    }
+
+    const anthropicResponse = translateToAnthropic(openAIResponse)
+    expect(anthropicResponse.stop_reason).toBe("max_tokens")
+  })
+
+  test("whitespace-only content with finish_reason stop is treated as empty", () => {
+    const response = {
+      id: "chatcmpl-whitespace",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "  \n  " },
+          finish_reason: "stop",
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 },
+    } as unknown as ChatCompletionResponse
+
+    expect(isEmptyNonStreamingResponse(response)).toBe(true)
+  })
+})
+
+describe("isEmptyNonStreamingResponse — degenerate upstream detection", () => {
+  test("treats a null finish_reason with empty content as empty", () => {
+    const response = {
+      id: "chatcmpl-null-empty",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "" },
+          finish_reason: null,
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+    } as unknown as ChatCompletionResponse
+
+    expect(isEmptyNonStreamingResponse(response)).toBe(true)
+  })
+
+  test("treats an empty choices array as empty", () => {
+    const response = {
+      id: "chatcmpl-empty-choices",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [],
+      usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+    } as unknown as ChatCompletionResponse
+
+    expect(isEmptyNonStreamingResponse(response)).toBe(true)
+  })
+
+  test("does not flag a normal completed response as empty", () => {
+    const response: ChatCompletionResponse = {
+      id: "chatcmpl-ok",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: "Real answer." },
+          finish_reason: "stop",
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+    }
+
+    expect(isEmptyNonStreamingResponse(response)).toBe(false)
   })
 })
 
@@ -728,5 +935,220 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
         && event.delta.type === "text_delta",
     )
     expect(textDeltas.length).toBeGreaterThan(0)
+  })
+})
+
+function freshStreamState(): AnthropicStreamState {
+  return {
+    messageStartSent: false,
+    messageStopSent: false,
+    contentBlockIndex: 0,
+    contentBlockOpen: false,
+    thinkingBlockOpen: false,
+    hasEmittedText: false,
+    toolCalls: {},
+    thinkingEnabled: false,
+  }
+}
+
+function finalStreamDelta(state: AnthropicStreamState) {
+  const delta = flushDeferredFinish(state).find(
+    (e) => e.type === "message_delta",
+  )
+  if (delta?.type !== "message_delta") {
+    throw new Error("Expected a terminating message_delta")
+  }
+  return delta
+}
+
+describe("Streaming terminating stop_reason — never null/omitted", () => {
+  // Regression: a streamed tool call whose finish chunk reports a non-standard
+  // finish_reason (Copilot runtime can violate its own type) must still defer a
+  // "tool_calls" reason and terminate as "tool_use" — not omit stop_reason,
+  // which would make Claude Code skip executing the tool.
+  test("tool-call stream with a non-standard finish_reason terminates as tool_use", () => {
+    const state = freshStreamState()
+    const stream: Array<ChatCompletionChunk> = [
+      {
+        id: "c1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemini-2.5-pro",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "c1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemini-2.5-pro",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_a",
+                  type: "function",
+                  function: { name: "get_weather", arguments: '{"loc":"NYC"}' },
+                },
+              ],
+            },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "c1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemini-2.5-pro",
+        // Non-standard finish_reason string — runtime type violation.
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: "STOP" as never,
+            logprobs: null,
+          },
+        ],
+      },
+    ]
+    for (const chunk of stream) translateChunkToAnthropicEvents(chunk, state)
+
+    const delta = finalStreamDelta(state)
+    expect(delta.delta.stop_reason).toBe("tool_use")
+  })
+
+  // A tool-call stream that finishes with the normal "stop" mismatch must also
+  // terminate as tool_use (existing Gemini-correction behavior, now broadened).
+  test("tool-call stream finishing with stop terminates as tool_use", () => {
+    const state = freshStreamState()
+    translateChunkToAnthropicEvents(
+      {
+        id: "c2",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemini-2.5-pro",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_b",
+                  type: "function",
+                  function: { name: "get_weather", arguments: '{"loc":"LA"}' },
+                },
+              ],
+            },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+    translateChunkToAnthropicEvents(
+      {
+        id: "c2",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemini-2.5-pro",
+        choices: [
+          { index: 0, delta: {}, finish_reason: "stop", logprobs: null },
+        ],
+      },
+      state,
+    )
+
+    expect(finalStreamDelta(state).delta.stop_reason).toBe("tool_use")
+  })
+
+  // A plain text stream finishing with a non-standard finish_reason and no tool
+  // calls must terminate as end_turn (not an omitted stop_reason).
+  test("text stream with a non-standard finish_reason terminates as end_turn", () => {
+    const state = freshStreamState()
+    translateChunkToAnthropicEvents(
+      {
+        id: "c3",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemini-2.5-pro",
+        choices: [
+          {
+            index: 0,
+            delta: { content: "Hello" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+    translateChunkToAnthropicEvents(
+      {
+        id: "c3",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gemini-2.5-pro",
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: "DONE" as never,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+
+    expect(finalStreamDelta(state).delta.stop_reason).toBe("end_turn")
+  })
+
+  // A normal text stream still terminates correctly as end_turn.
+  test("normal text stream terminates as end_turn", () => {
+    const state = freshStreamState()
+    translateChunkToAnthropicEvents(
+      {
+        id: "c4",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [
+          {
+            index: 0,
+            delta: { content: "Hi" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+    translateChunkToAnthropicEvents(
+      {
+        id: "c4",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-4o",
+        choices: [
+          { index: 0, delta: {}, finish_reason: "stop", logprobs: null },
+        ],
+      },
+      state,
+    )
+
+    expect(finalStreamDelta(state).delta.stop_reason).toBe("end_turn")
   })
 })

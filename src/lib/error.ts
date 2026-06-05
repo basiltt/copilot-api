@@ -149,11 +149,8 @@ export function isContextWindowError(
     || lower.includes("context_length_exceeded")
     || lower.includes("maximum context length")
     || lower.includes("input exceeds")
-    // Copilot format: "prompt token count of X exceeds the limit of Y"
-    // with code "model_max_prompt_tokens_exceeded"
     || lower.includes("exceeds the limit")
     || lower.includes("model_max_prompt_tokens_exceeded")
-    || lower.includes("failed to parse request")
   )
 }
 
@@ -241,7 +238,7 @@ export function formatAnthropicContextWindowError(
   }
 
   // Use the model's actual limit if available, otherwise fall back to defaults
-  const limit = modelLimit ?? 128_000
+  const limit = modelLimit ?? 935_000
   // Estimate actual tokens as ~1.5× the limit (we know it exceeded)
   const actual = Math.round(limit * 1.5)
   return `prompt is too long: ${actual} tokens > ${limit} maximum`

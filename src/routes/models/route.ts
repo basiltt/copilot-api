@@ -17,20 +17,36 @@ modelRoutes.get("/", async (c) => {
       await cacheModels()
     }
 
-    const models = state.models?.data.map((model) => ({
-      id: model.id,
-      object: "model",
-      type: "model",
-      created: 0, // No date available from source
-      created_at: new Date(0).toISOString(), // No date available from source
-      owned_by: model.vendor,
-      display_name: model.name,
-      // Anthropic-compatible fields so Claude Code knows each model's limits.
-      // max_input_tokens is the context window size — Claude Code uses it for
-      // proactive auto-compaction (triggers at ~95% of this value).
-      max_input_tokens: getModelContextWindow(model),
-      max_output_tokens: getModelMaxOutput(model),
-    }))
+    // Copilot reports conservative max_prompt_tokens (e.g. 168k) but certain
+    // Claude models actually accept up to ~935k tokens (1M context variant).
+    const MODELS_WITH_1M_CONTEXT = new Set([
+      "claude-opus-4.6",
+      "claude-opus-4.7",
+      "claude-opus-4.8",
+      "claude-sonnet-4.6",
+      "gemini-3.1-pro-preview",
+      "gemini-3.5-flash",
+      "gpt-5.4",
+      "gpt-5.5",
+    ])
+    const EFFECTIVE_1M_INPUT = 935_000
+
+    const models = state.models?.data.map((model) => {
+      const rawInput = getModelContextWindow(model)
+      const effectiveInput =
+        MODELS_WITH_1M_CONTEXT.has(model.id) ? EFFECTIVE_1M_INPUT : rawInput
+      return {
+        id: model.id,
+        object: "model",
+        type: "model",
+        created: 0,
+        created_at: new Date(0).toISOString(),
+        owned_by: model.vendor,
+        display_name: model.name,
+        max_input_tokens: effectiveInput,
+        max_output_tokens: getModelMaxOutput(model),
+      }
+    })
 
     return c.json({
       object: "list",

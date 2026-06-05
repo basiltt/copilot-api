@@ -377,13 +377,15 @@ export function translateChunkToAnthropicEvents(
       state.contentBlockOpen = false
     }
 
-    // Some models (notably Gemini) intermittently return finish_reason "stop"
-    // even when they emitted tool calls in the response. Claude Code interprets
-    // stop_reason "end_turn" as "model is done" and skips pending tool
-    // executions, causing the session to stall after a few rounds.
-    // Detect this mismatch and correct finish_reason to "tool_calls".
+    // Some models (notably Gemini) intermittently return a non-tool_calls
+    // finish_reason ("stop", or a non-standard string) even when they emitted
+    // tool calls. Claude Code interprets stop_reason "end_turn" as "model is
+    // done" and skips pending tool executions, stalling the session. Coerce to
+    // "tool_calls" whenever tool calls are present, EXCEPT for "length" (which
+    // is handled by the truncation guard above and must be preserved). This
+    // mirrors the non-streaming correction in non-stream-translation.ts.
     const correctedFinishReason =
-      hasToolCalls && choice.finish_reason === "stop" ?
+      hasToolCalls && choice.finish_reason !== "length" ?
         "tool_calls"
       : choice.finish_reason
 
@@ -416,7 +418,17 @@ export function flushDeferredFinish(
     {
       type: "message_delta",
       delta: {
-        stop_reason: mapOpenAIStopReasonToAnthropic(state.deferredFinishReason),
+        // Backstop: the terminating message_delta must carry a non-null
+        // stop_reason. mapOpenAIStopReasonToAnthropic returns undefined for a
+        // non-standard finish_reason string (which JSON drops, violating the
+        // Anthropic streaming protocol), so coalesce — to "tool_use" when tool
+        // calls were emitted, else "end_turn". Mirrors the non-streaming
+        // backstop in non-stream-translation.ts.
+        stop_reason:
+          mapOpenAIStopReasonToAnthropic(state.deferredFinishReason)
+          ?? (Object.keys(state.toolCalls).length > 0 ?
+            "tool_use"
+          : "end_turn"),
         stop_sequence: null,
       },
       usage: {

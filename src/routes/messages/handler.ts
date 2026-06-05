@@ -109,12 +109,25 @@ const RETRIABLE_ERROR_NAMES = new Set([
   "ConnectionRefused",
 ])
 
+const MODELS_WITH_1M_CONTEXT = new Set([
+  "claude-opus-4.6",
+  "claude-opus-4.7",
+  "claude-opus-4.8",
+  "claude-sonnet-4.6",
+  "gemini-3.1-pro-preview",
+  "gemini-3.5-flash",
+  "gpt-5.4",
+  "gpt-5.5",
+])
+const EFFECTIVE_1M_LIMIT = 935_000
+
 /**
  * Looks up the model's max_prompt_tokens limit from cached models.
  * Used to produce accurate "prompt is too long: N tokens > M maximum"
  * errors even when the upstream error doesn't contain token numbers.
  */
 function lookupModelLimit(modelId: string): number | undefined {
+  if (MODELS_WITH_1M_CONTEXT.has(modelId)) return EFFECTIVE_1M_LIMIT
   const model = state.models?.data.find((m) => m.id === modelId)
   return model ? getModelContextWindow(model) : undefined
 }
@@ -1517,12 +1530,40 @@ const isNonStreaming = (
  * a valid Anthropic message with stop_reason "end_turn" and empty content,
  * causing Claude Code to treat the model's turn as complete and stop the session.
  */
-function isEmptyNonStreamingResponse(
+export function isEmptyNonStreamingResponse(
   response: ChatCompletionResponse,
 ): boolean {
-  if (response.choices.length === 0) return false
+  // No choices at all: upstream produced nothing usable. Treat as empty so
+  // the caller emits the synthetic fallback instead of a degenerate
+  // { content: [], stop_reason: null } body.
+  if (response.choices.length === 0) return true
   const choice = response.choices[0]
-  if (choice.finish_reason !== "stop") return false
+  // A normal completed turn finishes with "stop". Anything that finished with
+  // a real reason other than "stop" (tool_calls/length/content_filter) is not
+  // "empty" — let the normal translation path handle it.
+  //
+  // The remaining cases we DO treat as empty: finish_reason === "stop" with no
+  // content, and finish_reason null/undefined (a degenerate shape some models
+  // emit via Copilot) with no content. Both would otherwise translate to an
+  // empty content array, which Anthropic clients reject.
+  //
+  // ChoiceNonStreaming types finish_reason as non-null, but Copilot violates
+  // that at runtime (the bug this guard exists for), so widen the type to
+  // include the nullish shapes we actually observe before comparing.
+  const finishReason = choice.finish_reason as
+    | "stop"
+    | "length"
+    | "tool_calls"
+    | "content_filter"
+    | null
+    | undefined
+  if (
+    finishReason !== "stop"
+    && finishReason !== null
+    && finishReason !== undefined
+  ) {
+    return false
+  }
   if (choice.message.tool_calls && choice.message.tool_calls.length > 0) {
     return false
   }

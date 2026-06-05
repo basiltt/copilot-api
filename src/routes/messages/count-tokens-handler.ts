@@ -21,6 +21,19 @@ const CLAUDE_CODE_DEFAULT_WINDOW = 200_000
 const NON_CLAUDE_COMPACTION_SAFETY_MARGIN = 1.08
 const GEMINI_CONTEXT_SAFETY_BUFFER_TOKENS = 8_000
 
+// Models that support ~935k input tokens (1M context variant).
+const MODELS_WITH_1M_CONTEXT = new Set([
+  "claude-opus-4.6",
+  "claude-opus-4.7",
+  "claude-opus-4.8",
+  "claude-sonnet-4.6",
+  "gemini-3.1-pro-preview",
+  "gemini-3.5-flash",
+  "gpt-5.4",
+  "gpt-5.5",
+])
+const EFFECTIVE_1M_WINDOW = 935_000
+
 // Token overhead for Anthropic-typed tools (per Anthropic pricing docs).
 // Custom tools use the existing flat +346 for the entire tools array.
 // Typed tools add per-tool overhead on top.
@@ -88,11 +101,14 @@ export async function handleCountTokens(c: Context) {
     // session arrives with zero images (meaning compaction succeeded).
     const sessionId = getSessionId(anthropicPayload)
     if (hasStrippedImages(sessionId)) {
+      const compactionTarget =
+        MODELS_WITH_1M_CONTEXT.has(anthropicPayload.model) ? EFFECTIVE_1M_WINDOW
+        : CLAUDE_CODE_DEFAULT_WINDOW
       consola.debug(
-        `[${sessionId}] Images were recently stripped — returning 200K tokens to trigger compaction`,
+        `[${sessionId}] Images were recently stripped — returning ${compactionTarget} tokens to trigger compaction`,
       )
       return c.json({
-        input_tokens: 200_000,
+        input_tokens: compactionTarget,
       })
     }
 
@@ -103,11 +119,14 @@ export async function handleCountTokens(c: Context) {
     )
 
     if (!selectedModel) {
+      const compactionTarget =
+        MODELS_WITH_1M_CONTEXT.has(anthropicPayload.model) ? EFFECTIVE_1M_WINDOW
+        : CLAUDE_CODE_DEFAULT_WINDOW
       consola.warn(
-        `Model '${anthropicPayload.model}' not found in cached models, returning high token count to trigger compaction`,
+        `Model '${anthropicPayload.model}' not found in cached models, returning ${compactionTarget} tokens to trigger compaction`,
       )
       return c.json({
-        input_tokens: 200_000,
+        input_tokens: compactionTarget,
       })
     }
 
@@ -127,12 +146,12 @@ export async function handleCountTokens(c: Context) {
     }
 
     let finalTokenCount = tokenCount.input + tokenCount.output
-    if (anthropicPayload.model.startsWith("claude")) {
-      // Scale token count so Claude Code's context-window compaction kicks in
-      // at the right time.  Copilot caps claude-opus at ~168K tokens while
-      // Claude Code thinks the model supports ~200K.  A 1.2× multiplier maps
-      // 168K actual → ~202K reported, triggering compaction before Copilot
-      // rejects the request with model_max_prompt_tokens_exceeded.
+    if (MODELS_WITH_1M_CONTEXT.has(anthropicPayload.model)) {
+      // 1M context models: no scaling needed — the real limit (~935k) is far
+      // above Claude Code's default window so compaction fires naturally.
+    } else if (anthropicPayload.model.startsWith("claude")) {
+      // Legacy Claude models: scale 1.2× so compaction fires before the
+      // conservative 168k Copilot limit.
       finalTokenCount = Math.round(finalTokenCount * 1.2)
     } else if (anthropicPayload.model.startsWith("grok")) {
       finalTokenCount = Math.round(finalTokenCount * 1.03)

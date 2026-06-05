@@ -551,8 +551,9 @@ function responsesToolToCC(t: ResponsesTool): Tool | null {
 }
 
 function translateResponsesContentToCC(
-  content: string | Array<ResponsesContentPart>,
+  content: string | Array<ResponsesContentPart> | null | undefined,
 ): string | Array<ContentPart> | null {
+  if (content === null || content === undefined) return null
   if (typeof content === "string") return content
 
   const parts: Array<ContentPart> = []

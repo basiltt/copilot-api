@@ -174,14 +174,15 @@ function mergeConsecutiveSameRoleMessages(
 ): Array<Message> {
   if (messages.length <= 1) return messages
 
-  const merged: Array<Message> = [messages[0]]
+  let previous: Message = messages[0]
+  const merged: Array<Message> = [previous]
 
   for (let i = 1; i < messages.length; i++) {
     const current = messages[i]
-    const previous = merged.at(-1)
 
     if (current.role !== previous.role || current.role === "tool") {
       merged.push(current)
+      previous = current
       continue
     }
 
@@ -685,11 +686,17 @@ export function translateToAnthropic(
 
   // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
 
-  // Some models (notably Gemini) intermittently return finish_reason "stop"
-  // even when they emitted tool calls. Correct this to "tool_calls" so Claude
-  // Code executes the pending tool calls instead of treating the turn as done.
+  // Some models (notably Gemini) intermittently return a non-tool_calls
+  // finish_reason ("stop", or even null — a degenerate shape) even when they
+  // emitted tool calls. Correct this to "tool_calls" whenever tool-use blocks
+  // are present, so Claude Code executes the pending tool calls instead of
+  // treating the turn as done.
+  //
+  // The one exception is "length": a length-truncated turn with tool calls is
+  // handled specially below (the arguments may be incomplete), so preserve it
+  // here rather than masking it as "tool_calls".
   const correctedStopReason =
-    allToolUseBlocks.length > 0 && stopReason === "stop" ?
+    allToolUseBlocks.length > 0 && stopReason !== "length" ?
       "tool_calls"
     : stopReason
 
@@ -740,13 +747,22 @@ export function translateToAnthropic(
     }
   }
 
+  // Backstop: a completed non-streaming message must never carry
+  // stop_reason: null. Anthropic clients (Claude Code, strict SDK callers)
+  // treat null stop_reason on a non-stream response as a protocol violation.
+  // Degenerate upstream payloads (empty choices array, or a null
+  // finish_reason from models like Gemini) would otherwise map straight
+  // through to null here. When tool-use blocks are present, default to
+  // "tool_use" so the client still executes the tools; otherwise "end_turn".
   return {
     id: toAnthropicMessageId(response.id),
     type: "message",
     role: "assistant",
     model: response.model,
     content: [...allTextBlocks, ...allToolUseBlocks],
-    stop_reason: mapOpenAIStopReasonToAnthropic(correctedStopReason),
+    stop_reason:
+      mapOpenAIStopReasonToAnthropic(correctedStopReason)
+      ?? (allToolUseBlocks.length > 0 ? "tool_use" : "end_turn"),
     stop_sequence: null,
     usage: buildAnthropicUsage(response.usage),
   }

@@ -56,7 +56,7 @@ describe("Anthropic tool name aliasing", () => {
 
     expect(openAIPayload.tool_choice).toEqual({
       type: "function",
-      function: { name: aliasedName },
+      function: { name: aliasedName as string },
     })
 
     const assistantMessage = openAIPayload.messages.find(

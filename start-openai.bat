@@ -44,6 +44,5 @@ echo.
 echo Or run Codex with:
 echo   set OPENAI_API_KEY=dummy ^& set OPENAI_BASE_URL=http://localhost:1515/v1 ^& codex
 echo.
-
-bun run ./src/main.ts start --port 1515
+bun run ./src/main.ts start --port 1515 --verbose
 pause
