@@ -5,6 +5,8 @@
 
 import type { SSEMessage } from "hono/streaming"
 
+import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
+
 import type {
   ContentPart,
   ChatCompletionResponse,
@@ -288,82 +290,6 @@ function buildTextFormat(
     return { text: { format: { type: responseFormat.type } } }
   }
   return {}
-}
-
-// ─── Repair orphaned tool calls/results ───────────────────────────────────────
-
-interface RepairRange {
-  messages: Array<import("./create-chat-completions").Message>
-  start: number
-  end: number
-  callIds: Set<string>
-}
-
-function removeOrphanedResults(range: RepairRange): number {
-  const { messages, start, callIds } = range
-  let j = range.end
-  for (let k = j - start - 2; k >= 0; k--) {
-    const id = messages[start + 1 + k].tool_call_id
-    if (id && !callIds.has(id)) {
-      messages.splice(start + 1 + k, 1)
-      j--
-    }
-  }
-  return j
-}
-
-function insertMissingResults(range: RepairRange): number {
-  const { messages, start, end, callIds } = range
-  const existingIds = new Set(
-    messages
-      .slice(start + 1, end)
-      .map((m) => m.tool_call_id)
-      .filter(Boolean),
-  )
-  const missing = [...callIds].filter((id) => !existingIds.has(id))
-  if (missing.length > 0) {
-    const placeholders = missing.map((id) => ({
-      role: "tool" as const,
-      tool_call_id: id,
-      content: "",
-    }))
-    messages.splice(start + 1, 0, ...placeholders)
-    return end + missing.length
-  }
-  return end
-}
-
-function repairOrphanedToolCalls(
-  messages: Array<import("./create-chat-completions").Message>,
-): void {
-  let i = 0
-  while (i < messages.length) {
-    const msg = messages[i]
-    if (msg.role === "assistant" && msg.tool_calls?.length) {
-      const callIds = new Set(msg.tool_calls.map((tc) => tc.id))
-
-      let j = i + 1
-      while (j < messages.length && messages[j].role === "tool") j++
-
-      const range: RepairRange = { messages, start: i, end: j, callIds }
-      j = removeOrphanedResults(range)
-      range.end = j
-      j = insertMissingResults(range)
-
-      i = j
-      continue
-    }
-
-    if (msg.role === "tool" && msg.tool_call_id) {
-      const prev = i > 0 ? messages[i - 1] : null
-      if (!prev || prev.role !== "assistant" || !prev.tool_calls?.length) {
-        messages.splice(i, 1)
-        continue
-      }
-    }
-
-    i++
-  }
 }
 
 // ─── Routing helper: models that don't support the Responses API ─────────────

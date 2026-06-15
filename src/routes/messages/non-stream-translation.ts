@@ -1,5 +1,6 @@
 import consola from "consola"
 
+import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
 import {
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
@@ -157,7 +158,17 @@ function translateAnthropicMessagesToOpenAI(
     : handleAssistantMessage(message, toolNameMap),
   )
 
-  return mergeConsecutiveSameRoleMessages([...systemMessages, ...otherMessages])
+  const combined = [...systemMessages, ...otherMessages]
+
+  // Drop/patch tool messages whose tool_use was removed from history (context
+  // compaction, interrupted or parallel tool calls).  Copilot re-validates the
+  // Anthropic invariant for Claude models and rejects any tool_result that has
+  // no corresponding tool_use in the previous message.  Run this BEFORE the
+  // merge so any orphan converted to a user message is then coalesced with an
+  // adjacent user turn (Copilot expects strictly alternating roles).
+  repairOrphanedToolCalls(combined)
+
+  return mergeConsecutiveSameRoleMessages(combined)
 }
 
 /**
