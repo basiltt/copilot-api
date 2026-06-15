@@ -9,6 +9,7 @@ import type { ResponsesPayload } from "~/services/copilot/responses-translation"
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { awaitApproval } from "~/lib/approval"
 import { HTTPError } from "~/lib/error"
+import { resolveModelId } from "~/lib/model-resolver"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import { createChatCompletions } from "~/services/copilot/create-chat-completions"
@@ -57,7 +58,14 @@ export async function handleResponses(c: Context) {
   const payload = await c.req.json<Record<string, unknown>>()
   consola.debug("Responses API request:", JSON.stringify(payload).slice(-400))
 
-  const model = typeof payload.model === "string" ? payload.model : ""
+  const rawModel = typeof payload.model === "string" ? payload.model : ""
+  // Normalize the requested model id (e.g. `claude-opus-4-8` →
+  // `claude-opus-4.8`) to a real Copilot model before lookup or forwarding.
+  const model = resolveModelId(rawModel, state.models)
+  if (model !== rawModel) {
+    consola.debug(`[model-resolver] '${rawModel}' → '${model}'`)
+    payload.model = model
+  }
 
   await checkBurstLimit(state, model)
 

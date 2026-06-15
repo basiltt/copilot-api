@@ -2,6 +2,7 @@ import type { Context } from "hono"
 
 import consola from "consola"
 
+import { resolveModelId } from "~/lib/model-resolver"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 import {
@@ -93,6 +94,15 @@ export async function handleCountTokens(c: Context) {
     const anthropicBeta = c.req.header("anthropic-beta")
 
     const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
+
+    // Normalize the requested model id (e.g. `claude-opus-4-8` →
+    // `claude-opus-4.8`) so the model lookup and per-model scaling below
+    // operate on the real Copilot model rather than falling back to the
+    // default window.
+    anthropicPayload.model = resolveModelId(
+      anthropicPayload.model,
+      state.models,
+    )
 
     // If images were stripped from this session's recent messages request,
     // force compaction by returning a very high token count.  The flag is

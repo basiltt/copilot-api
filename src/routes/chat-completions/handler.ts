@@ -4,6 +4,7 @@ import consola from "consola"
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
+import { resolveModelId } from "~/lib/model-resolver"
 import { selectModelForTokenCount } from "~/lib/model-selector"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
@@ -17,11 +18,29 @@ import {
 } from "~/services/copilot/create-chat-completions"
 import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 
+/**
+ * Returns the payload with its `model` normalized to a real Copilot model id
+ * (e.g. `claude-opus-4-8` → `claude-opus-4.8`).  Returns the original payload
+ * unchanged when the id already matches or no canonical match exists.
+ */
+function withResolvedModel(
+  payload: ChatCompletionsPayload,
+): ChatCompletionsPayload {
+  const resolvedModel = resolveModelId(payload.model, state.models)
+  if (resolvedModel === payload.model) return payload
+  consola.debug(`[model-resolver] '${payload.model}' → '${resolvedModel}'`)
+  return { ...payload, model: resolvedModel }
+}
+
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
+
+  // Normalize the requested model id (e.g. `claude-opus-4-8` →
+  // `claude-opus-4.8`) to a real Copilot model before lookup or forwarding.
+  payload = withResolvedModel(payload)
 
   await checkBurstLimit(state, payload.model)
 

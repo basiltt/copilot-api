@@ -15,6 +15,7 @@ import {
   sendAnthropicContextWindowError,
   sendAnthropicInvalidRequestError,
 } from "~/lib/error"
+import { resolveModelId } from "~/lib/model-resolver"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { isWebSearchEnabled, state } from "~/lib/state"
 import {
@@ -137,6 +138,16 @@ export async function handleCompletion(c: Context) {
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
+
+  // Normalize the requested model id (e.g. `claude-opus-4-8` → `claude-opus-4.8`)
+  // to a real Copilot model before any downstream lookup or forwarding.
+  const resolvedModel = resolveModelId(anthropicPayload.model, state.models)
+  if (resolvedModel !== anthropicPayload.model) {
+    consola.debug(
+      `[model-resolver] '${anthropicPayload.model}' → '${resolvedModel}'`,
+    )
+    anthropicPayload.model = resolvedModel
+  }
 
   await checkBurstLimit(state, anthropicPayload.model)
 
