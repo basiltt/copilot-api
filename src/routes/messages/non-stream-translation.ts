@@ -94,7 +94,10 @@ export function translateToOpenAI(
       payload.tool_choice,
       toolNameMap,
     ),
-    response_format: translateOutputConfig(payload.output_config),
+    response_format: translateOutputConfig(
+      payload.output_config,
+      payload.model,
+    ),
   }
 }
 
@@ -113,11 +116,21 @@ function translateModelName(model: string): string {
  * not support `json_schema` structured outputs, so we downgrade to `json_object`
  * which instructs the model to produce valid JSON.  The system prompt already
  * describes the expected JSON shape, so this is sufficient.
+ *
+ * Exception — Claude models: Copilot's Claude backend does not merely ignore
+ * `response_format`, it rejects the request with HTTP 422 Unprocessable Entity.
+ * For Claude we therefore omit `response_format` entirely and rely solely on
+ * the system-prompt JSON enforcement (`enforceJsonOutput`) plus the
+ * free-text → JSON repair in the structured-output handler.
  */
 function translateOutputConfig(
   outputConfig: AnthropicMessagesPayload["output_config"],
+  model: string,
 ): ChatCompletionsPayload["response_format"] {
   if (!outputConfig?.format) return undefined
+  // Copilot rejects response_format for Claude models (422). JSON is still
+  // enforced via the system prompt, so dropping it here is safe.
+  if (model.startsWith("claude")) return undefined
   return { type: "json_object" }
 }
 
@@ -168,7 +181,37 @@ function translateAnthropicMessagesToOpenAI(
   // adjacent user turn (Copilot expects strictly alternating roles).
   repairOrphanedToolCalls(combined)
 
-  return mergeConsecutiveSameRoleMessages(combined)
+  const merged = mergeConsecutiveSameRoleMessages(combined)
+
+  // Final invariant: the conversation must end with a user (or tool) turn.
+  // A trailing assistant message is an "assistant prefill" — native Anthropic
+  // allows it, but Copilot's Claude backend rejects it:
+  //   "This model does not support assistant message prefill. The conversation
+  //    must end with a user message."
+  // Claude Code's multi-agent / workflow ("ultracode") mode emits such prefills
+  // (e.g. priming a structured-output reply). Normalize by appending a minimal
+  // user continuation so the request ends with a user turn, keeping the
+  // assistant prefill intact as the prior turn.
+  return ensureConversationEndsWithUser(merged)
+}
+
+/**
+ * Appends a minimal user continuation when the translated conversation ends
+ * with an assistant message that has no pending tool_calls (an "assistant
+ * prefill"). Copilot's Claude backend requires the conversation to end with a
+ * user message; native Anthropic permits the prefill, so the proxy bridges the
+ * gap here. A trailing assistant message that *does* carry tool_calls is left
+ * untouched — appending a user turn would orphan those calls.
+ */
+function ensureConversationEndsWithUser(
+  messages: Array<Message>,
+): Array<Message> {
+  const last = messages.at(-1)
+  const hasPendingToolCalls = (last?.tool_calls?.length ?? 0) > 0
+  if (last?.role === "assistant" && !hasPendingToolCalls) {
+    messages.push({ role: "user", content: "Please continue." })
+  }
+  return messages
 }
 
 /**
@@ -191,15 +234,30 @@ function mergeConsecutiveSameRoleMessages(
   for (let i = 1; i < messages.length; i++) {
     const current = messages[i]
 
+    // `tool` messages are always standalone — each maps 1:1 to a tool_call and
+    // must keep its own tool_call_id; never coalesce them.
     if (current.role !== previous.role || current.role === "tool") {
       merged.push(current)
       previous = current
       continue
     }
 
+    // Same role (user↔user or assistant↔assistant): collapse into `previous`,
+    // merging text AND preserving tool_calls. Naively copying only `.content`
+    // would drop an assistant's tool_calls and orphan its tool results —
+    //   "messages with role 'tool' must be a response to a preceeding message
+    //    with 'tool_calls'."
     const prevText = extractTextContent(previous.content)
     const currText = extractTextContent(current.content)
-    previous.content = prevText + "\n\n" + currText
+    const combinedText = [prevText, currText].filter(Boolean).join("\n\n")
+    previous.content = combinedText.length > 0 ? combinedText : previous.content
+
+    if (current.tool_calls && current.tool_calls.length > 0) {
+      previous.tool_calls = [
+        ...(previous.tool_calls ?? []),
+        ...current.tool_calls,
+      ]
+    }
   }
 
   return merged

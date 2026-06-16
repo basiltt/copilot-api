@@ -66,12 +66,45 @@ function isRetriableUpstreamStatus(status: number): boolean {
   return RETRIABLE_UPSTREAM_STATUS_CODES.has(status)
 }
 
+// Substrings identifying invalid_request_body errors that are DETERMINISTIC —
+// caused by the shape of the request itself, so retrying the identical payload
+// can never succeed. Matching these short-circuits the retry loop instead of
+// burning all MAX_TRANSIENT_HTTP_RETRIES attempts (~16s) on a doomed request.
+// Matched case-insensitively against the upstream error message.
+const DETERMINISTIC_BODY_ERROR_SIGNATURES = [
+  "assistant message prefill",
+  "must end with a user message",
+  "must be a response to a preceeding message", // upstream's spelling
+  "must be a response to a preceding message",
+  "must have a corresponding tool_use",
+  "unexpected tool_use_id",
+  "exceeds the limit", // context-window / max-prompt-tokens errors
+  "exceeds the maximum",
+] as const
+
+function isDeterministicBodyErrorMessage(message: string): boolean {
+  const lower = message.toLowerCase()
+  return DETERMINISTIC_BODY_ERROR_SIGNATURES.some((sig) => lower.includes(sig))
+}
+
 async function isRetriableBodyError(response: Response): Promise<boolean> {
   if (response.status !== 400) return false
   try {
     const cloned = response.clone()
-    const body = (await cloned.json()) as { error?: { code?: string } }
-    return body.error?.code === "invalid_request_body"
+    const body = (await cloned.json()) as {
+      error?: { code?: string; message?: string }
+    }
+    if (body.error?.code !== "invalid_request_body") return false
+    // Deterministic request-shape errors (assistant prefill, role ordering,
+    // orphaned tool_result, context-window overflow) cannot be fixed by
+    // retrying the same payload — fail fast instead of looping.
+    if (
+      body.error.message
+      && isDeterministicBodyErrorMessage(body.error.message)
+    ) {
+      return false
+    }
+    return true
   } catch {
     return false
   }

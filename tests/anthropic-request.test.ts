@@ -832,9 +832,13 @@ describe("output_config.format → response_format translation", () => {
     },
   }
 
-  test("translates to json_object and enforces JSON in system prompt", () => {
+  test("does NOT send response_format for Claude models (Copilot 422s on it) but still enforces JSON via prompt", () => {
     const result = translateToOpenAI(titlePayload)
-    expect(result.response_format).toEqual({ type: "json_object" })
+    // Copilot's Claude backend rejects response_format with HTTP 422
+    // Unprocessable Entity. The structured-output handler enforces JSON via the
+    // system prompt and repairs free-text → JSON afterward, so response_format
+    // is redundant for Claude and must be omitted.
+    expect(result.response_format).toBeUndefined()
     const sys = result.messages.find((m) => m.role === "system")
     expect(sys).toBeDefined()
     const content = sys?.content as string
@@ -842,6 +846,11 @@ describe("output_config.format → response_format translation", () => {
     expect(content).toContain(
       "IMPORTANT: You MUST respond with valid JSON only",
     )
+  })
+
+  test("still sends response_format json_object for non-Claude models", () => {
+    const result = translateToOpenAI({ ...titlePayload, model: "gpt-4o" })
+    expect(result.response_format).toEqual({ type: "json_object" })
   })
 
   test("does not enforce JSON when output_config.format is absent", () => {
