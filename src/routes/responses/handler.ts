@@ -8,7 +8,13 @@ import type { ResponsesPayload } from "~/services/copilot/responses-translation"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { awaitApproval } from "~/lib/approval"
-import { HTTPError } from "~/lib/error"
+import {
+  HTTPError,
+  buildOpenAIContextWindowErrorBody,
+  buildResponsesContextWindowFailedEvent,
+  extractUpstreamErrorMessage,
+  isContextWindowError,
+} from "~/lib/error"
 import { resolveModelId } from "~/lib/model-resolver"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
@@ -142,35 +148,116 @@ export async function handleResponses(c: Context) {
 
   if (!response.ok) {
     inactivity.clear()
+    const ctxError = await detectContextWindowError(response)
+    if (ctxError) {
+      return sendResponsesContextWindowError(
+        c,
+        payload.stream === true,
+        ctxError,
+      )
+    }
     throw new HTTPError("Failed to create responses completion", response)
   }
 
   const isStreaming = payload.stream === true
 
   if (isStreaming) {
-    return streamSSE(c, async (stream) => {
-      try {
-        for await (const event of events(response)) {
-          inactivity.keepAlive()
-          if (!event.data) continue
-          if (event.data === "[DONE]") {
-            await stream.writeSSE({ data: "[DONE]" })
-            break
-          }
-          await stream.writeSSE({
-            event: event.event ?? undefined,
-            data: event.data,
-          })
-        }
-      } finally {
-        inactivity.clear()
-      }
-    })
+    return streamResponsesPassthrough(c, response, inactivity)
   }
 
   inactivity.clear()
   const data = await response.json()
   return c.json(data)
+}
+
+/** Streams a successful upstream /responses SSE body straight through to the client. */
+function streamResponsesPassthrough(
+  c: Context,
+  response: Response,
+  inactivity: ReturnType<typeof createInactivityAbort>,
+) {
+  return streamSSE(c, async (stream) => {
+    try {
+      for await (const event of events(response)) {
+        inactivity.keepAlive()
+        if (!event.data) continue
+        if (event.data === "[DONE]") {
+          await stream.writeSSE({ data: "[DONE]" })
+          break
+        }
+        await stream.writeSSE({
+          event: event.event ?? undefined,
+          data: event.data,
+        })
+      }
+    } finally {
+      inactivity.clear()
+    }
+  })
+}
+
+/**
+ * Reads an upstream error response and, if it indicates a context-window
+ * overflow (HTTP 413 or a recognizable message), returns the extracted upstream
+ * message. Returns null for unrelated errors.
+ *
+ * Reads from a clone so the original response body stays intact for
+ * `forwardError` when this is not a context-window error.
+ */
+async function detectContextWindowError(
+  response: Response,
+): Promise<{ message: string } | null> {
+  const errorText = await response.clone().text()
+  let errorJson: unknown
+  try {
+    errorJson = JSON.parse(errorText)
+  } catch {
+    errorJson = null
+  }
+  const message = extractUpstreamErrorMessage(
+    errorJson,
+    errorText,
+    response.headers.get("content-type"),
+  )
+  if (!isContextWindowError(message, response.status)) return null
+  return { message }
+}
+
+/**
+ * Emits a context-window error in the form the OpenAI Codex CLI recognizes so
+ * it triggers auto-compaction instead of failing.
+ *
+ * For streaming requests this MUST be a 200 OK SSE stream carrying a
+ * `response.failed` event with `error.code = "context_length_exceeded"` —
+ * Codex's transport layer discards the body of any non-2xx response before its
+ * SSE parser (and thus the context-window detector) ever runs.
+ *
+ * For non-streaming requests we return a standard OpenAI-shaped 400 error
+ * carrying the same `code`.
+ */
+function sendResponsesContextWindowError(
+  c: Context,
+  isStreaming: boolean,
+  ctxError: { message: string },
+) {
+  consola.warn(
+    `[responses] Context window exceeded — signaling Codex to compact (code=context_length_exceeded). Upstream: "${ctxError.message}"`,
+  )
+
+  if (isStreaming) {
+    return streamSSE(c, async (stream) => {
+      const event = buildResponsesContextWindowFailedEvent(ctxError.message)
+      // Codex's process_sse only surfaces the parsed error once the stream
+      // ends, so we write the single response.failed event and let the stream
+      // close (matching real OpenAI, which sends no [DONE] on a failed turn).
+      await stream.writeSSE({
+        event: event.type,
+        data: JSON.stringify(event),
+      })
+    })
+  }
+
+  return c.json(buildOpenAIContextWindowErrorBody(ctxError.message), 400)
 }
 
 async function handleViaCC(c: Context, payload: ResponsesPayload) {

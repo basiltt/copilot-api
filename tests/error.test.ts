@@ -5,6 +5,10 @@ import { describe, test, expect, mock } from "bun:test"
 import {
   HTTPError,
   buildAnthropicContextWindowErrorResponse,
+  buildOpenAIContextWindowErrorBody,
+  buildResponsesContextWindowFailedEvent,
+  contextWindowErrorMessage,
+  CONTEXT_LENGTH_EXCEEDED_CODE,
   forwardError,
   isContextWindowError,
   formatAnthropicContextWindowError,
@@ -215,5 +219,62 @@ describe("sendAnthropicInvalidRequestError", () => {
     expect(typed.error.type).toBe("invalid_request_error")
     expect(typed.error.message).toBe("Embedded image is too small.")
     expect(headerFn).toHaveBeenCalledWith("request-id", typed.request_id)
+  })
+})
+
+describe("Responses API (Codex) context-window signaling", () => {
+  // Codex's SSE detector matches strictly on this code; do not change it
+  // without re-verifying against codex-rs/codex-api/src/sse/responses.rs.
+  test("exposes the exact code Codex pattern-matches", () => {
+    expect(CONTEXT_LENGTH_EXCEEDED_CODE).toBe("context_length_exceeded")
+  })
+
+  test("buildResponsesContextWindowFailedEvent has the shape Codex parses", () => {
+    const event = buildResponsesContextWindowFailedEvent(
+      "prompt token count of 1402500 exceeds the limit of 935000",
+    )
+    expect(event.type).toBe("response.failed")
+    const response = event.response as {
+      status: string
+      error: { code: string; message: string }
+    }
+    expect(response.status).toBe("failed")
+    // The decisive field: Codex reads response.error.code.
+    expect(response.error.code).toBe("context_length_exceeded")
+    // A real, informative upstream message is preserved (no fabrication).
+    expect(response.error.message).toContain("exceeds the limit of 935000")
+  })
+
+  test("does NOT fabricate token counts when upstream message is generic", () => {
+    const event = buildResponsesContextWindowFailedEvent(
+      "failed to parse request",
+    )
+    const response = event.response as { error: { message: string } }
+    // The misleading "1402500 tokens > 935000" fabrication must be gone.
+    expect(response.error.message).not.toMatch(/\d+ tokens > \d+/)
+    expect(response.error.message).not.toContain("1402500")
+  })
+
+  test("contextWindowErrorMessage keeps genuine token-count messages", () => {
+    expect(
+      contextWindowErrorMessage(
+        "prompt token count of 55059 exceeds the limit of 12288",
+      ),
+    ).toBe("prompt token count of 55059 exceeds the limit of 12288")
+  })
+
+  test("contextWindowErrorMessage falls back for unhelpful upstream text", () => {
+    expect(contextWindowErrorMessage("failed to parse request")).not.toContain(
+      "failed to parse request",
+    )
+    expect(contextWindowErrorMessage(undefined)).toMatch(/context window/i)
+  })
+
+  test("buildOpenAIContextWindowErrorBody is OpenAI-shaped with the code", () => {
+    const body = buildOpenAIContextWindowErrorBody("input exceeds model limit")
+    expect(body.error.type).toBe("invalid_request_error")
+    expect(body.error.code).toBe("context_length_exceeded")
+    expect(body.error.param).toBeNull()
+    expect(body.error.message).toBe("input exceeds model limit")
   })
 })
