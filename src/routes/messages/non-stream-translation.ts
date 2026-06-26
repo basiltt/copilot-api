@@ -98,7 +98,33 @@ export function translateToOpenAI(
       payload.output_config,
       payload.model,
     ),
+    ...buildReasoningFromThinking(payload.thinking),
   }
+}
+
+/**
+ * Maps an Anthropic `thinking` config onto the Responses-API `reasoning`
+ * control. Setting `summary: "auto"` is what makes Copilot stream
+ * `reasoning_summary_text.delta` events in real time during the model's
+ * thinking phase; without it the model reasons silently and the thinking text
+ * only surfaces (all at once) at the end of the turn.
+ *
+ * The `budget_tokens` hint is translated to a coarse effort level so the
+ * upstream allocates a comparable amount of reasoning.
+ */
+function buildReasoningFromThinking(
+  thinking: AnthropicMessagesPayload["thinking"],
+): { reasoning?: { effort: string; summary: string } } {
+  if (thinking?.type !== "enabled") return {}
+
+  const budget = thinking.budget_tokens
+  let effort = "medium"
+  if (typeof budget === "number") {
+    if (budget <= 8_000) effort = "low"
+    else if (budget >= 24_000) effort = "high"
+  }
+
+  return { reasoning: { effort, summary: "auto" } }
 }
 
 function translateModelName(model: string): string {

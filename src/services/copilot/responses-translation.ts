@@ -237,37 +237,42 @@ function buildSystemInstruction(
   return {}
 }
 
+function buildResponsesTools(
+  tools: NonNullable<ChatCompletionsPayload["tools"]>,
+): Array<ResponsesTool> {
+  return tools.map((tool) => ({
+    type: "function" as const,
+    name: tool.function.name,
+    ...(tool.function.description !== undefined && {
+      description: tool.function.description,
+    }),
+    parameters: tool.function.parameters,
+    ...(tool.function.strict !== undefined && {
+      strict: tool.function.strict,
+    }),
+  }))
+}
+
+/** True when a value is neither null nor undefined (narrows the type). */
+function isSet<T>(value: T): value is NonNullable<T> {
+  return value !== null && value !== undefined
+}
+
 function buildOptionalScalars(
   payload: ChatCompletionsPayload,
 ): Partial<ResponsesPayload> {
   const out: Partial<ResponsesPayload> = {}
-  if (payload.max_tokens !== null && payload.max_tokens !== undefined)
-    out.max_output_tokens = payload.max_tokens
-  if (payload.temperature !== null && payload.temperature !== undefined)
-    out.temperature = payload.temperature
-  if (payload.top_p !== null && payload.top_p !== undefined)
-    out.top_p = payload.top_p
-  if (payload.stream !== null && payload.stream !== undefined)
-    out.stream = payload.stream
-  if (payload.tools !== null && payload.tools !== undefined)
-    out.tools = payload.tools.map((tool) => ({
-      type: "function" as const,
-      name: tool.function.name,
-      ...(tool.function.description !== undefined && {
-        description: tool.function.description,
-      }),
-      parameters: tool.function.parameters,
-      ...(tool.function.strict !== undefined && {
-        strict: tool.function.strict,
-      }),
-    }))
-  if (
-    payload.tool_choice !== null
-    && payload.tool_choice !== undefined
-    && out.tools
-    && out.tools.length > 0
-  )
+  if (isSet(payload.max_tokens)) out.max_output_tokens = payload.max_tokens
+  if (isSet(payload.temperature)) out.temperature = payload.temperature
+  if (isSet(payload.top_p)) out.top_p = payload.top_p
+  if (isSet(payload.stream)) out.stream = payload.stream
+  if (isSet(payload.tools)) out.tools = buildResponsesTools(payload.tools)
+  if (isSet(payload.tool_choice) && out.tools && out.tools.length > 0)
     out.tool_choice = payload.tool_choice
+  // Forward reasoning controls (effort + summary). `summary: "auto"` is what
+  // makes Copilot stream reasoning_summary_text.delta events in real time so
+  // the thinking block renders incrementally instead of all at once.
+  if (isSet(payload.reasoning)) out.reasoning = payload.reasoning
   return out
 }
 

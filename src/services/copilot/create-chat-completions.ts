@@ -466,6 +466,15 @@ export interface ChatCompletionsPayload {
     | null
   user?: string | null
   stream_options?: { include_usage: boolean } | null
+
+  /**
+   * Reasoning controls for the Responses API path (gpt-5.x and other reasoning
+   * models). When the incoming Anthropic request has extended thinking enabled,
+   * we set `summary: "auto"` so Copilot streams `reasoning_summary_text.delta`
+   * events in real time — without it, the model reasons silently and no
+   * thinking deltas are emitted (the thinking appears all at once at the end).
+   */
+  reasoning?: { effort?: string; summary?: string } | null
 }
 
 export interface Tool {
