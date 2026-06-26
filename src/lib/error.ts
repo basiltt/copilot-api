@@ -141,7 +141,9 @@ export function isContextWindowError(
   message: string,
   statusCode?: number,
 ): boolean {
-  if (statusCode === 413) return true
+  if (statusCode === 413) {
+    return !isOpaquePayloadParseError(message)
+  }
 
   const lower = message.toLowerCase()
   return (
@@ -152,6 +154,10 @@ export function isContextWindowError(
     || lower.includes("exceeds the limit")
     || lower.includes("model_max_prompt_tokens_exceeded")
   )
+}
+
+function isOpaquePayloadParseError(message: string): boolean {
+  return message.trim().toLowerCase() === "failed to parse request"
 }
 
 /**

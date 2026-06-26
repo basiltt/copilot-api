@@ -98,6 +98,45 @@ describe("resolveModelId — hyphen/dot normalization", () => {
   })
 })
 
+describe("resolveModelId — Anthropic date-stamp stripping", () => {
+  test("resolves claude-haiku-4-5-20251001 to claude-haiku-4.5", () => {
+    expect(resolveModelId("claude-haiku-4-5-20251001", COPILOT_MODELS)).toBe(
+      "claude-haiku-4.5",
+    )
+  })
+
+  test("resolves claude-sonnet-4-5-20250929 to claude-sonnet-4.5", () => {
+    expect(resolveModelId("claude-sonnet-4-5-20250929", COPILOT_MODELS)).toBe(
+      "claude-sonnet-4.5",
+    )
+  })
+
+  test("resolves a dotted+dated id (claude-haiku-4.5-20251001)", () => {
+    expect(resolveModelId("claude-haiku-4.5-20251001", COPILOT_MODELS)).toBe(
+      "claude-haiku-4.5",
+    )
+  })
+
+  test("is case-insensitive with a date stamp", () => {
+    expect(resolveModelId("Claude-Haiku-4-5-20251001", COPILOT_MODELS)).toBe(
+      "claude-haiku-4.5",
+    )
+  })
+
+  test("does not strip Copilot's own hyphen-dated ids (gpt-4.1-2025-04-14)", () => {
+    // Ends in two digits, not eight — exact match must win, untouched.
+    expect(resolveModelId("gpt-4.1-2025-04-14", COPILOT_MODELS)).toBe(
+      "gpt-4.1-2025-04-14",
+    )
+  })
+
+  test("returns original when stripping still finds no match", () => {
+    expect(resolveModelId("claude-haiku-9-9-20251001", COPILOT_MODELS)).toBe(
+      "claude-haiku-9-9-20251001",
+    )
+  })
+})
+
 describe("resolveModelId — no match", () => {
   test("returns the original id when no model matches", () => {
     expect(resolveModelId("claude-opus-9-9", COPILOT_MODELS)).toBe(

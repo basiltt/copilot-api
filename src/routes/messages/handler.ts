@@ -110,6 +110,25 @@ const RETRIABLE_ERROR_NAMES = new Set([
   "ConnectionRefused",
 ])
 
+/**
+ * Classifies whether a thrown fetch error is a transient network failure that
+ * is safe to retry (before any response byte has arrived).
+ *
+ * Bun/undici surface these markers inconsistently: an inactivity abort sets
+ * `error.name = "TimeoutError"`, while a raw socket reset arrives as a plain
+ * `Error` with the marker on `error.code` (e.g. `ECONNRESET`).  Checking only
+ * `.name` (the previous behavior) let connection resets fall through to a hard
+ * 500 instead of being retried.  We match against both.
+ */
+export function isRetriableFetchError(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false
+  const code = (error as { code?: unknown }).code
+  return (
+    RETRIABLE_ERROR_NAMES.has(error.name)
+    || (typeof code === "string" && RETRIABLE_ERROR_NAMES.has(code))
+  )
+}
+
 const MODELS_WITH_1M_CONTEXT = new Set([
   "claude-opus-4.6",
   "claude-opus-4.7",
@@ -943,8 +962,7 @@ async function prefetchCopilotResponse(
       if (error instanceof HTTPError) throw error
       // CompactionNeededError propagates immediately
       if (error instanceof CompactionNeededError) throw error
-      const isRetriable =
-        error instanceof Error && RETRIABLE_ERROR_NAMES.has(error.name)
+      const isRetriable = isRetriableFetchError(error)
       if (!isRetriable || attempt === MAX_FETCH_RETRIES) throw error
       consola.warn(
         `Copilot fetch attempt ${attempt}/${MAX_FETCH_RETRIES} failed (${error.message}), retrying…`,

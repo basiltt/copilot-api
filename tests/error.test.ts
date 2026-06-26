@@ -151,6 +151,10 @@ describe("isContextWindowError", () => {
     expect(isContextWindowError("input exceeds model limit")).toBe(true)
   })
 
+  test("does not treat opaque parser 413 as context-window", () => {
+    expect(isContextWindowError("failed to parse request", 413)).toBe(false)
+  })
+
   test("returns false for unrelated errors", () => {
     expect(isContextWindowError("rate limit exceeded")).toBe(false)
     expect(isContextWindowError("internal server error")).toBe(false)
