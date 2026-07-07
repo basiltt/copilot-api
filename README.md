@@ -14,6 +14,7 @@ A reverse-engineered proxy that turns the GitHub Copilot API into fully compatib
 - **Manual Approval Mode** — Interactively approve/deny each request (`--manual`)
 - **Docker & npx** — Run anywhere: from source, via `npx copilot-api@latest`, or as a Docker container
 - **Proxy Support** — HTTP/HTTPS proxy via environment variables with per-URL routing
+- **Native HTTPS** — Serve over TLS with a self-signed cert (`TLS_CERT`/`TLS_KEY`) for secure LAN access — no reverse proxy needed
 
 ## Demo
 
@@ -254,6 +255,8 @@ The included `start.bat` handles everything automatically:
 
 The script will load env vars, build if needed, show the active search provider, start the server, and open the Usage Dashboard in your browser.
 
+> Need HTTPS for access from another machine on your network? See [HTTPS / TLS (LAN Access)](#https--tls-lan-access).
+
 ## Environment Variables
 
 Create a `.env` file in the project root. It is gitignored.
@@ -266,9 +269,67 @@ BRAVE_API_KEY=BSA...             # Alternative: brave.com/search/api
 # Proxy (optional)
 HTTP_PROXY=http://proxy:8080
 HTTPS_PROXY=http://proxy:8080
+
+# HTTPS / TLS (optional — enables HTTPS when both are set)
+TLS_CERT=certs/server.crt        # Path to certificate (PEM) or inline PEM
+TLS_KEY=certs/server.key         # Path to private key (PEM) or inline PEM
+TLS_PASSPHRASE=                  # Private key passphrase (only if encrypted)
 ```
 
 > **Provider priority:** If both keys are set, Tavily is used.
+
+> **TLS:** Set **both** `TLS_CERT` and `TLS_KEY` to serve over HTTPS; leave both unset for plain HTTP (default). See [HTTPS / TLS](#https--tls-lan-access).
+
+## HTTPS / TLS (LAN Access)
+
+By default the proxy serves plain **HTTP**, which is fine for `localhost`. If another machine on your network must reach the proxy over **HTTPS** (some clients refuse plain HTTP), the server can terminate TLS itself — no reverse proxy required.
+
+HTTPS turns on automatically when both `TLS_CERT` and `TLS_KEY` are set (via `.env` or the environment). Each value may be a **file path** or an **inline PEM** string. If only one is set, the server exits with an error. When TLS is active the console prints `TLS enabled — server will listen over HTTPS` and the listening URL switches to `https://`.
+
+### Quick Start (Windows)
+
+The repo ships batch files that wire this up end to end:
+
+1. **Generate a self-signed certificate** — run `generate-cert.bat`. It writes `certs/server.crt` and `certs/server.key`, with the certificate valid for your PC's LAN IP and hostname (Subject Alternative Names). Edit the `LAN_IP` and `HOSTNAME` values at the top of the script if yours differ.
+2. **Start the server** — run `start.bat` (port 4141), `start-openai.bat` (port 1515), or `start-controlled.bat` (port 3131). Each script points `TLS_CERT`/`TLS_KEY` at `certs/` and refuses to start if the certificate is missing.
+3. **Connect from the other machine** at `https://<LAN_IP>:<port>` (e.g. `https://192.168.0.105:4141`).
+
+> The `certs/` directory is gitignored — your private key is never committed.
+
+### Generating a certificate manually
+
+Any tool that produces a PEM cert/key pair works. With OpenSSL, the key detail is that the **Subject Alternative Name (SAN) must list the exact IP or hostname** the client connects to — modern HTTPS clients validate against the SAN, not the Common Name:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes \
+  -keyout certs/server.key -out certs/server.crt \
+  -subj "/CN=YOUR-HOSTNAME" \
+  -addext "subjectAltName=IP:192.168.0.105,IP:127.0.0.1,DNS:YOUR-HOSTNAME,DNS:localhost"
+```
+
+Verify the SANs landed correctly:
+
+```sh
+openssl x509 -in certs/server.crt -noout -subject -ext subjectAltName
+```
+
+### Trusting the certificate on the client
+
+A self-signed certificate is rejected until the **connecting machine trusts it**. Copy `certs/server.crt` to that machine and install it as a trusted root:
+
+- **Windows** (admin terminal): `certutil -addstore -f Root server.crt`
+- **Node-based clients:** point `NODE_EXTRA_CA_CERTS` at the `.crt` file
+- **curl / OpenSSL tools:** pass `--cacert server.crt` or set `SSL_CERT_FILE`
+
+### Firewall
+
+Windows Firewall blocks inbound connections by default. Allow the port on the machine running the proxy:
+
+```sh
+netsh advfirewall firewall add rule name="copilot-api 4141" dir=in action=allow protocol=TCP localport=4141
+```
+
+> **DHCP note:** The IP is baked into the certificate's SANs. If your LAN IP changes, update `LAN_IP` in `generate-cert.bat` and the start scripts, regenerate the certificate, and re-trust it on the client. A DHCP reservation (or connecting by hostname) avoids this.
 
 ## Command Structure
 

@@ -39,6 +39,39 @@ interface RunServerOptions {
 /** Formats a number as "Nk" if >= 1000, otherwise as-is. */
 const formatK = (v: number) => (v >= 1000 ? `${Math.round(v / 1000)}k` : `${v}`)
 
+interface TlsSetup {
+  tls: { cert: string; key: string; passphrase?: string } | undefined
+  scheme: "http" | "https"
+}
+
+/**
+ * Resolves optional TLS config from env. HTTPS is enabled when BOTH TLS_CERT
+ * and TLS_KEY are set (file paths or inline PEM — srvx reads files for us).
+ * Exits if only one is provided. Returns plain-HTTP defaults when neither is
+ * set, preserving the original behavior.
+ */
+function resolveTlsSetup(): TlsSetup {
+  const cert = process.env.TLS_CERT?.trim()
+  const key = process.env.TLS_KEY?.trim()
+
+  if (Boolean(cert) !== Boolean(key)) {
+    consola.error(
+      "TLS misconfiguration: set BOTH TLS_CERT and TLS_KEY, or neither.",
+    )
+    process.exit(1)
+  }
+
+  if (!cert || !key) {
+    return { tls: undefined, scheme: "http" }
+  }
+
+  consola.info("TLS enabled — server will listen over HTTPS")
+  return {
+    tls: { cert, key, passphrase: process.env.TLS_PASSPHRASE },
+    scheme: "https",
+  }
+}
+
 // eslint-disable-next-line max-lines-per-function
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
@@ -125,7 +158,11 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     .join("\n")
   consola.info(`Available models: \n${modelList}`)
 
-  const serverUrl = `http://localhost:${options.port}`
+  // Optional TLS: enable HTTPS when TLS_CERT/TLS_KEY are set (see
+  // resolveTlsSetup). When unset, the server stays on plain HTTP (unchanged).
+  const { tls, scheme } = resolveTlsSetup()
+
+  const serverUrl = `${scheme}://localhost:${options.port}`
 
   if (options.claudeCode) {
     invariant(state.models, "Models should be loaded by now")
@@ -178,6 +215,8 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   const srvxServer = serve({
     fetch: server.fetch as ServerHandler,
     port: options.port,
+    // Enable HTTPS when TLS_CERT/TLS_KEY are set; otherwise stay on HTTP.
+    tls,
     // Copilot responses can take several minutes for long generations;
     // disable Bun's default 10-second idle timeout to prevent premature 500s.
     // srvx forwards the `bun` object directly to Bun.serve as extra options.

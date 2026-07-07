@@ -5,6 +5,9 @@ node_modules/
 *.local
 .env
 
+# TLS certificates / private keys (self-signed, machine-local)
+certs/
+
 # aider
 .aider*
 
