@@ -1,0 +1,35 @@
+# Example nginx reverse proxy for public copilot-api access.
+#
+# The important line is client_max_body_size. Codex /v1/responses requests can
+# contain long conversation history and image/tool output payloads. nginx's
+# default body limit is too small for that traffic and returns a raw HTML 413
+# before copilot-api can trigger Codex auto-compaction.
+
+server {
+    listen 8443 ssl;
+    server_name 157-173-124-192.sslip.io;
+
+    ssl_certificate /etc/letsencrypt/live/157-173-124-192.sslip.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/157-173-124-192.sslip.io/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    client_max_body_size 256m;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    location / {
+        proxy_pass http://127.0.0.1:3131;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection '';
+
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+    }
+}

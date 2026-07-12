@@ -331,6 +331,23 @@ netsh advfirewall firewall add rule name="copilot-api 4141" dir=in action=allow 
 
 > **DHCP note:** The IP is baked into the certificate's SANs. If your LAN IP changes, update `LAN_IP` in `generate-cert.bat` and the start scripts, regenerate the certificate, and re-trust it on the client. A DHCP reservation (or connecting by hostname) avoids this.
 
+### nginx / public reverse proxy
+
+If you expose `copilot-api` through nginx, raise nginx's request body limit for the API location. Codex `/v1/responses` turns can include long conversation history, tool output, and images. With nginx's default body limit, nginx returns a raw HTML `413 Request Entity Too Large` before this server receives the request, so the `/v1/responses` handler cannot emit the `response.failed` / `context_length_exceeded` event that Codex uses to auto-compact.
+
+Use the sample in `deploy/nginx/copilot-api.conf.example`, or add the equivalent directive to your `server` or `location` block:
+
+```nginx
+client_max_body_size 256m;
+```
+
+After changing nginx config, run:
+
+```sh
+nginx -t
+sudo systemctl reload nginx
+```
+
 ## Command Structure
 
 | Command | Description |
