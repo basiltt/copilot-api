@@ -1,0 +1,15 @@
+[Unit]
+Description=Copilot API token-expiry watchdog
+After=copilot-api.service
+Wants=copilot-api.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/root/projects/copilot-api/deploy/token-watchdog.sh
+Restart=always
+RestartSec=5
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
