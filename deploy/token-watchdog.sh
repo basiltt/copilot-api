@@ -12,7 +12,12 @@
 set -uo pipefail
 
 SERVICE="${SERVICE:-copilot-api.service}"
-PATTERN="${PATTERN:-token expired: unauthorized: token expired}"
+# Extended-regex of log lines that indicate a dead/stale Copilot token and
+# warrant a restart. Covers two failure modes:
+#   1. Upstream 401 on a request: "...token expired: unauthorized: token expired"
+#   2. The in-app periodic refresh failing (src/lib/token.ts rethrows, producing
+#      "Failed to refresh Copilot token" + an unhandled promise rejection).
+PATTERN="${PATTERN:-token expired: unauthorized: token expired|Failed to refresh Copilot token|Unhandled promise rejection: Failed to get Copilot token}"
 COOLDOWN="${COOLDOWN:-120}"
 MAX_PER_HOUR="${MAX_PER_HOUR:-6}"
 
@@ -46,8 +51,7 @@ log "Watchdog started; following journal for $SERVICE (cooldown=${COOLDOWN}s, ca
 
 # -n0 => start at the tail, only react to errors that happen from now on.
 journalctl -u "$SERVICE" -f -n0 -o cat 2>/dev/null | while IFS= read -r line; do
-  case "$line" in
-    *"$PATTERN"*)
+  if [[ "$line" =~ $PATTERN ]]; then
       now=$(date +%s)
 
       last=0
@@ -58,12 +62,12 @@ journalctl -u "$SERVICE" -f -n0 -o cat 2>/dev/null | while IFS= read -r line; do
 
       count=$(restarts_last_hour "$now")
       if (( count >= MAX_PER_HOUR )); then
-        log "Detected token-expired but restart cap reached (${count}/${MAX_PER_HOUR} in last hour); backing off"
+        log "Detected token failure but restart cap reached (${count}/${MAX_PER_HOUR} in last hour); backing off"
         echo "$now" > "$LAST_RESTART_FILE"
         continue
       fi
 
-      log "Detected token-expired error -> restarting $SERVICE"
+      log "Detected token failure -> restarting $SERVICE"
       if systemctl restart "$SERVICE"; then
         echo "$now" > "$LAST_RESTART_FILE"
         echo "$now" >> "$HISTORY_FILE"
@@ -71,6 +75,5 @@ journalctl -u "$SERVICE" -f -n0 -o cat 2>/dev/null | while IFS= read -r line; do
       else
         log "ERROR: failed to restart $SERVICE"
       fi
-      ;;
-  esac
+  fi
 done

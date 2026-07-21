@@ -9,14 +9,15 @@ TESTROOT=/tmp/wdtest
 rm -rf "$TESTROOT"; mkdir -p "$TESTROOT/bin"
 
 MATCH='10:45:00 AM x POST /v1/messages claude 401 221ms IDE token expired: unauthorized: token expired'
+MATCH2=' ERROR  Failed to refresh Copilot token: Failed to get Copilot token'
 
-# Stub journalctl: emit two matching lines immediately, then a third after >cooldown.
+# Stub journalctl: emit a 401 line, then (after >cooldown) a "Failed to refresh" line.
 cat > "$TESTROOT/bin/journalctl" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "$MATCH"
 printf '%s\n' "$MATCH"
 sleep 3
-printf '%s\n' "$MATCH"
+printf '%s\n' "$MATCH2"
 sleep 1
 EOF
 
@@ -29,7 +30,7 @@ EOF
 chmod +x "$TESTROOT/bin/"*
 : > "$TESTROOT/actions.log"
 
-echo "=== TEST 1: cooldown (expect 2 restarts: trigger, suppress, trigger) ==="
+echo "=== TEST 1: two patterns + cooldown (expect 2 restarts: 401 trigger, suppress dup, refresh-fail trigger) ==="
 PATH="$TESTROOT/bin:$PATH" STATE_DIR="$TESTROOT/state1" COOLDOWN=2 MAX_PER_HOUR=6 \
   timeout 15 bash "$WD" 2>&1 | sed 's/^/  /'
 echo "  --- systemctl calls ---"
