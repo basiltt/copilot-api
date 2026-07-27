@@ -788,16 +788,78 @@ function translateAnthropicToolsToOpenAI(
       type: "function",
       function: {
         name: toOpenAIToolName(tool.name, toolNameMap),
-        description: tool.description,
-        parameters: tool.input_schema,
+        description: translateToolDescription(tool),
+        parameters: translateToolInputSchema(tool),
         // Forward strict for Structured Outputs; strip all other extra fields
-        // (cache_control, defer_loading, input_examples, eager_input_streaming)
+        // (cache_control, defer_loading, eager_input_streaming, allowed_callers).
+        // input_examples are adapted into the description above because the
+        // OpenAI function format has no equivalent field.
         ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
       },
     }))
   // Return undefined (not []) when all tools are typed — an empty tools array with an active
   // tool_choice would produce a malformed OpenAI request.
   return customTools.length > 0 ? customTools : undefined
+}
+
+const WORKFLOW_SELECTOR_KEYS = ["script", "name", "scriptPath"] as const
+const WORKFLOW_INPUT_REQUIREMENT =
+  "Workflow input requirement: provide at least one of `script`, `name`, or `scriptPath`; never call Workflow with an empty object."
+const MAX_TOOL_INPUT_EXAMPLE_CHARS = 1000
+const MAX_TOOL_INPUT_EXAMPLES = 2
+
+/**
+ * Preserves Anthropic input examples in the OpenAI function description.
+ *
+ * Copilot's Chat Completions tool format has no `input_examples` field. Simply
+ * dropping it is especially harmful for Workflow: its three selector fields
+ * are individually optional in JSON Schema and a custom runtime validator
+ * enforces that one is present. Without examples or an explicit constraint,
+ * the model can emit `{}`, which Claude Desktop rejects before execution.
+ */
+function translateToolDescription(
+  tool: AnthropicCustomTool,
+): string | undefined {
+  const sections: Array<string> = []
+  if (tool.description) sections.push(tool.description)
+  if (tool.name === "Workflow") sections.push(WORKFLOW_INPUT_REQUIREMENT)
+
+  const examples = (tool.input_examples ?? [])
+    .map((example) => JSON.stringify(example))
+    .filter((example) => example.length <= MAX_TOOL_INPUT_EXAMPLE_CHARS)
+    .slice(0, MAX_TOOL_INPUT_EXAMPLES)
+  if (examples.length > 0) {
+    sections.push(`Valid input examples:\n${examples.join("\n")}`)
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : undefined
+}
+
+/**
+ * Expresses Workflow's custom cross-field validation in JSON Schema so the
+ * upstream model cannot treat `{}` as a valid tool call.
+ */
+function translateToolInputSchema(
+  tool: AnthropicCustomTool,
+): Record<string, unknown> {
+  if (tool.name !== "Workflow") return tool.input_schema
+
+  const required = tool.input_schema.required
+  const alreadyRequiresSelector =
+    Array.isArray(required)
+    && WORKFLOW_SELECTOR_KEYS.some((key) => required.includes(key))
+  const alreadyHasSelectorUnion =
+    Array.isArray(tool.input_schema.anyOf)
+    || Array.isArray(tool.input_schema.oneOf)
+
+  if (alreadyRequiresSelector || alreadyHasSelectorUnion) {
+    return tool.input_schema
+  }
+
+  return {
+    ...tool.input_schema,
+    anyOf: WORKFLOW_SELECTOR_KEYS.map((key) => ({ required: [key] })),
+  }
 }
 
 function translateAnthropicToolChoiceToOpenAI(
