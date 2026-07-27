@@ -22,6 +22,7 @@ import {
   type AnthropicServerToolResultBlock,
   type AnthropicServerToolUseBlock,
   type AnthropicSystemBlock,
+  type AnthropicSystemMessage,
   type AnthropicTextBlock,
   type AnthropicThinkingBlock,
   type AnthropicTool,
@@ -114,7 +115,10 @@ export function translateToOpenAI(
       payload.output_config,
       payload.model,
     ),
-    ...buildReasoningFromThinking(payload.thinking),
+    ...buildReasoningFromThinking(
+      payload.thinking,
+      payload.output_config?.effort,
+    ),
   }
 }
 
@@ -128,16 +132,51 @@ export function translateToOpenAI(
  * The `budget_tokens` hint is translated to a coarse effort level so the
  * upstream allocates a comparable amount of reasoning.
  */
+/**
+ * Maps an Anthropic `output_config.effort` level onto Copilot's reasoning
+ * effort. Copilot's reasoning control only recognizes low/medium/high, so the
+ * newer `xhigh`/`max` depths clamp to `high`.
+ */
+function mapEffortLevel(
+  effort: NonNullable<AnthropicMessagesPayload["output_config"]>["effort"],
+): string | undefined {
+  switch (effort) {
+    case "low": {
+      return "low"
+    }
+    case "medium": {
+      return "medium"
+    }
+    case "high":
+    case "xhigh":
+    case "max": {
+      return "high"
+    }
+    default: {
+      return undefined
+    }
+  }
+}
+
 function buildReasoningFromThinking(
   thinking: AnthropicMessagesPayload["thinking"],
+  outputEffort?: NonNullable<
+    AnthropicMessagesPayload["output_config"]
+  >["effort"],
 ): { reasoning?: { effort: string; summary: string } } {
   if (!isThinkingRequested(thinking)) return {}
 
-  const budget = thinking.budget_tokens
-  let effort = "medium"
-  if (typeof budget === "number") {
-    if (budget <= 8_000) effort = "low"
-    else if (budget >= 24_000) effort = "high"
+  // Adaptive thinking depth (Claude 4.6+) is controlled by
+  // `output_config.effort`. When present it takes precedence; otherwise fall
+  // back to the classic `budget_tokens` hint (extended thinking).
+  const mappedEffort = mapEffortLevel(outputEffort)
+  let effort = mappedEffort ?? "medium"
+  if (!mappedEffort) {
+    const budget = thinking.budget_tokens
+    if (typeof budget === "number") {
+      if (budget <= 8_000) effort = "low"
+      else if (budget >= 24_000) effort = "high"
+    }
   }
 
   return { reasoning: { effort, summary: "auto" } }
@@ -207,11 +246,15 @@ function translateAnthropicMessagesToOpenAI(
 ): Array<Message> {
   const systemMessages = handleSystemPrompt(system)
 
-  const otherMessages = anthropicMessages.flatMap((message) =>
-    message.role === "user" ?
-      handleUserMessage(message)
-    : handleAssistantMessage(message, toolNameMap),
-  )
+  const otherMessages = anthropicMessages.flatMap((message) => {
+    if (message.role === "user") return handleUserMessage(message)
+    // Mid-conversation system instructions (Anthropic's third message role,
+    // sent by the Claude app / Claude Code). Emit an OpenAI `system` message in
+    // place — Copilot's Chat Completions backend accepts system messages at any
+    // position, so the instruction keeps its placement and semantics.
+    if (message.role === "system") return handleSystemMessage(message)
+    return handleAssistantMessage(message, toolNameMap)
+  })
 
   const combined = [...systemMessages, ...otherMessages]
 
@@ -332,6 +375,24 @@ function handleSystemPrompt(
       .join("\n\n")
     return systemText ? [{ role: "system", content: systemText }] : []
   }
+}
+
+/**
+ * Translates a `role: "system"` message (mid-conversation system instructions,
+ * new in the 2025 Messages API and sent by the Claude app / Claude Code) into
+ * an OpenAI `system` message. Text is extracted from string or block content
+ * (including embedded `mid_conv_system` blocks); non-text blocks are serialized
+ * via the shared block serializer so nothing is silently dropped.
+ */
+function handleSystemMessage(message: AnthropicSystemMessage): Array<Message> {
+  const text =
+    typeof message.content === "string" ?
+      message.content
+    : message.content
+        .map((block) => serializeBlockToText(block))
+        .filter((part): part is string => part !== null && part.length > 0)
+        .join("\n\n")
+  return text ? [{ role: "system", content: text }] : []
 }
 
 function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
@@ -643,6 +704,15 @@ function serializeBlockToText(
     }
     case "container_upload": {
       return `[Container upload: ${block.file_id}]`
+    }
+    case "mid_conv_system": {
+      // Mid-conversation system instructions embedded in a user message.
+      // Surface the plain text so the model still receives the updated
+      // guidance rather than an opaque JSON dump.
+      const inner = block.content
+      return typeof inner === "string" ? inner : (
+          inner.map((b) => b.text).join("\n\n")
+        )
     }
     default: {
       // Catch-all: server tool results and future unknown types

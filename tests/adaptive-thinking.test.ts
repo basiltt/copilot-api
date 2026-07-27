@@ -91,4 +91,35 @@ describe("adaptive thinking → upstream reasoning control", () => {
 
     expect(high.reasoning?.effort).toBe("high")
   })
+
+  test("output_config.effort controls adaptive thinking depth (takes precedence)", () => {
+    const low = translateToOpenAI({
+      model: "claude-sonnet-5",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 512,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "low" },
+    })
+    expect(low.reasoning?.effort).toBe("low")
+
+    // Newer xhigh/max depths clamp to Copilot's max supported effort ("high").
+    const max = translateToOpenAI({
+      model: "claude-sonnet-5",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 512,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "max" },
+    })
+    expect(max.reasoning?.effort).toBe("high")
+
+    // Explicit effort wins over the budget_tokens-derived level.
+    const explicit = translateToOpenAI({
+      model: "claude-sonnet-5",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 512,
+      thinking: { type: "adaptive", budget_tokens: 1024 },
+      output_config: { effort: "high" },
+    })
+    expect(explicit.reasoning?.effort).toBe("high")
+  })
 })

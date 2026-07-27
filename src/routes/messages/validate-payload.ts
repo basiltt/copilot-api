@@ -30,8 +30,19 @@ function validateMessagesArray(messages: unknown): string | undefined {
       return `messages.${i}: each message must be an object.`
     }
     const msg = raw as Record<string, unknown>
-    if (msg.role !== "user" && msg.role !== "assistant") {
-      return `messages.${i}.role: must be either "user" or "assistant".`
+    // The Anthropic Messages API recognizes THREE roles in `messages[]`:
+    // "user", "assistant", and "system" (mid-conversation system
+    // instructions, sent by the Claude app / Claude Code v1.24012.92+).
+    // The LLM gateway protocol is explicit that a gateway must not reject
+    // unrecognized roles/fields — "treat the body fields as open lists, not
+    // closed ones" — because doing so makes the client silently disable the
+    // feature (e.g. mid-conversation system messages) for the rest of the
+    // conversation. So we only reject a role that is missing or not a string;
+    // the translation layer maps "user"/"system" explicitly and safely
+    // defaults every other role to "assistant".
+    // @see https://code.claude.com/docs/en/llm-gateway-protocol
+    if (typeof msg.role !== "string" || msg.role.length === 0) {
+      return `messages.${i}.role: must be a non-empty string.`
     }
     if (typeof msg.content !== "string" && !Array.isArray(msg.content)) {
       return `messages.${i}.content: must be a string or an array of content blocks.`

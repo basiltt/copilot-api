@@ -36,7 +36,7 @@ export interface AnthropicMessagesPayload {
   }
   service_tier?: "auto" | "standard_only"
   output_config?: {
-    effort?: "low" | "medium" | "high" | "max"
+    effort?: "low" | "medium" | "high" | "xhigh" | "max"
     format?: { type: "json_schema"; schema: Record<string, unknown> }
   }
   speed?: "standard" | "fast"
@@ -157,6 +157,21 @@ export interface AnthropicContainerUploadBlock {
   cache_control?: { type: "ephemeral"; ttl?: number }
 }
 
+/**
+ * Mid-conversation system instructions embedded inside a user message.
+ * Introduced in the 2025 Messages API: the Claude app / Claude Code
+ * (v1.24012.92+) delivers updated system guidance mid-conversation either as a
+ * `role: "system"` message (see {@link AnthropicSystemMessage}) or as this
+ * block inside a user message.
+ *
+ * @see https://platform.claude.com/docs/en/api/messages (ContentBlockParam)
+ */
+export interface AnthropicMidConversationSystemBlock {
+  type: "mid_conv_system"
+  content: string | Array<AnthropicTextBlock>
+  cache_control?: { type: "ephemeral"; ttl?: number }
+}
+
 interface ServerToolResultBase {
   tool_use_id: string
   content: unknown
@@ -200,6 +215,7 @@ export type AnthropicUserContentBlock =
   | AnthropicToolResultBlock
   | AnthropicSearchResultBlock
   | AnthropicContainerUploadBlock
+  | AnthropicMidConversationSystemBlock
   | AnthropicServerToolResultBlock
 
 export type AnthropicAssistantContentBlock =
@@ -220,7 +236,26 @@ export interface AnthropicAssistantMessage {
   content: string | Array<AnthropicAssistantContentBlock>
 }
 
-export type AnthropicMessage = AnthropicUserMessage | AnthropicAssistantMessage
+/**
+ * A `role: "system"` message inside the `messages[]` array. The Anthropic
+ * Messages API now recognizes `"system"` as a third role (alongside `"user"`
+ * and `"assistant"`) for mid-conversation system instructions, and the Claude
+ * app / Claude Code (v1.24012.92+) actively sends them. The LLM gateway
+ * protocol is explicit that rejecting these makes the client silently retry
+ * with the feature disabled for the rest of the conversation.
+ *
+ * @see https://code.claude.com/docs/en/llm-gateway-protocol
+ * @see https://platform.claude.com/docs/en/api/messages (MessageParam.role)
+ */
+export interface AnthropicSystemMessage {
+  role: "system"
+  content: string | Array<AnthropicUserContentBlock>
+}
+
+export type AnthropicMessage =
+  | AnthropicUserMessage
+  | AnthropicAssistantMessage
+  | AnthropicSystemMessage
 
 // Custom tool (has input_schema) — what Claude Code and standard clients send
 export interface AnthropicCustomTool {
