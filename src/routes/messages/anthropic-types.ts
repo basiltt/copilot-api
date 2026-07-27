@@ -92,12 +92,27 @@ export interface AnthropicDocumentBlock {
   cache_control?: { type: "ephemeral"; ttl?: number }
 }
 
+/**
+ * Client-side ToolSearch result used by Claude Code 2.1.210+.
+ * It is nested inside a normal `tool_result.content` array and replayed in
+ * subsequent Messages requests.
+ */
+export interface AnthropicToolReferenceBlock {
+  type: "tool_reference"
+  tool_name: string
+}
+
 export interface AnthropicToolResultBlock {
   type: "tool_result"
   tool_use_id: string
   content:
     | string
-    | Array<AnthropicTextBlock | AnthropicImageBlock | AnthropicDocumentBlock>
+    | Array<
+        | AnthropicTextBlock
+        | AnthropicImageBlock
+        | AnthropicDocumentBlock
+        | AnthropicToolReferenceBlock
+      >
   is_error?: boolean
 }
 
@@ -212,6 +227,7 @@ export type AnthropicUserContentBlock =
   | AnthropicTextBlock
   | AnthropicImageBlock
   | AnthropicDocumentBlock
+  | AnthropicToolReferenceBlock
   | AnthropicToolResultBlock
   | AnthropicSearchResultBlock
   | AnthropicContainerUploadBlock

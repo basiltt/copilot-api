@@ -8,6 +8,7 @@ import type {
   AnthropicImageBlock,
   AnthropicMessagesPayload,
   AnthropicTextBlock,
+  AnthropicToolReferenceBlock,
 } from "./anthropic-types"
 
 /**
@@ -100,7 +101,10 @@ type ImageRef = {
 /** Collects image refs from a tool_result's nested content array. */
 function collectToolResultImages(
   content: Array<
-    AnthropicTextBlock | AnthropicImageBlock | AnthropicDocumentBlock
+    | AnthropicTextBlock
+    | AnthropicImageBlock
+    | AnthropicDocumentBlock
+    | AnthropicToolReferenceBlock
   >,
   refs: Array<ImageRef>,
   messageIndex: number,

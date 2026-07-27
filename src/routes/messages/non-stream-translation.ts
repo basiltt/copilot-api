@@ -564,8 +564,7 @@ function mapToolResultContent(
   if (typeof content === "string") {
     return content
   }
-  // Safe cast: AnthropicToolResultBlock content array is Array<TextBlock|ImageBlock|DocumentBlock>,
-  // all of which are members of AnthropicUserContentBlock — mapContent handles them correctly.
+  // Every nested tool-result block is also handled by mapContent.
   return mapContent(
     content as Array<
       AnthropicUserContentBlock | AnthropicAssistantContentBlock
@@ -713,6 +712,13 @@ function serializeBlockToText(
       return typeof inner === "string" ? inner : (
           inner.map((b) => b.text).join("\n\n")
         )
+    }
+    case "tool_reference": {
+      // Claude Code's client-side ToolSearch returns this block inside a
+      // tool_result. The OpenAI format has no equivalent content part, and all
+      // deferred definitions are already forwarded in `tools`, so preserve the
+      // discovery signal as text instead of silently dropping it.
+      return `[Tool loaded: ${block.tool_name}]`
     }
     default: {
       // Catch-all: server tool results and future unknown types
