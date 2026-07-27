@@ -75,6 +75,24 @@ export function translateToOpenAI(
     enforceJsonOutput(messages)
   }
 
+  const tools = translateAnthropicToolsToOpenAI(payload.tools, toolNameMap)
+
+  // Copilot rejects the request outright ("tools are required when tool choice
+  // is specified") when `tool_choice` is present without a non-empty `tools`
+  // array.  This happens routinely with Claude Desktop / Cowork, which sends
+  // `tool_choice: {type: "auto"}` alongside *only* server-side typed tools
+  // (e.g. `web_search_20250305`).  Those typed tools are filtered out by
+  // `translateAnthropicToolsToOpenAI`, leaving an orphaned `tool_choice` and a
+  // hard 400 that kills the whole turn — including every web search.
+  //
+  // Suppress `tool_choice` whenever no callable tool survives translation.
+  // `"none"` is also dropped: with no tools it is a no-op, and sending it
+  // alongside an absent `tools` array trips the same upstream validation.
+  const toolChoice =
+    tools ?
+      translateAnthropicToolChoiceToOpenAI(payload.tool_choice, toolNameMap)
+    : undefined
+
   return {
     model: translateModelName(payload.model),
     messages,
@@ -89,11 +107,8 @@ export function translateToOpenAI(
     temperature: payload.temperature,
     top_p: payload.top_p,
     user: payload.metadata?.user_id,
-    tools: translateAnthropicToolsToOpenAI(payload.tools, toolNameMap),
-    tool_choice: translateAnthropicToolChoiceToOpenAI(
-      payload.tool_choice,
-      toolNameMap,
-    ),
+    tools,
+    tool_choice: toolChoice,
     response_format: translateOutputConfig(
       payload.output_config,
       payload.model,

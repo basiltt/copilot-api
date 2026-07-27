@@ -19,6 +19,23 @@ server.use(cors())
 
 server.get("/", (c) => c.text("Server running"))
 
+/**
+ * Best-effort connectivity probe.  Claude Code issues `HEAD /` against a
+ * configured gateway on startup to check reachability before any inference.
+ * Hono answers HEAD via the GET handler, but registering it explicitly keeps
+ * the response body-free and cheap.
+ */
+server.on("HEAD", "/", (c) => c.body(null, 200))
+
+/**
+ * Liveness probe.  Claude Desktop's gateway health check and most container
+ * orchestrators expect a cheap `/health` endpoint; without one they fall back
+ * to probing an inference route, which is slow and bills tokens.
+ */
+server.get("/health", (c) =>
+  c.json({ status: "ok", service: "copilot-api" }, 200),
+)
+
 server.route("/chat/completions", completionRoutes)
 server.route("/models", modelRoutes)
 server.route("/embeddings", embeddingRoutes)
@@ -36,3 +53,6 @@ server.route("/responses", responsesRoutes)
 
 // Anthropic compatible endpoints
 server.route("/v1/messages", messageRoutes)
+// Some Anthropic-compatible clients call the unprefixed form; every other
+// route on this server is registered both ways, so mirror it here too.
+server.route("/messages", messageRoutes)

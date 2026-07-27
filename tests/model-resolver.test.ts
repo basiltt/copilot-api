@@ -152,3 +152,52 @@ describe("resolveModelId — no match", () => {
     expect(resolveModelId("", COPILOT_MODELS)).toBe("")
   })
 })
+
+describe("resolveModelId — [1m] context-window marker", () => {
+  // Claude Code / Claude Desktop append `[1m]` when the user picks the
+  // 1M-context row.  Copilot has no such catalog entry and returns
+  // `400 model_not_supported`, so the marker must be stripped before matching.
+  test("strips [1m] and resolves to the base model", () => {
+    expect(resolveModelId("claude-sonnet-4.6[1m]", COPILOT_MODELS)).toBe(
+      "claude-sonnet-4.6",
+    )
+  })
+
+  test("strips [1m] combined with hyphenated version form", () => {
+    expect(resolveModelId("claude-opus-4-8[1m]", COPILOT_MODELS)).toBe(
+      "claude-opus-4.8",
+    )
+  })
+
+  test("strips [1m] combined with an Anthropic date stamp", () => {
+    expect(resolveModelId("claude-haiku-4-5-20251001[1m]", COPILOT_MODELS)).toBe(
+      "claude-haiku-4.5",
+    )
+  })
+
+  test("is case-insensitive", () => {
+    expect(resolveModelId("claude-sonnet-4.6[1M]", COPILOT_MODELS)).toBe(
+      "claude-sonnet-4.6",
+    )
+  })
+
+  test("strips [1m] even when the catalog is unavailable", () => {
+    expect(resolveModelId("claude-sonnet-5[1m]", undefined)).toBe(
+      "claude-sonnet-5",
+    )
+  })
+
+  test("strips [1m] even when the base id is not in the catalog", () => {
+    // Better to forward a bare unknown id (which may still be valid upstream)
+    // than one carrying a marker guaranteed to 400.
+    expect(resolveModelId("claude-future-9[1m]", COPILOT_MODELS)).toBe(
+      "claude-future-9",
+    )
+  })
+
+  test("leaves bracket-free ids untouched", () => {
+    expect(resolveModelId("claude-sonnet-4.6", COPILOT_MODELS)).toBe(
+      "claude-sonnet-4.6",
+    )
+  })
+})

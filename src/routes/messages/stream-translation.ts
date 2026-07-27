@@ -172,43 +172,34 @@ export function translateChunkToAnthropicEvents(
       state.thinkingBlockOpen = false
     }
 
-    if (state.thinkingEnabled) {
-      // Emit as a proper thinking block so Claude Code's thinking UI
-      // displays the reasoning content with real-time streaming.
-      if (!state.contentBlockOpen) {
-        events.push({
-          type: "content_block_start",
-          index: state.contentBlockIndex,
-          content_block: { type: "thinking", thinking: "" },
-        })
-        state.contentBlockOpen = true
-        state.thinkingBlockOpen = true
-      }
-
+    // Always emit reasoning as a `thinking` block, regardless of whether the
+    // client explicitly enabled thinking.
+    //
+    // Previously, when `thinking` was absent from the request, reasoning was
+    // downgraded to a `text` block.  Copilot emits `reasoning_content` for
+    // reasoning-capable models whether or not we asked for it, so the model's
+    // private chain-of-thought was rendered to the user as ordinary assistant
+    // prose — e.g. a reply that opened with "The user wants a brief greeting
+    // in just three words."  Claude Desktop renders `thinking` blocks in
+    // dedicated collapsed UI and ignores them when absent, so routing
+    // reasoning there is correct in both cases and never leaks into the
+    // visible answer.
+    if (!state.contentBlockOpen) {
       events.push({
-        type: "content_block_delta",
+        type: "content_block_start",
         index: state.contentBlockIndex,
-        delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+        content_block: { type: "thinking", thinking: "" },
       })
-    } else {
-      // Thinking not enabled — emit as regular text so content is visible.
-      if (!state.contentBlockOpen) {
-        events.push({
-          type: "content_block_start",
-          index: state.contentBlockIndex,
-          content_block: { type: "text", text: "" },
-        })
-        state.contentBlockOpen = true
-        state.thinkingBlockOpen = true
-      }
-
-      events.push({
-        type: "content_block_delta",
-        index: state.contentBlockIndex,
-        delta: { type: "text_delta", text: delta.reasoning_content },
-      })
+      state.contentBlockOpen = true
+      state.thinkingBlockOpen = true
     }
-    state.hasEmittedText = true
+
+    events.push({
+      type: "content_block_delta",
+      index: state.contentBlockIndex,
+      delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+    })
+    state.hasEmittedThinking = true
   }
 
   if (delta.content) {

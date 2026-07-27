@@ -27,6 +27,28 @@ function canonicalize(modelId: string): string {
 const ANTHROPIC_DATE_SUFFIX = /-\d{8}$/
 
 /**
+ * Claude Code and Claude Desktop append a `[1m]` marker to a model id when the
+ * user selects the 1M-context row in the model picker (e.g.
+ * `claude-sonnet-5[1m]`).  The marker is a *client-side* context-window
+ * selector, not part of the upstream model name — Copilot's catalog has no
+ * such entry and returns `400 model_not_supported` for it.
+ *
+ * This must be stripped before catalog matching.  It is trimmed first (ahead
+ * of exact matching) because no real catalog id ever contains brackets.
+ */
+const CONTEXT_WINDOW_SUFFIX = /\[1m\]$/i
+
+/** Removes the `[1m]` picker marker from a model id, if present. */
+export function stripContextWindowSuffix(modelId: string): string {
+  return modelId.replace(CONTEXT_WINDOW_SUFFIX, "")
+}
+
+/** Whether a requested model id carries the `[1m]` 1M-context marker. */
+export function hasContextWindowSuffix(modelId: string): boolean {
+  return CONTEXT_WINDOW_SUFFIX.test(modelId)
+}
+
+/**
  * Attempts to match a requested id against the catalog, first by exact id,
  * then by separator-insensitive {@link canonicalize} comparison.  Returns the
  * real catalog id on success, or `undefined` when nothing matches.
@@ -66,20 +88,30 @@ export function resolveModelId(
   requestedId: string,
   models: ModelsResponse | undefined,
 ): string {
-  if (!requestedId || !models) return requestedId
+  if (!requestedId) return requestedId
+  // Strip `[1m]` even when the catalog is unavailable — the marker is never
+  // valid upstream regardless of whether we can verify the base id.
+  if (!models) return stripContextWindowSuffix(requestedId)
+
+  // 0. Strip the client-side `[1m]` context-window marker.  Copilot's catalog
+  //    never contains it, so it must go before any matching is attempted.
+  const baseId = stripContextWindowSuffix(requestedId)
 
   // 1 & 2. Exact, then canonical matching against the id as requested.
-  const direct = matchCatalogId(requestedId, models)
+  const direct = matchCatalogId(baseId, models)
   if (direct) return direct
 
   // 3. Strip Anthropic's trailing release-date stamp and retry.
-  if (ANTHROPIC_DATE_SUFFIX.test(requestedId)) {
+  if (ANTHROPIC_DATE_SUFFIX.test(baseId)) {
     const stripped = matchCatalogId(
-      requestedId.replace(ANTHROPIC_DATE_SUFFIX, ""),
+      baseId.replace(ANTHROPIC_DATE_SUFFIX, ""),
       models,
     )
     if (stripped) return stripped
   }
 
-  return requestedId
+  // Return the suffix-stripped id rather than the raw request: even when the
+  // catalog lookup fails, forwarding `model[1m]` upstream is guaranteed to
+  // 400, whereas the bare id may still be valid.
+  return baseId
 }

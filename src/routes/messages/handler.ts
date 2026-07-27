@@ -1244,6 +1244,7 @@ async function pipeStreamToClient(
     contentBlockOpen: false,
     thinkingBlockOpen: false,
     hasEmittedText: false,
+    hasEmittedThinking: false,
     toolCalls: {},
     toolNameMap,
     thinkingEnabled,

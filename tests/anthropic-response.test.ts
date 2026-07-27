@@ -540,6 +540,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockOpen: false,
       thinkingBlockOpen: false,
       hasEmittedText: false,
+      hasEmittedThinking: false,
       toolCalls: {},
       thinkingEnabled: false,
     }
@@ -643,6 +644,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockOpen: false,
       thinkingBlockOpen: false,
       hasEmittedText: false,
+      hasEmittedThinking: false,
       toolCalls: {},
       thinkingEnabled: false,
     }
@@ -753,6 +755,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockOpen: false,
       thinkingBlockOpen: false,
       hasEmittedText: false,
+      hasEmittedThinking: false,
       toolCalls: {},
       toolNameMap,
       thinkingEnabled: false,
@@ -838,6 +841,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockOpen: false,
       thinkingBlockOpen: false,
       hasEmittedText: false,
+      hasEmittedThinking: false,
       toolCalls: {},
       thinkingEnabled: false,
     }
@@ -921,6 +925,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
       contentBlockOpen: false,
       thinkingBlockOpen: false,
       hasEmittedText: false,
+      hasEmittedThinking: false,
       toolCalls: {},
       thinkingEnabled: false,
     }
@@ -946,6 +951,7 @@ function freshStreamState(): AnthropicStreamState {
     contentBlockOpen: false,
     thinkingBlockOpen: false,
     hasEmittedText: false,
+    hasEmittedThinking: false,
     toolCalls: {},
     thinkingEnabled: false,
   }

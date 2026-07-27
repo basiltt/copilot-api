@@ -66,6 +66,151 @@ export async function forwardError(c: Context, error: unknown) {
   )
 }
 
+/**
+ * Maps an HTTP status code to the corresponding Anthropic error `type` string.
+ * Clients (Claude Desktop / Claude Code) branch on these values to decide
+ * whether a failure is retriable, so returning a non-enumerated type such as
+ * the generic `"error"` causes the client to treat everything as fatal.
+ *
+ * @see https://docs.claude.com/en/api/errors
+ */
+export function anthropicErrorTypeForStatus(status: number): string {
+  switch (status) {
+    case 400: {
+      return "invalid_request_error"
+    }
+    case 401: {
+      return "authentication_error"
+    }
+    case 403: {
+      return "permission_error"
+    }
+    case 404: {
+      return "not_found_error"
+    }
+    case 413: {
+      return "request_too_large"
+    }
+    case 429: {
+      return "rate_limit_error"
+    }
+    case 529: {
+      return "overloaded_error"
+    }
+    default: {
+      return status >= 500 ? "api_error" : "invalid_request_error"
+    }
+  }
+}
+
+/** Type guard for a body already shaped like an Anthropic API error. */
+function isAnthropicErrorBody(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false
+  const obj = value as Record<string, unknown>
+  if (obj.type !== "error") return false
+  if (obj.error === null || typeof obj.error !== "object") return false
+  const err = obj.error as Record<string, unknown>
+  return typeof err.type === "string" && typeof err.message === "string"
+}
+
+/**
+ * Error forwarder for the Anthropic-compatible surface (`/v1/messages`).
+ *
+ * `forwardError` passes upstream Copilot error JSON through verbatim, which
+ * emits an OpenAI-shaped body (`{error: {...}}`, no top-level discriminator)
+ * to a client that expects Anthropic's `{type: "error", error: {type, message}}`.
+ * Claude Desktop fails to parse those, surfacing an opaque failure instead of a
+ * typed, retriable one — and a thrown JS `TypeError` became a bare HTTP 500
+ * leaking the internal message.
+ *
+ * This normalizes every failure on the Anthropic routes into the documented
+ * shape, preserving the upstream status code and message, and keeping the
+ * context-window special case that drives auto-compaction.
+ */
+export async function forwardAnthropicError(c: Context, error: unknown) {
+  consola.error("Error occurred:", error)
+
+  if (error instanceof HTTPError) {
+    const errorText = await error.response.text()
+    const contentType = error.response.headers.get("content-type")
+    let errorJson: unknown
+    try {
+      errorJson = JSON.parse(errorText)
+    } catch {
+      errorJson = null
+    }
+    const errorMessage = extractUpstreamErrorMessage(
+      errorJson,
+      errorText,
+      contentType,
+    )
+    consola.error("HTTP error:", errorJson ?? errorMessage)
+
+    const status = error.response.status
+
+    if (isContextWindowError(errorMessage, status)) {
+      consola.debug(
+        `Context window exceeded — extracted message: "${errorMessage}"`,
+      )
+      return sendAnthropicContextWindowError(c, errorMessage, { status: 400 })
+    }
+
+    // Upstream already speaks Anthropic — forward unchanged.
+    if (isAnthropicErrorBody(errorJson)) {
+      return c.json(
+        errorJson as Record<string, unknown>,
+        status as ContentfulStatusCode,
+      )
+    }
+
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+    c.header("request-id", requestId)
+    // Surface upstream rate-limit backoff to the client when provided.
+    const retryAfter = error.response.headers.get("retry-after")
+    if (retryAfter) c.header("retry-after", retryAfter)
+
+    return c.json(
+      {
+        type: "error",
+        request_id: requestId,
+        error: {
+          type: anthropicErrorTypeForStatus(status),
+          message: errorMessage,
+        },
+      },
+      status as ContentfulStatusCode,
+    )
+  }
+
+  // Non-HTTP failure (bug, malformed client payload, aborted socket).
+  // A missing/invalid body is the client's fault → 400 invalid_request_error,
+  // not a 500 that leaks the interpreter's message.
+  const message = error instanceof Error ? error.message : String(error)
+  const isClientPayloadError =
+    /payload\.messages|Unexpected end of JSON|JSON Parse error|is not an object|Unexpected token/i.test(
+      message,
+    )
+
+  if (isClientPayloadError) {
+    return sendAnthropicInvalidRequestError(
+      c,
+      "Invalid request body: expected an Anthropic Messages payload with a "
+        + "`model` string, a `max_tokens` integer, and a non-empty `messages` array.",
+    )
+  }
+
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+  c.header("request-id", requestId)
+  return c.json(
+    {
+      type: "error",
+      request_id: requestId,
+      error: { type: "api_error", message },
+    },
+    500,
+  )
+}
+
 /** Extracts the error message from a parsed Copilot error response. */
 export function extractUpstreamErrorMessage(
   errorJson: unknown,
