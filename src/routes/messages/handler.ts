@@ -78,6 +78,30 @@ import {
 // (~45s).  10 seconds gives comfortable headroom for both.
 const PING_INTERVAL_MS = 10_000
 
+/**
+ * Sends recurring Anthropic ping events until the caller stops the keepalive.
+ *
+ * A one-shot timer is insufficient: after that single ping, nginx's default
+ * 60-second upstream idle timeout can close a still-running workflow stream
+ * before the 90-second upstream stall recovery emits `message_stop`.
+ */
+export function startSSEKeepalive(
+  stream: Pick<SSEStreamingApi, "writeSSE">,
+  intervalMs: number = PING_INTERVAL_MS,
+): () => void {
+  const timer = setInterval(() => {
+    consola.debug("Sending periodic SSE ping")
+    stream
+      .writeSSE({ event: "ping", data: JSON.stringify({ type: "ping" }) })
+      .catch((error: unknown) => {
+        clearInterval(timer)
+        consola.debug("Stopping SSE keepalive after write failure:", error)
+      })
+  }, intervalMs)
+
+  return () => clearInterval(timer)
+}
+
 // Maximum time to wait for the next upstream chunk inside pipeStreamToClient
 // before assuming the stream is stalled.  When the Copilot API finishes
 // streaming a large tool call (e.g. 6000+ line Write), it sometimes never
@@ -1251,16 +1275,9 @@ async function pipeStreamToClient(
     thinkingEnabled,
   }
 
-  // Ping while waiting between chunks to keep the connection alive.
-  const schedulePing = () =>
-    setTimeout(() => {
-      consola.debug("Sending SSE ping between chunks")
-      stream
-        .writeSSE({ event: "ping", data: JSON.stringify({ type: "ping" }) })
-        .catch(() => {})
-    }, PING_INTERVAL_MS)
-
-  let chunkTimer: ReturnType<typeof setTimeout> | undefined = schedulePing()
+  // Keep pinging for the full lifetime of the upstream stream. A single ping
+  // does not protect waits longer than a reverse proxy's idle timeout.
+  const stopKeepalive = startSSEKeepalive(stream)
 
   try {
     // Instead of `for await (const rawEvent of response)` which blocks
@@ -1268,9 +1285,6 @@ async function pipeStreamToClient(
     // a stall timeout.  This lets us break out and synthesize proper
     // termination events when the Copilot API hangs after a large tool call.
     for (;;) {
-      clearTimeout(chunkTimer)
-      chunkTimer = schedulePing()
-
       const rawEvent = await nextWithTimeout(response, streamState)
 
       // Timeout or natural end of stream
@@ -1352,7 +1366,7 @@ async function pipeStreamToClient(
       data: JSON.stringify(errorEvent),
     })
   } finally {
-    clearTimeout(chunkTimer)
+    stopKeepalive()
   }
   return true
 }
