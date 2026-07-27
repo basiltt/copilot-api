@@ -16,9 +16,30 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           script: |
+            set -euo pipefail
             export PATH=/root/.bun/bin:$PATH
             cd /root/projects/copilot-api
-            git pull origin master
+
+            # Hard-reset to the pushed commit rather than merging.
+            #
+            # `git pull` aborts when an untracked file on the server collides
+            # with one arriving in the commit — which is exactly what happened
+            # when deploy/token-watchdog.sh and deploy/copilot-api-watchdog.service
+            # were created by hand on the box and later committed to the repo.
+            # Because the old script ignored the failure, every subsequent run
+            # rebuilt and restarted the *previous* code while still reporting
+            # success, so the server silently sat on a stale commit.
+            #
+            # `set -e` above now makes any step failing abort the deploy, and
+            # fetch + reset --hard is immune to untracked-file collisions.
+            git fetch origin master
+            git reset --hard origin/master
+            # Drop leftover untracked files so the tree matches the commit
+            # exactly, but keep node_modules/dist to avoid a cold rebuild.
+            git clean -fd -e node_modules -e dist
+
+            echo "Deploying $(git rev-parse --short HEAD)"
+
             bun install
             bun run build
             systemctl restart copilot-api
