@@ -29,6 +29,7 @@ import {
   type AnthropicToolUseBlock,
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
+  isThinkingRequested,
   isTypedTool,
 } from "./anthropic-types"
 import {
@@ -130,7 +131,7 @@ export function translateToOpenAI(
 function buildReasoningFromThinking(
   thinking: AnthropicMessagesPayload["thinking"],
 ): { reasoning?: { effort: string; summary: string } } {
-  if (thinking?.type !== "enabled") return {}
+  if (!isThinkingRequested(thinking)) return {}
 
   const budget = thinking.budget_tokens
   let effort = "medium"

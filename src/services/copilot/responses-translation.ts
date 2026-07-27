@@ -5,6 +5,8 @@
 
 import type { SSEMessage } from "hono/streaming"
 
+import consola from "consola"
+
 import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
 
 import type {
@@ -14,7 +16,7 @@ import type {
   Tool,
   ToolCall,
 } from "./create-chat-completions"
-import type { Model } from "./get-models"
+import type { Model, ModelsResponse } from "./get-models"
 
 // ─── Routing helper ──────────────────────────────────────────────────────────
 
@@ -46,7 +48,13 @@ export interface ResponsesTool {
 
 export interface ResponsesPayload {
   model: string
-  input: Array<ResponsesInputItem>
+  /**
+   * The OpenAI Responses API accepts either a plain string (shorthand for a
+   * single user message) or an array of typed input items.  Both forms are
+   * sent in practice — the ChatGPT desktop app and Codex use the string form
+   * for simple turns — so the union must be modeled here.
+   */
+  input: string | Array<ResponsesInputItem>
   instructions?: string
   max_output_tokens?: number
   temperature?: number
@@ -71,7 +79,14 @@ export interface ResponsesPayload {
 // 2. A function_call (assistant deciding to call a tool)
 // 3. A function_call_output (tool result)
 type ResponsesInputItem =
-  | { role: string; content: string | Array<ResponsesContentPart> }
+  // `type: "message"` is optional: the Responses API accepts a bare
+  // `{role, content}` item, but the ChatGPT desktop app and Codex send the
+  // explicit tagged form.  Both are handled at runtime, so both are modeled.
+  | {
+      type?: "message"
+      role: string
+      content: string | Array<ResponsesContentPart>
+    }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
   | { type: "function_call_output"; call_id: string; output: string }
 
@@ -300,11 +315,33 @@ function buildTextFormat(
 // ─── Routing helper: models that don't support the Responses API ─────────────
 // Allow-list approach: only models known to support /responses go direct.
 // Everything else is routed through /chat/completions.
-const RESPONSES_API_PREFIXES = ["gpt-4.1", "gpt-5", "o1", "o3", "o4"]
+const RESPONSES_API_PREFIXES = ["gpt-4.1", "gpt-5", "gpt-6", "o1", "o3", "o4"]
 
 const RESPONSES_API_EXACT = new Set(["gpt-41-copilot"])
 
-export function requiresChatCompletionsApi(model: string): boolean {
+/**
+ * Decides whether a model must be served by translating to Chat Completions
+ * rather than passing the Responses payload through natively.
+ *
+ * Prefers the catalog's own `supported_endpoints` capability data, falling back
+ * to the hardcoded name list only when the catalog is unavailable or silent.
+ * The list alone is a maintenance hazard: a model Copilot serves natively on
+ * `/responses` but whose name doesn't match a known prefix would be silently
+ * downgraded to the lossy translation path (which drops `reasoning`,
+ * `parallel_tool_calls`, built-in tools, and emits a reduced event set).
+ */
+export function requiresChatCompletionsApi(
+  model: string,
+  models?: ModelsResponse,
+): boolean {
+  const catalogEntry = models?.data.find((m) => m.id === model)
+  const endpoints = catalogEntry?.supported_endpoints
+  if (endpoints && endpoints.length > 0) {
+    // Native passthrough whenever the model genuinely serves /responses.
+    if (endpoints.includes("/responses")) return false
+    if (endpoints.includes("/chat/completions")) return true
+  }
+
   if (RESPONSES_API_EXACT.has(model)) return false
   if (RESPONSES_API_PREFIXES.some((p) => model.startsWith(p))) return false
   return true
@@ -320,9 +357,20 @@ export function translateFromResponsesPayloadToCC(
     messages.push({ role: "system", content: payload.instructions })
   }
 
-  for (const item of payload.input) {
-    const msg = translateInputItemToMessage(item)
-    if (msg) messages.push(msg)
+  // `input` is either a plain string (shorthand for a single user message) or
+  // an array of input items.  Iterating a string yields its *characters*, each
+  // of which translates to nothing — producing an empty `messages` array and a
+  // hard `400 messages must be non-empty` from upstream.  The ChatGPT desktop
+  // app and Codex both send the string form for simple turns.
+  if (typeof payload.input === "string") {
+    if (payload.input.length > 0) {
+      messages.push({ role: "user", content: payload.input })
+    }
+  } else {
+    for (const item of payload.input) {
+      const msg = translateInputItemToMessage(item)
+      if (msg) messages.push(msg)
+    }
   }
 
   repairOrphanedToolCalls(messages)
@@ -411,11 +459,18 @@ function applyToolsAndFormat(
   result: ChatCompletionsPayload,
 ): void {
   if (payload.tools && payload.tools.length > 0) {
-    const ccTools = payload.tools
-      .map((t) => responsesToolToCC(t))
-      .filter((t): t is NonNullable<typeof t> => t !== null)
+    const ccTools = payload.tools.flatMap((t) => responsesToolToCC(t))
     if (ccTools.length > 0) {
       result.tools = ccTools
+    } else {
+      // Every tool was a built-in the Chat Completions API cannot express
+      // (web_search, file_search, code_interpreter, image_generation, mcp, …).
+      // The model is then told nothing about them and may claim capabilities it
+      // lacks, so make the drop visible rather than silent.
+      consola.debug(
+        `[responses→cc] All ${payload.tools.length} tool(s) dropped — no Chat `
+          + `Completions equivalent: ${payload.tools.map((t) => t.type).join(", ")}`,
+      )
     }
   }
 
@@ -436,49 +491,90 @@ function applyToolsAndFormat(
   }
 }
 
-function responsesToolToCC(t: ResponsesTool): Tool | null {
+/**
+ * Translates a single Responses-API tool into zero or more Chat Completions
+ * tools.
+ *
+ * Returns an array because a `namespace` tool is a *container* of functions and
+ * expands to one CC tool per member.
+ */
+function responsesToolToCC(t: ResponsesTool): Array<Tool> {
   if (t.type === "function" && t.name) {
-    return {
-      type: "function" as const,
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters ?? {},
-        ...(t.strict !== undefined && { strict: t.strict }),
-      },
-    }
-  }
-  if (t.type === "local_shell") {
-    return {
-      type: "function" as const,
-      function: {
-        name: "shell",
-        description: "Execute a shell command",
-        parameters: {
-          type: "object",
-          properties: {
-            command: {
-              type: "array",
-              items: { type: "string" },
-              description: "Command and arguments to execute",
-            },
-          },
-          required: ["command"],
+    return [
+      {
+        type: "function" as const,
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters ?? {},
+          ...(t.strict !== undefined && { strict: t.strict }),
         },
       },
-    }
+    ]
+  }
+  if (t.type === "local_shell") {
+    return [
+      {
+        type: "function" as const,
+        function: {
+          name: "shell",
+          description: "Execute a shell command",
+          parameters: {
+            type: "object",
+            properties: {
+              command: {
+                type: "array",
+                items: { type: "string" },
+                description: "Command and arguments to execute",
+              },
+            },
+            required: ["command"],
+          },
+        },
+      },
+    ]
   }
   if (t.type === "custom" && t.name) {
-    return {
-      type: "function" as const,
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters ?? {},
+    // Includes Codex's `freeform` tools, whose grammar lives in `format` and
+    // has no Chat Completions equivalent — the callable name and description
+    // are preserved so the model can still invoke it.
+    return [
+      {
+        type: "function" as const,
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters ?? {},
+        },
       },
-    }
+    ]
   }
-  return null
+  if (t.type === "namespace") {
+    // Codex groups related tools under a namespace container
+    // (codex-rs/tools/src/responses_api.rs → `ResponsesApiNamespace`).  The
+    // member functions are the real callable tools; dropping the container
+    // silently discards all of them, leaving the model unaware of capabilities
+    // it was told it had.  Flatten to `namespace__member` to avoid collisions
+    // between same-named tools in different namespaces.
+    const members = Array.isArray(t.tools) ? (t.tools as Array<unknown>) : []
+    return members.flatMap((raw) => {
+      if (raw === null || typeof raw !== "object") return []
+      const member = raw as ResponsesTool
+      if (!member.name) return []
+      return [
+        {
+          type: "function" as const,
+          function: {
+            name: t.name ? `${t.name}__${member.name}` : member.name,
+            description: member.description,
+            parameters: member.parameters ?? {},
+            ...(member.strict !== undefined && { strict: member.strict }),
+          },
+        },
+      ]
+    })
+  }
+  return []
 }
 
 function translateResponsesContentToCC(

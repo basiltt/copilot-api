@@ -84,6 +84,33 @@ function matchCatalogId(
  * When nothing matches — or the catalog is unavailable — the original id is
  * returned unchanged so the upstream API produces its normal error.
  */
+/**
+ * Model ids Codex hardcodes for internal, non-user-facing turns.
+ *
+ * Codex sends these regardless of the `model` configured in `config.toml`, so
+ * they reach a custom gateway verbatim and 400 with `model_not_supported`
+ * (openai/codex#24879).  The affected features — sandbox auto-review, history
+ * compaction — then fail silently for every third-party provider.
+ *
+ * Each maps to the *capability* the internal turn needs, resolved against the
+ * live catalog in preference order.  These are cheap, mechanical turns, so a
+ * small fast model is the right target.
+ */
+const CODEX_INTERNAL_MODEL_FALLBACKS: Record<string, Array<string>> = {
+  "codex-auto-review": ["gpt-5.4-mini", "gpt-5-mini", "gpt-4o-mini"],
+  "trajectory-compaction": ["gpt-5.4-mini", "gpt-5-mini", "gpt-4o-mini"],
+}
+
+/** Resolves a Codex-internal model alias against the catalog, if applicable. */
+function resolveCodexInternalModel(
+  requestedId: string,
+  models: ModelsResponse,
+): string | undefined {
+  const candidates = CODEX_INTERNAL_MODEL_FALLBACKS[requestedId.toLowerCase()]
+  if (!candidates) return undefined
+  return candidates.find((c) => models.data.some((m) => m.id === c))
+}
+
 export function resolveModelId(
   requestedId: string,
   models: ModelsResponse | undefined,
@@ -109,6 +136,11 @@ export function resolveModelId(
     )
     if (stripped) return stripped
   }
+
+  // 4. Map Codex's hardcoded internal model ids onto a real catalog model.
+  //    Runs last so a genuine catalog entry of the same name always wins.
+  const internal = resolveCodexInternalModel(baseId, models)
+  if (internal) return internal
 
   // Return the suffix-stripped id rather than the raw request: even when the
   // catalog lookup fails, forwarding `model[1m]` upstream is guaranteed to

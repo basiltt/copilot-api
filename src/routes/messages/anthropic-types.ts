@@ -22,7 +22,16 @@ export interface AnthropicMessagesPayload {
     disable_parallel_tool_use?: boolean // parsed but not forwarded — no OpenAI equivalent
   }
   thinking?: {
-    type: "enabled"
+    /**
+     * `enabled` is the classic explicit opt-in.  `adaptive` is what Claude Code
+     * and Claude Desktop send for Claude 4.6 and later — and, per the gateway
+     * protocol reference, for any model name they don't recognize (including
+     * gateway aliases), so it arrives on most requests.  `disabled` turns
+     * reasoning off.
+     *
+     * @see https://code.claude.com/docs/en/llm-gateway-protocol
+     */
+    type: "enabled" | "adaptive" | "disabled"
     budget_tokens?: number
   }
   service_tier?: "auto" | "standard_only"
@@ -405,4 +414,26 @@ export interface AnthropicStreamState {
     | "tool_calls"
     | "content_filter"
     | null
+}
+
+/**
+ * Whether a request's `thinking` field asks for reasoning.
+ *
+ * Claude Code and Claude Desktop send `{"type": "adaptive"}` for Claude 4.6 and
+ * later, and — per the gateway protocol reference — treat model names they
+ * don't recognize (such as gateway aliases) as current models that receive the
+ * field.  Behind this proxy every Claude model is effectively an alias, so
+ * `adaptive` arrives on the majority of desktop requests.
+ *
+ * Matching only `"enabled"` therefore read as "thinking off" for real traffic:
+ * upstream reasoning was never requested, and any reasoning the model produced
+ * anyway was rendered as ordinary assistant text — the model's private
+ * chain-of-thought shown to the user as its answer.
+ *
+ * @see https://code.claude.com/docs/en/llm-gateway-protocol
+ */
+export function isThinkingRequested(
+  thinking: AnthropicMessagesPayload["thinking"],
+): thinking is NonNullable<AnthropicMessagesPayload["thinking"]> {
+  return thinking?.type === "enabled" || thinking?.type === "adaptive"
 }

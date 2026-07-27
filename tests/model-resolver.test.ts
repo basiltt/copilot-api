@@ -201,3 +201,39 @@ describe("resolveModelId — [1m] context-window marker", () => {
     )
   })
 })
+
+describe("resolveModelId — Codex internal model aliases", () => {
+  // Codex hardcodes these ids for internal turns regardless of the configured
+  // model, so they hit a custom gateway verbatim and 400 (openai/codex#24879).
+  const WITH_MINI = makeModels([
+    "gpt-5.4-mini",
+    "gpt-5.6-sol",
+    "claude-sonnet-5",
+  ])
+
+  test("maps codex-auto-review onto a real catalog model", () => {
+    expect(resolveModelId("codex-auto-review", WITH_MINI)).toBe("gpt-5.4-mini")
+  })
+
+  test("falls through preference order when the first choice is absent", () => {
+    const onlyLegacy = makeModels(["gpt-4o-mini", "gpt-5.6-sol"])
+    expect(resolveModelId("codex-auto-review", onlyLegacy)).toBe("gpt-4o-mini")
+  })
+
+  test("returns the id unchanged when no fallback exists in the catalog", () => {
+    const noMini = makeModels(["gpt-5.6-sol"])
+    expect(resolveModelId("codex-auto-review", noMini)).toBe("codex-auto-review")
+  })
+
+  test("a real catalog entry of the same name always wins", () => {
+    // `trajectory-compaction` is a genuine Copilot model; never override it.
+    const withReal = makeModels(["trajectory-compaction", "gpt-5.4-mini"])
+    expect(resolveModelId("trajectory-compaction", withReal)).toBe(
+      "trajectory-compaction",
+    )
+  })
+
+  test("does not touch ordinary model ids", () => {
+    expect(resolveModelId("gpt-5.6-sol", WITH_MINI)).toBe("gpt-5.6-sol")
+  })
+})

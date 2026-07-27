@@ -211,6 +211,145 @@ export async function forwardAnthropicError(c: Context, error: unknown) {
   )
 }
 
+/**
+ * Maps an HTTP status code to an OpenAI error `type` string.
+ *
+ * @see https://platform.openai.com/docs/guides/error-codes
+ */
+export function openAIErrorTypeForStatus(status: number): string {
+  switch (status) {
+    case 400: {
+      return "invalid_request_error"
+    }
+    case 401: {
+      return "authentication_error"
+    }
+    case 403: {
+      return "permission_error"
+    }
+    case 404: {
+      return "not_found_error"
+    }
+    case 429: {
+      return "rate_limit_error"
+    }
+    default: {
+      return status >= 500 ? "api_error" : "invalid_request_error"
+    }
+  }
+}
+
+/** Type guard for a body already shaped like an OpenAI API error. */
+function isOpenAIErrorBody(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false
+  const obj = value as Record<string, unknown>
+  if (obj.error === null || typeof obj.error !== "object") return false
+  const err = obj.error as Record<string, unknown>
+  return typeof err.message === "string" && typeof err.type === "string"
+}
+
+/**
+ * Error forwarder for the OpenAI-compatible surface (`/v1/responses`,
+ * `/v1/chat/completions`, `/v1/embeddings`).
+ *
+ * `forwardError` has two problems on these routes:
+ *   1. Context-window overflows are rendered in *Anthropic* shape
+ *      (`{type:"error", error:{...}}`), which OpenAI clients cannot parse.
+ *   2. A thrown JS error becomes a bare HTTP 500 whose message leaks
+ *      interpreter/internal detail, with `type:"error"` — not a valid OpenAI
+ *      error type — and no `param`/`code` fields.
+ *
+ * This normalizes every failure into OpenAI's documented shape:
+ * `{"error": {"message", "type", "param", "code"}}`.
+ */
+export async function forwardOpenAIError(c: Context, error: unknown) {
+  consola.error("Error occurred:", error)
+
+  if (error instanceof HTTPError) {
+    const errorText = await error.response.text()
+    const contentType = error.response.headers.get("content-type")
+    let errorJson: unknown
+    try {
+      errorJson = JSON.parse(errorText)
+    } catch {
+      errorJson = null
+    }
+    const errorMessage = extractUpstreamErrorMessage(
+      errorJson,
+      errorText,
+      contentType,
+    )
+    consola.error("HTTP error:", errorJson ?? errorMessage)
+
+    const status = error.response.status
+
+    // Context-window overflow → OpenAI-shaped body carrying the
+    // `context_length_exceeded` code clients pattern-match on to compact.
+    if (isContextWindowError(errorMessage, status)) {
+      const retryAfterHeader = error.response.headers.get("retry-after")
+      if (retryAfterHeader) c.header("retry-after", retryAfterHeader)
+      return c.json(
+        buildOpenAIContextWindowErrorBody(errorMessage),
+        400 as ContentfulStatusCode,
+      )
+    }
+
+    // Upstream already speaks OpenAI — forward unchanged.
+    if (isOpenAIErrorBody(errorJson)) {
+      return c.json(
+        errorJson as Record<string, unknown>,
+        status as ContentfulStatusCode,
+      )
+    }
+
+    const retryAfter = error.response.headers.get("retry-after")
+    if (retryAfter) c.header("retry-after", retryAfter)
+
+    return c.json(
+      {
+        error: {
+          message: errorMessage,
+          type: openAIErrorTypeForStatus(status),
+          param: null,
+          code: null,
+        },
+      },
+      status as ContentfulStatusCode,
+    )
+  }
+
+  // Non-HTTP failure. A malformed client body is the caller's fault → 400,
+  // not a 500 leaking the interpreter's message.
+  const message = error instanceof Error ? error.message : String(error)
+  const isClientPayloadError =
+    /Unexpected end of JSON|JSON Parse error|is not an object|Unexpected token|not iterable/i.test(
+      message,
+    )
+
+  if (isClientPayloadError) {
+    return c.json(
+      {
+        error: {
+          message:
+            "Invalid request body: expected a JSON object with a `model` "
+            + "string and a valid `input`/`messages` field.",
+          type: "invalid_request_error",
+          param: null,
+          code: null,
+        },
+      },
+      400 as ContentfulStatusCode,
+    )
+  }
+
+  return c.json(
+    {
+      error: { message, type: "api_error", param: null, code: null },
+    },
+    500,
+  )
+}
+
 /** Extracts the error message from a parsed Copilot error response. */
 export function extractUpstreamErrorMessage(
   errorJson: unknown,

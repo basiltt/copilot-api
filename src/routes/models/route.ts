@@ -2,7 +2,7 @@ import { Hono } from "hono"
 
 import type { Model } from "~/services/copilot/get-models"
 
-import { forwardError } from "~/lib/error"
+import { forwardOpenAIError } from "~/lib/error"
 import { resolveModelId } from "~/lib/model-resolver"
 import { state } from "~/lib/state"
 import { cacheModels } from "~/lib/utils"
@@ -93,7 +93,7 @@ modelRoutes.get("/", async (c) => {
       last_id: models.at(-1)?.id ?? null,
     })
   } catch (error) {
-    return await forwardError(c, error)
+    return await forwardOpenAIError(c, error)
   }
 })
 
@@ -116,12 +116,31 @@ modelRoutes.get("/:modelId", async (c) => {
     const model = state.models?.data.find((m) => m.id === resolved)
 
     if (!model) {
+      // This route is shared by the Anthropic and OpenAI surfaces, so the error
+      // body is content-negotiated: clients that send `anthropic-version` get
+      // Anthropic's `{type:"error", error:{...}}`, everyone else gets OpenAI's
+      // `{error:{message,type,param,code}}`.  Returning the wrong dialect makes
+      // the failure unparseable for whichever client asked.
+      if (c.req.header("anthropic-version")) {
+        return c.json(
+          {
+            type: "error",
+            error: {
+              type: "not_found_error",
+              message: `model: ${requested}`,
+            },
+          },
+          404,
+        )
+      }
+
       return c.json(
         {
-          type: "error",
           error: {
-            type: "not_found_error",
-            message: `model: ${requested}`,
+            message: `The model '${requested}' does not exist`,
+            type: "invalid_request_error",
+            param: "model",
+            code: "model_not_found",
           },
         },
         404,
@@ -130,6 +149,6 @@ modelRoutes.get("/:modelId", async (c) => {
 
     return c.json(buildModelEntry(model))
   } catch (error) {
-    return await forwardError(c, error)
+    return await forwardOpenAIError(c, error)
   }
 })

@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 
-import { forwardError } from "~/lib/error"
+import { forwardOpenAIError } from "~/lib/error"
 import { resolveModelId } from "~/lib/model-resolver"
 import { state } from "~/lib/state"
 import {
@@ -19,6 +19,6 @@ embeddingRoutes.post("/", async (c) => {
 
     return c.json(response)
   } catch (error) {
-    return await forwardError(c, error)
+    return await forwardOpenAIError(c, error)
   }
 })

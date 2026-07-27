@@ -39,6 +39,7 @@ import {
   type AnthropicResponse,
   type AnthropicStreamEventData,
   type AnthropicStreamState,
+  isThinkingRequested,
 } from "./anthropic-types"
 import {
   CompactionNeededError,
@@ -1041,7 +1042,7 @@ async function handleStreaming(
         consola.debug(
           "Empty non-streaming response detected in streaming path — retrying",
         )
-        const thinkingEnabled = anthropicPayload.thinking?.type === "enabled"
+        const thinkingEnabled = isThinkingRequested(anthropicPayload.thinking)
         await retryEmptyResponse(stream, anthropicPayload, {
           thinkingEnabled,
           imageTokenOverhead,
@@ -1057,7 +1058,7 @@ async function handleStreaming(
       return
     }
 
-    const thinkingEnabled = anthropicPayload.thinking?.type === "enabled"
+    const thinkingEnabled = isThinkingRequested(anthropicPayload.thinking)
     const hadContent = await pipeStreamToClient(stream, copilotResponse, {
       thinkingEnabled,
       imageTokenOverhead,

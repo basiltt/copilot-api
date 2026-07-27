@@ -74,8 +74,9 @@ export async function handleResponses(c: Context) {
 
   if (state.manualApprove) await awaitApproval()
 
-  // Claude models don't support the Responses API — translate to Chat Completions
-  if (requiresChatCompletionsApi(model)) {
+  // Models that can't serve the Responses API natively are translated to Chat
+  // Completions (Claude, Gemini, and anything the catalog marks as such).
+  if (requiresChatCompletionsApi(model, state.models)) {
     return handleViaCC(c, payload as unknown as ResponsesPayload)
   }
 
@@ -514,27 +515,61 @@ async function handleViaCC(c: Context, payload: ResponsesPayload) {
         }),
       })
 
-      for await (const event of result as AsyncIterable<{
-        data?: string
-        event?: string
-      }>) {
-        const data = event.data ?? (event as Record<string, unknown>).data
-        if (!data || data === "[DONE]") continue
+      try {
+        for await (const event of result as AsyncIterable<{
+          data?: string
+          event?: string
+        }>) {
+          const data = event.data ?? (event as Record<string, unknown>).data
+          if (!data || data === "[DONE]") continue
 
-        let parsed: Record<string, unknown>
-        try {
-          parsed = JSON.parse(data as string) as Record<string, unknown>
-        } catch {
-          continue
-        }
+          let parsed: Record<string, unknown>
+          try {
+            parsed = JSON.parse(data as string) as Record<string, unknown>
+          } catch {
+            continue
+          }
 
-        const responsesEvents = translateFromCCStreamToResponsesEvents(
-          parsed,
-          streamState,
-        )
-        for (const evt of responsesEvents) {
-          await stream.writeSSE({ event: evt.event, data: evt.data })
+          const responsesEvents = translateFromCCStreamToResponsesEvents(
+            parsed,
+            streamState,
+          )
+          for (const evt of responsesEvents) {
+            await stream.writeSSE({ event: evt.event, data: evt.data })
+          }
         }
+      } catch (error) {
+        // Once `streamSSE` has begun, headers are already 200 and the route's
+        // try/catch can no longer produce an HTTP error response.  Without a
+        // terminal event here the socket simply closes, and the Codex SSE
+        // parser sees a truncated stream with no resolution.
+        //
+        // `response.failed` is the only channel Codex reads for a fatal
+        // mid-stream error (codex-rs/codex-api/src/sse/responses.rs), and it
+        // keys off `response.error.code`: `context_length_exceeded` maps to
+        // `ApiError::ContextWindowExceeded`, which is what drives compaction.
+        const message = error instanceof Error ? error.message : String(error)
+        consola.error("[responses→cc] stream failed mid-flight:", error)
+
+        const failedEvent =
+          isContextWindowError(message) ?
+            buildResponsesContextWindowFailedEvent(message)
+          : {
+              type: "response.failed" as const,
+              response: {
+                id: responsesId,
+                object: "response",
+                status: "failed",
+                error: { code: "stream_error", message },
+                usage: null,
+                metadata: {},
+              },
+            }
+
+        await stream.writeSSE({
+          event: "response.failed",
+          data: JSON.stringify(failedEvent),
+        })
       }
       await stream.writeSSE({ data: "[DONE]" })
     })

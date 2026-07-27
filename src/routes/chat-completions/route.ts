@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 
-import { forwardError } from "~/lib/error"
+import { forwardOpenAIError } from "~/lib/error"
 
 import { handleCompletion } from "./handler"
 
@@ -10,6 +10,6 @@ completionRoutes.post("/", async (c) => {
   try {
     return await handleCompletion(c)
   } catch (error) {
-    return await forwardError(c, error)
+    return await forwardOpenAIError(c, error)
   }
 })

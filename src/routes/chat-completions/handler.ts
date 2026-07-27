@@ -105,12 +105,31 @@ export async function handleCompletion(c: Context) {
 
   consola.debug("Streaming response")
   return streamSSE(c, async (stream) => {
+    let sentDone = false
     for await (const chunk of response) {
       consola.debug("Streaming chunk:", JSON.stringify(chunk))
-      // Stop iterating once we see [DONE] — don't wait for the upstream HTTP
-      // connection to close, which can hang if the Copilot API keeps it open.
-      if (chunk.data === "[DONE]") break
+      // Forward the terminal `[DONE]` sentinel, then stop iterating rather than
+      // waiting for the upstream HTTP connection to close (which can hang if
+      // the Copilot API keeps it open).
+      //
+      // The sentinel MUST reach the client: the OpenAI Chat Completions
+      // streaming contract terminates on `data: [DONE]`, and standard clients
+      // (openai-python/-node, LangChain, Vercel AI SDK) block waiting for it.
+      // Previously this broke *before* the write, swallowing the sentinel and
+      // leaving those clients hanging until their own timeout fired.
+      if (chunk.data === "[DONE]") {
+        await stream.writeSSE({ data: "[DONE]" })
+        sentDone = true
+        break
+      }
       await stream.writeSSE(chunk as SSEMessage)
+    }
+
+    // Upstream can end the body without ever emitting the sentinel (observed
+    // when the final chunk is a usage-only frame).  Synthesize it so the client
+    // always sees a well-formed terminator.
+    if (!sentDone) {
+      await stream.writeSSE({ data: "[DONE]" })
     }
   })
 }
