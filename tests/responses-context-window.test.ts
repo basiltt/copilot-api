@@ -281,3 +281,36 @@ describe("Responses route — context-window 413 → Codex compaction signal", (
     expect(text).toContain("internal server error")
   })
 })
+
+describe("Responses route — upstream policy rejection", () => {
+  test("preserves cyber_policy on a streaming request without retrying", async () => {
+    const upstreamBody = {
+      error: {
+        message:
+          "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request.",
+        code: "cyber_policy",
+      },
+    }
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify(upstreamBody), {
+        status: 422,
+        headers: {
+          "content-type": "application/json",
+          "x-request-id": "req_cyber_policy_test",
+        },
+      }),
+    )
+
+    const res = await postResponses({
+      model: "gpt-5.5",
+      stream: true,
+      input: [{ role: "user", content: "hello" }],
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(res.status).toBe(422)
+    expect(res.headers.get("content-type")).toContain("application/json")
+    expect(res.headers.get("x-request-id")).toBe("req_cyber_policy_test")
+    expect(await res.json()).toEqual(upstreamBody)
+  })
+})

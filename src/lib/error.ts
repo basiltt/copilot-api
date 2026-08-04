@@ -239,13 +239,42 @@ export function openAIErrorTypeForStatus(status: number): string {
   }
 }
 
-/** Type guard for a body already shaped like an OpenAI API error. */
-function isOpenAIErrorBody(value: unknown): boolean {
+/**
+ * Type guard for an upstream error body that OpenAI clients can classify.
+ *
+ * Most OpenAI errors include `type`, but cybersecurity-check rejections may
+ * contain only `message` and `code`. Codex branches on `code: "cyber_policy"`,
+ * so those bodies must pass through unchanged.
+ */
+function isForwardableOpenAIErrorBody(value: unknown): boolean {
   if (value === null || typeof value !== "object") return false
   const obj = value as Record<string, unknown>
   if (obj.error === null || typeof obj.error !== "object") return false
   const err = obj.error as Record<string, unknown>
-  return typeof err.message === "string" && typeof err.type === "string"
+  return (
+    typeof err.message === "string"
+    && (typeof err.type === "string" || typeof err.code === "string")
+  )
+}
+
+function forwardUpstreamErrorHeaders(c: Context, response: Response): void {
+  for (const name of [
+    "x-request-id",
+    "request-id",
+    "x-github-request-id",
+    "retry-after",
+  ]) {
+    const value = response.headers.get(name)
+    if (value) c.header(name, value)
+  }
+}
+
+function getUpstreamErrorCode(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object") return undefined
+  const error = (value as Record<string, unknown>).error
+  if (error === null || typeof error !== "object") return undefined
+  const code = (error as Record<string, unknown>).code
+  return typeof code === "string" ? code : undefined
 }
 
 /**
@@ -263,8 +292,6 @@ function isOpenAIErrorBody(value: unknown): boolean {
  * `{"error": {"message", "type", "param", "code"}}`.
  */
 export async function forwardOpenAIError(c: Context, error: unknown) {
-  consola.error("Error occurred:", error)
-
   if (error instanceof HTTPError) {
     const errorText = await error.response.text()
     const contentType = error.response.headers.get("content-type")
@@ -279,31 +306,35 @@ export async function forwardOpenAIError(c: Context, error: unknown) {
       errorText,
       contentType,
     )
-    consola.error("HTTP error:", errorJson ?? errorMessage)
 
     const status = error.response.status
+    forwardUpstreamErrorHeaders(c, error.response)
+    const errorCode = getUpstreamErrorCode(errorJson)
+    if (errorCode === "cyber_policy") {
+      consola.warn(
+        `[responses] Upstream cybersecurity policy rejection (HTTP ${status}, code=${errorCode}): ${errorMessage}`,
+      )
+    } else {
+      consola.error("HTTP error:", errorJson ?? errorMessage)
+    }
 
     // Context-window overflow → OpenAI-shaped body carrying the
     // `context_length_exceeded` code clients pattern-match on to compact.
     if (isContextWindowError(errorMessage, status)) {
-      const retryAfterHeader = error.response.headers.get("retry-after")
-      if (retryAfterHeader) c.header("retry-after", retryAfterHeader)
       return c.json(
         buildOpenAIContextWindowErrorBody(errorMessage),
         400 as ContentfulStatusCode,
       )
     }
 
-    // Upstream already speaks OpenAI — forward unchanged.
-    if (isOpenAIErrorBody(errorJson)) {
+    // Preserve upstream OpenAI errors exactly, including `cyber_policy`
+    // rejections that intentionally omit `type`.
+    if (isForwardableOpenAIErrorBody(errorJson)) {
       return c.json(
         errorJson as Record<string, unknown>,
         status as ContentfulStatusCode,
       )
     }
-
-    const retryAfter = error.response.headers.get("retry-after")
-    if (retryAfter) c.header("retry-after", retryAfter)
 
     return c.json(
       {
@@ -317,6 +348,8 @@ export async function forwardOpenAIError(c: Context, error: unknown) {
       status as ContentfulStatusCode,
     )
   }
+
+  consola.error("Error occurred:", error)
 
   // Non-HTTP failure. A malformed client body is the caller's fault → 400,
   // not a 500 leaking the interpreter's message.
