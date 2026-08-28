@@ -65,8 +65,7 @@ export interface AnthropicGenericSystemBlock {
 }
 
 export type AnthropicSystemBlock =
-  | AnthropicTextBlock
-  | AnthropicGenericSystemBlock
+  AnthropicTextBlock | AnthropicGenericSystemBlock
 
 export interface AnthropicImageBlock {
   type: "image"
@@ -201,13 +200,11 @@ interface AnthropicCodeExecutionToolResultBlock extends ServerToolResultBase {
   type: "code_execution_tool_result"
 }
 
-interface AnthropicBashCodeExecutionToolResultBlock
-  extends ServerToolResultBase {
+interface AnthropicBashCodeExecutionToolResultBlock extends ServerToolResultBase {
   type: "bash_code_execution_tool_result"
 }
 
-interface AnthropicTextEditorCodeExecutionToolResultBlock
-  extends ServerToolResultBase {
+interface AnthropicTextEditorCodeExecutionToolResultBlock extends ServerToolResultBase {
   type: "text_editor_code_execution_tool_result"
 }
 
@@ -269,9 +266,7 @@ export interface AnthropicSystemMessage {
 }
 
 export type AnthropicMessage =
-  | AnthropicUserMessage
-  | AnthropicAssistantMessage
-  | AnthropicSystemMessage
+  AnthropicUserMessage | AnthropicAssistantMessage | AnthropicSystemMessage
 
 // Custom tool (has input_schema) — what Claude Code and standard clients send
 export interface AnthropicCustomTool {
@@ -428,6 +423,8 @@ export interface AnthropicStreamState {
   thinkingBlockOpen: boolean
   /** Whether any visible text content has been emitted in this response. */
   hasEmittedText: boolean
+  /** Leading whitespace buffered until the first visible text delta arrives. */
+  pendingLeadingText?: string
   /** Whether any thinking (reasoning) content has been emitted in this response. */
   hasEmittedThinking: boolean
   toolCalls: {
@@ -460,11 +457,7 @@ export interface AnthropicStreamState {
    * chunk arrives (or the stream ends).
    */
   deferredFinishReason?:
-    | "stop"
-    | "length"
-    | "tool_calls"
-    | "content_filter"
-    | null
+    "stop" | "length" | "tool_calls" | "content_filter" | null
 }
 
 /**

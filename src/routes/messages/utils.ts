@@ -1,5 +1,13 @@
 import { type AnthropicResponse } from "./anthropic-types"
 
+export const EMPTY_VISIBLE_OUTPUT_TEXT =
+  "The upstream model completed the turn without producing a visible response. "
+  + "Please retry or rephrase the request."
+
+export const FILTERED_VISIBLE_OUTPUT_TEXT =
+  "The upstream model declined to provide a response because the request was "
+  + "filtered by its safety policy."
+
 export function mapOpenAIStopReasonToAnthropic(
   finishReason: "stop" | "length" | "tool_calls" | "content_filter" | null,
 ): AnthropicResponse["stop_reason"] {
@@ -10,7 +18,7 @@ export function mapOpenAIStopReasonToAnthropic(
     stop: "end_turn",
     length: "max_tokens",
     tool_calls: "tool_use",
-    content_filter: "end_turn",
+    content_filter: "refusal",
   } as const
   return stopReasonMap[finishReason]
 }

@@ -5,7 +5,12 @@ import {
   type AnthropicStreamState,
 } from "./anthropic-types"
 import { toAnthropicToolName } from "./tool-name-mapping"
-import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
+import {
+  EMPTY_VISIBLE_OUTPUT_TEXT,
+  FILTERED_VISIBLE_OUTPUT_TEXT,
+  mapOpenAIStopReasonToAnthropic,
+  toAnthropicMessageId,
+} from "./utils"
 
 /**
  * Generates a human-readable description for a tool call so the user can see
@@ -120,6 +125,29 @@ export function translateChunkToAnthropicEvents(
 
   const choice = chunk.choices[0]
   const { delta } = choice
+
+  // OpenAI-compatible streams normally begin with a role-only chunk.  Do not
+  // commit Anthropic's message_start for that protocol preamble: if the next
+  // chunk is an empty terminal response, the caller can still retry without
+  // having sent any part of a message to the client. Buffer leading whitespace
+  // rather than dropping it so valid Markdown/code formatting is preserved
+  // when visible text eventually arrives.
+  const deltaText = delta.content ?? ""
+  const hasSubstantiveDelta =
+    Boolean(deltaText.trim())
+    || Boolean(delta.reasoning_content)
+    || Boolean(delta.reasoning_text)
+    || Boolean(delta.tool_calls?.length)
+  if (
+    !state.messageStartSent
+    && !choice.finish_reason
+    && !hasSubstantiveDelta
+  ) {
+    if (deltaText) {
+      state.pendingLeadingText = (state.pendingLeadingText ?? "") + deltaText
+    }
+    return events
+  }
 
   if (!state.messageStartSent) {
     events.push({
@@ -236,15 +264,19 @@ export function translateChunkToAnthropicEvents(
       state.contentBlockOpen = true
     }
 
+    const text = (state.pendingLeadingText ?? "") + delta.content
+    state.pendingLeadingText = undefined
     events.push({
       type: "content_block_delta",
       index: state.contentBlockIndex,
       delta: {
         type: "text_delta",
-        text: delta.content,
+        text,
       },
     })
-    state.hasEmittedText = true
+    if (text.trim().length > 0) {
+      state.hasEmittedText = true
+    }
   }
 
   if (delta.tool_calls) {
@@ -360,12 +392,70 @@ export function translateChunkToAnthropicEvents(
 
     const hasToolCalls = Object.keys(state.toolCalls).length > 0
 
+    // A filtered tool call must never be committed as a normal Anthropic tool
+    // turn. The tool block may already have streamed, so terminate the partial
+    // message with an error; clients discard errored turns instead of executing
+    // or replaying their tool_use blocks.
+    if (choice.finish_reason === "content_filter" && hasToolCalls) {
+      if (state.contentBlockOpen) {
+        events.push({
+          type: "content_block_stop",
+          index: state.contentBlockIndex,
+        })
+        state.contentBlockOpen = false
+        state.thinkingBlockOpen = false
+      }
+      events.push(
+        translateErrorToAnthropicErrorEvent(
+          FILTERED_VISIBLE_OUTPUT_TEXT,
+          "invalid_request_error",
+        ),
+      )
+      state.messageStopSent = true
+      state.deferredFinishReason = undefined
+      return events
+    }
+
     if (state.contentBlockOpen) {
       events.push({
         type: "content_block_stop",
         index: state.contentBlockIndex,
       })
       state.contentBlockOpen = false
+      state.thinkingBlockOpen = false
+      state.contentBlockIndex++
+    }
+
+    // A reasoning-only or policy-filtered completion is not a usable Claude
+    // response.  Once thinking has streamed we cannot transparently retry (a
+    // second message_start would violate the Anthropic SSE protocol), so close
+    // the same message with explicit, visible text instead of a silent end_turn.
+    const isFiltered = choice.finish_reason === "content_filter"
+    if (!state.hasEmittedText && (!hasToolCalls || isFiltered)) {
+      const fallbackText =
+        (state.pendingLeadingText ?? "")
+        + (choice.finish_reason === "content_filter" ?
+          FILTERED_VISIBLE_OUTPUT_TEXT
+        : EMPTY_VISIBLE_OUTPUT_TEXT)
+      state.pendingLeadingText = undefined
+      events.push(
+        {
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "text", text: "" },
+        },
+        {
+          type: "content_block_delta",
+          index: state.contentBlockIndex,
+          delta: { type: "text_delta", text: fallbackText },
+        },
+        {
+          type: "content_block_stop",
+          index: state.contentBlockIndex,
+        },
+      )
+      state.hasEmittedText = true
+      state.contentBlockIndex++
     }
 
     // Some models (notably Gemini) intermittently return a non-tool_calls
@@ -376,7 +466,11 @@ export function translateChunkToAnthropicEvents(
     // is handled by the truncation guard above and must be preserved). This
     // mirrors the non-streaming correction in non-stream-translation.ts.
     const correctedFinishReason =
-      hasToolCalls && choice.finish_reason !== "length" ?
+      (
+        hasToolCalls
+        && choice.finish_reason !== "length"
+        && choice.finish_reason !== "content_filter"
+      ) ?
         "tool_calls"
       : choice.finish_reason
 
@@ -473,7 +567,7 @@ export function isEmptyStreamResponse(chunk: ChatCompletionChunk): boolean {
   const choice = chunk.choices[0]
   return (
     choice.finish_reason === "stop"
-    && !choice.delta.content
+    && !choice.delta.content?.trim()
     && !choice.delta.reasoning_content
     && !choice.delta.reasoning_text
     && (!choice.delta.tool_calls || choice.delta.tool_calls.length === 0)

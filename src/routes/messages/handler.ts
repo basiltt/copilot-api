@@ -64,7 +64,7 @@ import {
   createToolNameMapFromAnthropicPayload,
   type ToolNameMap,
 } from "./tool-name-mapping"
-import { toAnthropicMessageId } from "./utils"
+import { EMPTY_VISIBLE_OUTPUT_TEXT, toAnthropicMessageId } from "./utils"
 import {
   detectWebSearchIntent,
   stripWebSearchTypedTools,
@@ -113,6 +113,7 @@ export function startSSEKeepalive(
 // upstream.  90s accommodates long reasoning phases while still recovering
 // from truly dead connections within a reasonable time.
 const STREAM_STALL_TIMEOUT_MS = 90_000
+const STREAM_TIMED_OUT = Symbol("stream-timed-out")
 
 // Maximum number of times to retry a timed-out upstream fetch before giving up.
 // Each attempt gets a fresh TCP connection, resetting the firewall idle timer.
@@ -1251,18 +1252,54 @@ async function retryEmptyResponse(
   await emitSyntheticFallbackResponse(stream, anthropicPayload)
 }
 
-// eslint-disable-next-line complexity
-async function pipeStreamToClient(
-  stream: SSEStreamingApi,
+function logMissingVisibleOutputFinish(
+  chunk: ChatCompletionChunk,
+  state: AnthropicStreamState,
+): void {
+  if (chunk.choices.length === 0) return
+  const choice = chunk.choices[0]
+  const hasVisibleText =
+    state.hasEmittedText || Boolean(choice.delta.content?.trim())
+  const hasToolCalls =
+    Object.keys(state.toolCalls).length > 0
+    || Boolean(choice.delta.tool_calls?.length)
+  const isFiltered = choice.finish_reason === "content_filter"
+
+  if (
+    !choice.finish_reason
+    || hasVisibleText
+    || (hasToolCalls && !isFiltered)
+  ) {
+    return
+  }
+
+  consola.warn("Copilot stream finished without visible output", {
+    model: chunk.model,
+    finishReason: choice.finish_reason,
+    hadThinking:
+      state.hasEmittedThinking
+      || Boolean(choice.delta.reasoning_content)
+      || Boolean(choice.delta.reasoning_text),
+    hadToolCalls: hasToolCalls,
+    messageStarted: state.messageStartSent,
+  })
+}
+
+async function closeUpstreamStream(
   response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
-  options: {
-    thinkingEnabled: boolean
-    imageTokenOverhead?: number
-    toolNameMap?: ToolNameMap
-  },
-): Promise<boolean> {
-  const { thinkingEnabled, imageTokenOverhead = 0, toolNameMap } = options
-  const streamState: AnthropicStreamState = {
+): Promise<void> {
+  try {
+    await response.return(undefined)
+  } catch (error) {
+    consola.debug("Failed to close upstream stream cleanly:", error)
+  }
+}
+
+function createAnthropicStreamState(
+  thinkingEnabled: boolean,
+  toolNameMap: ToolNameMap | undefined,
+): AnthropicStreamState {
+  return {
     messageStartSent: false,
     messageStopSent: false,
     contentBlockIndex: 0,
@@ -1274,10 +1311,26 @@ async function pipeStreamToClient(
     toolNameMap,
     thinkingEnabled,
   }
+}
+
+// eslint-disable-next-line complexity
+async function pipeStreamToClient(
+  stream: SSEStreamingApi,
+  response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
+  options: {
+    thinkingEnabled: boolean
+    imageTokenOverhead?: number
+    toolNameMap?: ToolNameMap
+  },
+): Promise<boolean> {
+  const { thinkingEnabled, imageTokenOverhead = 0, toolNameMap } = options
+  const streamState = createAnthropicStreamState(thinkingEnabled, toolNameMap)
 
   // Keep pinging for the full lifetime of the upstream stream. A single ping
   // does not protect waits longer than a reverse proxy's idle timeout.
   const stopKeepalive = startSSEKeepalive(stream)
+  let upstreamStarted = false
+  let upstreamTimedOut = false
 
   try {
     // Instead of `for await (const rawEvent of response)` which blocks
@@ -1285,9 +1338,17 @@ async function pipeStreamToClient(
     // a stall timeout.  This lets us break out and synthesize proper
     // termination events when the Copilot API hangs after a large tool call.
     for (;;) {
-      const rawEvent = await nextWithTimeout(response, streamState)
+      const rawEvent = await nextWithTimeout(
+        response,
+        streamState,
+        upstreamStarted,
+      )
 
       // Timeout or natural end of stream
+      if (rawEvent === STREAM_TIMED_OUT) {
+        upstreamTimedOut = true
+        break
+      }
       if (rawEvent === undefined) break
 
       consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
@@ -1295,6 +1356,8 @@ async function pipeStreamToClient(
       if (!rawEvent.data) continue
 
       const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+      if (chunk.choices.length > 0) upstreamStarted = true
+      logMissingVisibleOutputFinish(chunk, streamState)
 
       // Detect empty responses before sending message_start: some models
       // (notably Gemini) return a single chunk with finish_reason "stop",
@@ -1367,6 +1430,14 @@ async function pipeStreamToClient(
     })
   } finally {
     stopKeepalive()
+    if (upstreamTimedOut) {
+      // A timed-out iter.next() is still pending. Async-generator operations
+      // are serialized, so awaiting return() here would queue behind that read
+      // and recreate the multi-minute hang the stall guard just recovered from.
+      void closeUpstreamStream(response)
+    } else {
+      await closeUpstreamStream(response)
+    }
   }
   return true
 }
@@ -1398,8 +1469,8 @@ async function emitDeferredFinish(
  *
  * Returns the next yielded value, or `undefined` if either:
  * - The iterator is done (natural end of stream), OR
- * - The iterator has been stalled for STREAM_STALL_TIMEOUT_MS while the
- *   stream has already started (messageStartSent === true).
+ * - The iterator has been stalled for STREAM_STALL_TIMEOUT_MS after either
+ *   upstream activity or a downstream message_start.
  *
  * The stall timeout is the key fix for the Write tool hang: when the Copilot
  * API finishes streaming a large tool call but never sends `finish_reason`,
@@ -1412,12 +1483,13 @@ async function emitDeferredFinish(
 async function nextWithTimeout(
   iter: AsyncGenerator<ServerSentEventMessage, void, unknown>,
   streamState: AnthropicStreamState,
-): Promise<ServerSentEventMessage | undefined> {
-  // Before the stream has started we don't apply a stall timeout —
-  // the initial response from Copilot can take a long time (model
-  // thinking) and is covered by the ping keepalive + upstream inactivity
-  // abort instead.
-  if (!streamState.messageStartSent) {
+  upstreamStarted: boolean,
+): Promise<ServerSentEventMessage | typeof STREAM_TIMED_OUT | undefined> {
+  // Before any upstream activity we don't apply a stall timeout — the model's
+  // initial response can take a long time and is covered by the ping keepalive
+  // plus the upstream inactivity abort. Once even a role preamble arrives, use
+  // the normal stall guard without forcing an empty downstream message_start.
+  if (!streamState.messageStartSent && !upstreamStarted) {
     const result = await iter.next()
     return result.done ? undefined : result.value
   }
@@ -1432,9 +1504,9 @@ async function nextWithTimeout(
   if (result === "timeout") {
     consola.debug(
       `Upstream stream stalled for ${STREAM_STALL_TIMEOUT_MS / 1000}s after `
-        + `message_start — synthesizing termination events`,
+        + `stream activity — synthesizing termination events`,
     )
-    return undefined
+    return STREAM_TIMED_OUT
   }
 
   return result.done ? undefined : result.value
@@ -1449,7 +1521,7 @@ async function nextWithTimeout(
  * 2. Stream started (message_start sent) but ended without finish_reason →
  *    synthesize the missing termination events so Claude Code can proceed.
  */
-async function handleIncompleteStream(
+export async function handleIncompleteStream(
   stream: SSEStreamingApi,
   state: AnthropicStreamState,
 ): Promise<void> {
@@ -1482,6 +1554,7 @@ async function handleIncompleteStream(
     "Copilot stream ended without finish_reason — synthesizing message_delta/message_stop",
   )
 
+  let nextContentBlockIndex = state.contentBlockIndex
   if (state.contentBlockOpen) {
     await stream.writeSSE({
       event: "content_block_stop",
@@ -1490,6 +1563,7 @@ async function handleIncompleteStream(
         index: state.contentBlockIndex,
       }),
     })
+    nextContentBlockIndex++
   }
 
   // Check if any tool calls have truncated (invalid) JSON arguments.
@@ -1500,12 +1574,16 @@ async function handleIncompleteStream(
   const hasToolCalls = Object.keys(state.toolCalls).length > 0
   const truncated = hasToolCalls ? findTruncatedToolCalls(state) : []
 
+  if (!state.hasEmittedText && !hasToolCalls) {
+    await emitIncompleteVisibleFallback(stream, state, nextContentBlockIndex)
+  }
+
   if (truncated.length > 0) {
     const toolName = truncated[0].name
     consola.debug(
       `Truncated tool call "${toolName}" detected during stream recovery`,
     )
-    const nextIndex = state.contentBlockIndex + 1
+    const nextIndex = nextContentBlockIndex
     await stream.writeSSE({
       event: "content_block_start",
       data: JSON.stringify({
@@ -1562,6 +1640,48 @@ async function handleIncompleteStream(
   })
 }
 
+async function emitIncompleteVisibleFallback(
+  stream: SSEStreamingApi,
+  state: AnthropicStreamState,
+  index: number,
+): Promise<void> {
+  consola.warn("Copilot stream ended without visible output", {
+    hadThinking: state.hasEmittedThinking,
+  })
+  await emitRecoveryTextBlock(
+    stream,
+    index,
+    (state.pendingLeadingText ?? "") + EMPTY_VISIBLE_OUTPUT_TEXT,
+  )
+}
+
+async function emitRecoveryTextBlock(
+  stream: SSEStreamingApi,
+  index: number,
+  text: string,
+): Promise<void> {
+  await stream.writeSSE({
+    event: "content_block_start",
+    data: JSON.stringify({
+      type: "content_block_start",
+      index,
+      content_block: { type: "text", text: "" },
+    }),
+  })
+  await stream.writeSSE({
+    event: "content_block_delta",
+    data: JSON.stringify({
+      type: "content_block_delta",
+      index,
+      delta: { type: "text_delta", text },
+    }),
+  })
+  await stream.writeSSE({
+    event: "content_block_stop",
+    data: JSON.stringify({ type: "content_block_stop", index }),
+  })
+}
+
 const isNonStreaming = (
   response: Awaited<ReturnType<typeof createChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
@@ -1596,12 +1716,7 @@ export function isEmptyNonStreamingResponse(
   // that at runtime (the bug this guard exists for), so widen the type to
   // include the nullish shapes we actually observe before comparing.
   const finishReason = choice.finish_reason as
-    | "stop"
-    | "length"
-    | "tool_calls"
-    | "content_filter"
-    | null
-    | undefined
+    "stop" | "length" | "tool_calls" | "content_filter" | null | undefined
   if (
     finishReason !== "stop"
     && finishReason !== null

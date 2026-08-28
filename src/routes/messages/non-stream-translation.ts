@@ -39,7 +39,11 @@ import {
   toOpenAIToolName,
   type ToolNameMap,
 } from "./tool-name-mapping"
-import { mapOpenAIStopReasonToAnthropic, toAnthropicMessageId } from "./utils"
+import {
+  FILTERED_VISIBLE_OUTPUT_TEXT,
+  mapOpenAIStopReasonToAnthropic,
+  toAnthropicMessageId,
+} from "./utils"
 
 const MAX_TOOL_RESULT_CHARS = 20_000
 const TOOL_RESULT_HEAD_CHARS = 5_000
@@ -565,11 +569,7 @@ function mapToolResultContent(
     return content
   }
   // Every nested tool-result block is also handled by mapContent.
-  return mapContent(
-    content as Array<
-      AnthropicUserContentBlock | AnthropicAssistantContentBlock
-    >,
-  )
+  return mapContent(content)
 }
 
 function translateToolResultForOpenAI(
@@ -602,11 +602,7 @@ function translateToolResultForOpenAI(
     toolContent:
       textContent
       || "[Non-text tool result forwarded in the following user message.]",
-    followUpUserContent: mapContent(
-      content as Array<
-        AnthropicUserContentBlock | AnthropicAssistantContentBlock
-      >,
-    ),
+    followUpUserContent: mapContent(content),
   }
 }
 
@@ -736,8 +732,7 @@ function serializeBlockToText(
 
 function mapContent(
   content:
-    | string
-    | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
+    string | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
 ): string | Array<ContentPart> | null {
   if (typeof content === "string") {
     return content
@@ -945,9 +940,32 @@ export function translateToAnthropic(
   // handled specially below (the arguments may be incomplete), so preserve it
   // here rather than masking it as "tool_calls".
   const correctedStopReason =
-    allToolUseBlocks.length > 0 && stopReason !== "length" ?
+    (
+      allToolUseBlocks.length > 0
+      && stopReason !== "length"
+      && stopReason !== "content_filter"
+    ) ?
       "tool_calls"
     : stopReason
+
+  if (correctedStopReason === "content_filter") {
+    const visibleTextBlocks = allTextBlocks.filter(
+      (block) => block.text.trim().length > 0,
+    )
+    return {
+      id: toAnthropicMessageId(response.id),
+      type: "message",
+      role: "assistant",
+      model: response.model,
+      content:
+        visibleTextBlocks.length > 0 ?
+          visibleTextBlocks
+        : [{ type: "text", text: FILTERED_VISIBLE_OUTPUT_TEXT }],
+      stop_reason: "refusal",
+      stop_sequence: null,
+      usage: buildAnthropicUsage(response.usage),
+    }
+  }
 
   // Guard: detect truncated tool calls when finish_reason is "length".
   // When the output hits the token limit mid-tool-call, the JSON arguments are

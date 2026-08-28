@@ -11,10 +11,14 @@ import {
   type AnthropicMessagesPayload,
   type AnthropicStreamState,
 } from "~/routes/messages/anthropic-types"
-import { isEmptyNonStreamingResponse } from "~/routes/messages/handler"
+import {
+  handleIncompleteStream,
+  isEmptyNonStreamingResponse,
+} from "~/routes/messages/handler"
 import { translateToAnthropic } from "~/routes/messages/non-stream-translation"
 import {
   flushDeferredFinish,
+  isEmptyStreamResponse,
   translateChunkToAnthropicEvents,
 } from "~/routes/messages/stream-translation"
 import {
@@ -418,6 +422,75 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
     } as unknown as ChatCompletionResponse
 
     expect(isEmptyNonStreamingResponse(response)).toBe(true)
+  })
+
+  test("blank content_filter responses become visible refusals", () => {
+    for (const content of [null, "", "   "]) {
+      const response: ChatCompletionResponse = {
+        id: "chatcmpl-filtered",
+        object: "chat.completion",
+        created: 1,
+        model: "claude-opus-5",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content },
+            finish_reason: "content_filter",
+            logprobs: null,
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+      }
+
+      const translated = translateToAnthropic(response)
+
+      expect(translated.stop_reason).toBe("refusal")
+      expect(translated.content).toHaveLength(1)
+      expect(translated.content[0]?.type).toBe("text")
+      if (translated.content[0]?.type === "text") {
+        expect(translated.content[0].text.trim().length).toBeGreaterThan(0)
+      }
+    }
+  })
+
+  test("content_filter discards tool calls instead of requesting execution", () => {
+    const response: ChatCompletionResponse = {
+      id: "chatcmpl-filtered-tool",
+      object: "chat.completion",
+      created: 1,
+      model: "claude-opus-5",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_filtered",
+                type: "function",
+                function: { name: "Bash", arguments: '{"command":"id"}' },
+              },
+            ],
+          },
+          finish_reason: "content_filter",
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 },
+    }
+
+    const translated = translateToAnthropic(response)
+
+    expect(translated.stop_reason).toBe("refusal")
+    expect(
+      translated.content.some((block) => block.type === "tool_use"),
+    ).toBeFalse()
+    expect(
+      translated.content.some(
+        (block) => block.type === "text" && block.text.trim().length > 0,
+      ),
+    ).toBeTrue()
   })
 })
 
@@ -1156,5 +1229,368 @@ describe("Streaming terminating stop_reason — never null/omitted", () => {
     )
 
     expect(finalStreamDelta(state).delta.stop_reason).toBe("end_turn")
+  })
+})
+
+describe("Streaming empty-response safeguards", () => {
+  test("role-only nonterminal chunk does not emit message_start", () => {
+    const state = freshStreamState()
+    const events = translateChunkToAnthropicEvents(
+      {
+        id: "role-only",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "claude-opus-5",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+
+    expect(events).toEqual([])
+    expect(state.messageStartSent).toBeFalse()
+  })
+
+  test("role-only followed by an empty stop remains retry-detectable", () => {
+    const state = freshStreamState()
+    translateChunkToAnthropicEvents(
+      {
+        id: "empty-stop",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "claude-opus-5",
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+
+    const emptyStop: ChatCompletionChunk = {
+      id: "empty-stop",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "claude-opus-5",
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: "stop",
+          logprobs: null,
+        },
+      ],
+    }
+
+    expect(state.messageStartSent).toBeFalse()
+    expect(isEmptyStreamResponse(emptyStop)).toBeTrue()
+  })
+
+  test("whitespace-only stream content does not hide an empty stop", () => {
+    const state = freshStreamState()
+    const whitespaceEvents = translateChunkToAnthropicEvents(
+      {
+        id: "whitespace-only",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "claude-opus-5",
+        choices: [
+          {
+            index: 0,
+            delta: { content: "   " },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+
+    expect(whitespaceEvents).toEqual([])
+    expect(state.messageStartSent).toBeFalse()
+    expect(state.hasEmittedText).toBeFalse()
+
+    const visibleEvents = translateChunkToAnthropicEvents(
+      {
+        id: "whitespace-only",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "claude-opus-5",
+        choices: [
+          {
+            index: 0,
+            delta: { content: "Answer" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      state,
+    )
+    const textDelta = visibleEvents.find(
+      (event) =>
+        event.type === "content_block_delta"
+        && event.delta.type === "text_delta",
+    )
+
+    expect(textDelta?.type).toBe("content_block_delta")
+    if (textDelta?.type === "content_block_delta") {
+      expect(textDelta.delta.type).toBe("text_delta")
+      if (textDelta.delta.type === "text_delta") {
+        expect(textDelta.delta.text).toBe("   Answer")
+      }
+    }
+
+    const terminalWhitespace: ChatCompletionChunk = {
+      id: "terminal-whitespace",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "claude-opus-5",
+      choices: [
+        {
+          index: 0,
+          delta: { content: "   " },
+          finish_reason: "stop",
+          logprobs: null,
+        },
+      ],
+    }
+    expect(isEmptyStreamResponse(terminalWhitespace)).toBeTrue()
+  })
+})
+
+describe("Streaming post-start empty-response safeguards", () => {
+  test("incomplete thinking or whitespace streams recover with visible text", async () => {
+    const thinkingState = freshStreamState()
+    thinkingState.messageStartSent = true
+    thinkingState.contentBlockOpen = true
+    thinkingState.thinkingBlockOpen = true
+    thinkingState.hasEmittedThinking = true
+
+    const whitespaceState = freshStreamState()
+    whitespaceState.messageStartSent = true
+    whitespaceState.contentBlockOpen = true
+    whitespaceState.pendingLeadingText = "\n\n"
+
+    for (const state of [thinkingState, whitespaceState]) {
+      const writes: Array<{ event?: string; data: string }> = []
+      const stream = {
+        writeSSE(event: { event?: string; data: string }): Promise<void> {
+          writes.push(event)
+          return Promise.resolve()
+        },
+      }
+
+      await handleIncompleteStream(stream as never, state)
+      const events = writes.map(
+        (write) =>
+          JSON.parse(write.data) as {
+            type: string
+            delta?: { type?: string; text?: string; stop_reason?: string }
+          },
+      )
+      const fallbackIndex = events.findIndex(
+        (event) =>
+          event.type === "content_block_delta"
+          && event.delta?.type === "text_delta"
+          && Boolean(event.delta.text?.trim()),
+      )
+      const endTurnIndex = events.findIndex(
+        (event) =>
+          event.type === "message_delta"
+          && event.delta?.stop_reason === "end_turn",
+      )
+
+      expect(fallbackIndex).toBeGreaterThanOrEqual(0)
+      expect(endTurnIndex).toBeGreaterThan(fallbackIndex)
+    }
+  })
+
+  test("thinking-only stop emits nonblank fallback text before end_turn", () => {
+    const state = freshStreamState()
+    const translated = [
+      ...translateChunkToAnthropicEvents(
+        {
+          id: "thinking-only",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "claude-opus-5",
+          choices: [
+            {
+              index: 0,
+              delta: { reasoning_content: "I should answer carefully." },
+              finish_reason: null,
+              logprobs: null,
+            },
+          ],
+        },
+        state,
+      ),
+      ...translateChunkToAnthropicEvents(
+        {
+          id: "thinking-only",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "claude-opus-5",
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+              logprobs: null,
+            },
+          ],
+        },
+        state,
+      ),
+      ...flushDeferredFinish(state),
+    ]
+
+    const fallbackIndex = translated.findIndex(
+      (event) =>
+        event.type === "content_block_delta"
+        && event.delta.type === "text_delta"
+        && event.delta.text.trim().length > 0,
+    )
+    const endTurnIndex = translated.findIndex(
+      (event) =>
+        event.type === "message_delta"
+        && event.delta.stop_reason === "end_turn",
+    )
+
+    expect(fallbackIndex).toBeGreaterThanOrEqual(0)
+    expect(endTurnIndex).toBeGreaterThan(fallbackIndex)
+  })
+})
+
+describe("Streaming filtered-response safeguards", () => {
+  test("content_filter without content emits explicit fallback and refusal", () => {
+    const state = freshStreamState()
+    const translated = [
+      ...translateChunkToAnthropicEvents(
+        {
+          id: "filtered",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "claude-opus-5",
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant" },
+              finish_reason: null,
+              logprobs: null,
+            },
+          ],
+        },
+        state,
+      ),
+      ...translateChunkToAnthropicEvents(
+        {
+          id: "filtered",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "claude-opus-5",
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: "content_filter",
+              logprobs: null,
+            },
+          ],
+        },
+        state,
+      ),
+      ...flushDeferredFinish(state),
+    ]
+
+    const fallbackIndex = translated.findIndex(
+      (event) =>
+        event.type === "content_block_delta"
+        && event.delta.type === "text_delta"
+        && event.delta.text.trim().length > 0,
+    )
+    const refusalIndex = translated.findIndex(
+      (event) =>
+        event.type === "message_delta" && event.delta.stop_reason === "refusal",
+    )
+
+    expect(fallbackIndex).toBeGreaterThanOrEqual(0)
+    expect(refusalIndex).toBeGreaterThan(fallbackIndex)
+  })
+
+  test("content_filter terminates a partial tool call as an error", () => {
+    const state = freshStreamState()
+    const translated = [
+      ...translateChunkToAnthropicEvents(
+        {
+          id: "filtered-tool",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "claude-opus-5",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_filtered",
+                    type: "function",
+                    function: { name: "Bash", arguments: '{"command":"id"}' },
+                  },
+                ],
+              },
+              finish_reason: null,
+              logprobs: null,
+            },
+          ],
+        },
+        state,
+      ),
+      ...translateChunkToAnthropicEvents(
+        {
+          id: "filtered-tool",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "claude-opus-5",
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: "content_filter",
+              logprobs: null,
+            },
+          ],
+        },
+        state,
+      ),
+      ...flushDeferredFinish(state),
+    ]
+
+    expect(
+      translated.some((event) => event.type === "message_delta"),
+    ).toBeFalse()
+    expect(
+      translated.some((event) => event.type === "message_stop"),
+    ).toBeFalse()
+    expect(
+      translated.some(
+        (event) =>
+          event.type === "error"
+          && event.error.type === "invalid_request_error"
+          && event.error.message.trim().length > 0,
+      ),
+    ).toBeTrue()
   })
 })
