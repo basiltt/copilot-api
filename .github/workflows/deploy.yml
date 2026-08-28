@@ -45,3 +45,5 @@ jobs:
             systemctl restart copilot-api
             sleep 3
             systemctl is-active copilot-api
+            systemctl restart copilot-api-watchdog
+            systemctl is-active copilot-api-watchdog
