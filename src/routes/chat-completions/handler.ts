@@ -7,6 +7,7 @@ import { awaitApproval } from "~/lib/approval"
 import { resolveModelId } from "~/lib/model-resolver"
 import { selectModelForTokenCount } from "~/lib/model-selector"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
+import { normalizeReasoningEffort } from "~/lib/reasoning-effort"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 import { isNullish } from "~/lib/utils"
@@ -77,6 +78,14 @@ export async function handleCompletion(c: Context) {
   } catch (error) {
     consola.warn("Failed to calculate token count:", error)
   }
+
+  // Resolve against the final target, after the existing context-overflow
+  // selection, and outside its best-effort token-count error handler.
+  payload.reasoning_effort = normalizeReasoningEffort(
+    payload.reasoning_effort,
+    payload.model,
+    { models: state.models, param: "reasoning_effort" },
+  )
 
   if (state.manualApprove) await awaitApproval()
 

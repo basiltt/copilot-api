@@ -63,7 +63,7 @@ export interface ResponsesPayload {
   tools?: Array<ResponsesTool>
   tool_choice?: ChatCompletionsPayload["tool_choice"]
   parallel_tool_calls?: boolean
-  reasoning?: { effort?: string; summary?: string }
+  reasoning?: ChatCompletionsPayload["reasoning"]
   text?: {
     format: {
       type: string
@@ -288,6 +288,9 @@ function buildOptionalScalars(
   // makes Copilot stream reasoning_summary_text.delta events in real time so
   // the thinking block renders incrementally instead of all at once.
   if (isSet(payload.reasoning)) out.reasoning = payload.reasoning
+  if (isSet(payload.reasoning_effort)) {
+    out.reasoning = { ...out.reasoning, effort: payload.reasoning_effort }
+  }
   return out
 }
 
@@ -327,8 +330,8 @@ const RESPONSES_API_EXACT = new Set(["gpt-41-copilot"])
  * to the hardcoded name list only when the catalog is unavailable or silent.
  * The list alone is a maintenance hazard: a model Copilot serves natively on
  * `/responses` but whose name doesn't match a known prefix would be silently
- * downgraded to the lossy translation path (which drops `reasoning`,
- * `parallel_tool_calls`, built-in tools, and emits a reduced event set).
+ * downgraded to the lossy translation path (which drops `parallel_tool_calls`,
+ * built-in tools, and emits a reduced event set).
  */
 export function requiresChatCompletionsApi(
   model: string,
@@ -442,6 +445,14 @@ function applyOptionalPayloadFields(
   if (payload.stream !== undefined) result.stream = payload.stream
   if (payload.stream) {
     result.stream_options = { include_usage: true }
+  }
+  if (payload.reasoning !== undefined) {
+    // Preserve Copilot's reasoning extension (summary and other controls) as
+    // well as the standard Chat Completions effort field.
+    result.reasoning = payload.reasoning
+    if (payload.reasoning?.effort !== undefined) {
+      result.reasoning_effort = payload.reasoning.effort
+    }
   }
 
   applyToolsAndFormat(payload, result)

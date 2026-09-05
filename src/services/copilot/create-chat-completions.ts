@@ -82,12 +82,30 @@ const DETERMINISTIC_BODY_ERROR_SIGNATURES = [
   "exceeds the maximum",
 ] as const
 
-function isDeterministicBodyErrorMessage(message: string): boolean {
+function isDeterministicBodyErrorMessage(
+  message: string,
+  reasoningEffort?: string | null,
+): boolean {
   const lower = message.toLowerCase()
-  return DETERMINISTIC_BODY_ERROR_SIGNATURES.some((sig) => lower.includes(sig))
+  // Match the effort actually sent, without changing unrelated body-error
+  // retries or the Anthropic path (which does not send reasoning_effort).
+  const isEffortError =
+    typeof reasoningEffort === "string"
+    && lower.includes("supported values are:")
+    && (lower.includes(`invalid value: '${reasoningEffort.toLowerCase()}'`)
+      || lower.includes(
+        `unsupported value: '${reasoningEffort.toLowerCase()}'`,
+      ))
+  return (
+    isEffortError
+    || DETERMINISTIC_BODY_ERROR_SIGNATURES.some((sig) => lower.includes(sig))
+  )
 }
 
-async function isRetriableBodyError(response: Response): Promise<boolean> {
+async function isRetriableBodyError(
+  response: Response,
+  reasoningEffort?: string | null,
+): Promise<boolean> {
   if (response.status !== 400) return false
   try {
     const cloned = response.clone()
@@ -100,7 +118,7 @@ async function isRetriableBodyError(response: Response): Promise<boolean> {
     // retrying the same payload — fail fast instead of looping.
     if (
       body.error.message
-      && isDeterministicBodyErrorMessage(body.error.message)
+      && isDeterministicBodyErrorMessage(body.error.message, reasoningEffort)
     ) {
       return false
     }
@@ -303,7 +321,7 @@ export const createChatCompletions = async (
 
     const shouldRetry =
       isRetriableUpstreamStatus(response.status)
-      || (await isRetriableBodyError(response))
+      || (await isRetriableBodyError(response, payload.reasoning_effort))
 
     if (!shouldRetry || attempt === MAX_TRANSIENT_HTTP_RETRIES) {
       inactivity.clear()
@@ -466,6 +484,7 @@ export interface ChatCompletionsPayload {
     | null
   user?: string | null
   stream_options?: { include_usage: boolean } | null
+  reasoning_effort?: string | null
 
   /**
    * Reasoning controls for the Responses API path (gpt-5.x and other reasoning

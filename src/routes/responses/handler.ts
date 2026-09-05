@@ -17,6 +17,7 @@ import {
 } from "~/lib/error"
 import { resolveModelId } from "~/lib/model-resolver"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
+import { normalizeReasoningEffort } from "~/lib/reasoning-effort"
 import { state } from "~/lib/state"
 import { createChatCompletions } from "~/services/copilot/create-chat-completions"
 import {
@@ -69,6 +70,20 @@ export async function handleResponses(c: Context) {
   consola.debug("Responses API request:", JSON.stringify(payload).slice(-400))
 
   const model = resolveAndApplyModel(payload)
+  const reasoning = payload.reasoning
+  if (
+    reasoning !== null
+    && typeof reasoning === "object"
+    && "effort" in reasoning
+  ) {
+    payload.reasoning = {
+      ...reasoning,
+      effort: normalizeReasoningEffort(reasoning.effort, model, {
+        models: state.models,
+        param: "reasoning.effort",
+      }),
+    }
+  }
 
   await checkBurstLimit(state, model)
 

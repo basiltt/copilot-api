@@ -28,6 +28,7 @@ interface ModelSupports {
   tool_calls?: boolean
   parallel_tool_calls?: boolean
   dimensions?: boolean
+  reasoning_effort?: Array<string>
 }
 
 interface ModelCapabilities {

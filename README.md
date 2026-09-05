@@ -477,6 +477,22 @@ More options: [Claude Code settings](https://docs.anthropic.com/en/docs/claude-c
 
 Models declare their `supported_endpoints`. When a model doesn't support `/chat/completions` (e.g. some gpt-5.x variants), the proxy automatically routes through the Responses API with full translation. Claude models go the opposite direction — they're translated from Responses API to Chat Completions.
 
+### Ultra Reasoning Effort
+
+On the OpenAI endpoints, `reasoning.effort: "ultra"` (Responses) and `reasoning_effort: "ultra"` (Chat Completions) are case-insensitive aliases for the target model's highest supported reasoning effort. Normalization happens **before the first upstream request**, for both streaming and non-streaming requests and in either translation direction. For example, `gpt-6-astra` with `"Ultra"` is sent upstream with `"max"`.
+
+The proxy first uses the raw upstream catalog's `capabilities.supports.reasoning_effort` list, ranked `none < minimal < low < medium < high < xhigh < max`, not the list's ordering. This field is defined in the [Copilot client's model capability schema](https://github.com/microsoft/vscode-copilot-chat/blob/main/src/platform/endpoint/common/endpointProvider.ts); the proxy's public `/v1/models` response does not expose it. When the field is absent, these exact, verified model defaults apply:
+
+| Maximum effort | Models |
+|---|---|
+| `max` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
+| `xhigh` | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.4-2026-03-05` |
+| `high` | `gpt-5-mini`, `gpt-5-mini-2025-08-07` |
+
+Explicit catalog metadata takes precedence over these defaults. A non-chat model, an empty or `none`-only effort list, an unrecognized/malformed effort list, or a model with neither effort metadata nor a verified maximum produces HTTP 400 (`invalid_request_error`) before dispatch. The proxy does not guess capabilities from a model-family prefix.
+
+Ultra is not a new upstream value, an error-triggered fallback, or agent delegation. It does not change model identity, context limits, the client catalog, or Anthropic thinking behavior. Other effort values and omitted effort remain unchanged, and other `reasoning` fields are preserved. Effort validation errors are forwarded without trying a different effort; the existing context-overflow model selection remains separate, with normalization using its final target.
+
 ### Context Overflow Auto-Switch
 
 When estimated token count exceeds the requested model's context window, the proxy auto-switches to the largest available model. This prevents context-window errors without client-side changes.

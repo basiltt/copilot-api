@@ -42,7 +42,7 @@ const CATALOG: ModelsResponse = {
 /**
  * Routing decides whether a `/v1/responses` request is passed through natively
  * or translated to Chat Completions.  The translated path is lossy — it drops
- * `reasoning`, `parallel_tool_calls`, and all built-in tools, and emits a
+ * `parallel_tool_calls` and all built-in tools, and emits a
  * reduced SSE event set — so misrouting a natively-capable model silently
  * degrades it.
  */
@@ -64,7 +64,9 @@ describe("requiresChatCompletionsApi — catalog capabilities take precedence", 
 
 describe("requiresChatCompletionsApi — name-list fallback", () => {
   test("falls back to the prefix list when the catalog omits endpoints", () => {
-    expect(requiresChatCompletionsApi("no-endpoints-listed", CATALOG)).toBe(true)
+    expect(requiresChatCompletionsApi("no-endpoints-listed", CATALOG)).toBe(
+      true,
+    )
   })
 
   test("falls back to the prefix list when no catalog is supplied", () => {
