@@ -407,6 +407,29 @@ export async function translateWithWriteRecovery(
   options: RecoveryOptions,
 ): Promise<AnthropicResponse> {
   options.signal.throwIfAborted()
+  if (
+    response.choices.some(
+      (choice) =>
+        typeof choice.message.refusal === "string"
+        || choice.finish_reason === "content_filter",
+    )
+  ) {
+    return translateToAnthropic(
+      {
+        ...response,
+        choices: response.choices.map((choice) => ({
+          ...choice,
+          finish_reason: "content_filter",
+          message: {
+            ...choice.message,
+            content: choice.message.refusal ?? choice.message.content,
+            tool_calls: undefined,
+          },
+        })),
+      },
+      options.map,
+    )
+  }
   try {
     return translateToAnthropic(response, options.map)
   } catch (error) {

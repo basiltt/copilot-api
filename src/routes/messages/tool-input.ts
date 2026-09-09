@@ -67,6 +67,13 @@ function jsonType(value: unknown): string {
   return typeof value
 }
 
+function safeFinishReason(value: string | null): string | null {
+  if (value === null) return null
+  return ["content_filter", "length", "stop", "tool_calls"].includes(value) ?
+      value
+    : "unknown"
+}
+
 // eslint-disable-next-line complexity -- Fixed fields avoid exposing arbitrary schema or candidate data.
 export function logWriteToolSchemaMismatch(
   raw: string,
@@ -96,7 +103,7 @@ export function logWriteToolSchemaMismatch(
   const presentNames = candidate ? Object.keys(candidate) : []
   const declaredNames = properties ? Object.keys(properties) : []
   consola.warn("Write tool schema mismatch", {
-    finishReason,
+    finishReason: safeFinishReason(finishReason),
     candidateType: candidate ? "object" : "invalid",
     filePathDeclared: Boolean(
       properties && Object.hasOwn(properties, "file_path"),

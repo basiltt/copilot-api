@@ -399,6 +399,24 @@ describe("bounded Write missing-content recovery", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2)
   })
 
+  test.each(["Declined", ""])(
+    "valid Write arguments with refusal %j never emit a tool",
+    async (refusal) => {
+      const result = completion(
+        '{"file_path":"src/generated.ts","content":"ready"}',
+        { finishReason: "stop" },
+      )
+      result.choices[0].message.refusal = refusal
+      queue(result)
+      const response = await send()
+      const raw = await response.text()
+      expect(response.status).toBe(200)
+      expect(raw).toContain('"stop_reason":"refusal"')
+      expect(raw).not.toContain('"type":"tool_use"')
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    },
+  )
+
   test("correction-time upstream policy details retain their status", async () => {
     queue(
       completion('{"file_path":"src/generated.ts"}'),
@@ -544,6 +562,28 @@ describe("bounded Write missing-content recovery", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 
+  test("StructuredOutput buffering cannot enable Write recovery for an original stream", async () => {
+    const request = payload(true)
+    request.tools?.push({
+      name: "StructuredOutput",
+      input_schema: {
+        type: "object",
+        properties: { answer: { type: "string" } },
+        required: ["answer"],
+      },
+    })
+    state.structuredOutputRecovery = true
+    expect(usesWriteToolRecovery(request)).toBe(false)
+    queue(completion('{"file_path":"src/generated.ts"}'))
+
+    const response = await send(request)
+    const output = await response.text()
+    expect(response.status).toBe(200)
+    expect(output).toContain('"type":"error"')
+    expect(output).not.toContain('"type":"tool_use"')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
   test("diagnostics expose only fixed Write metadata", async () => {
     const privatePath = String.raw`C:\private\secret.ts`
     queue(completion(JSON.stringify({ file_path: privatePath })))
@@ -554,6 +594,31 @@ describe("bounded Write missing-content recovery", () => {
     expect(captured).toContain('"missingRequiredCount":1')
     expect(captured).not.toContain(privatePath)
     expect(captured).not.toContain("secret.ts")
+  })
+
+  test("diagnostics redact unknown finish reasons and arbitrary schema fields", async () => {
+    const finishMarker = "PRIVATE_FINISH_MARKER"
+    const privateName = "private@example.invalid"
+    const privateValue = "PRIVATE_ENUM_VALUE"
+    const inputSchema = {
+      ...schema,
+      properties: {
+        ...schema.properties,
+        [privateName]: { type: "string", enum: [privateValue] },
+      },
+      required: ["file_path", "content", privateName],
+    }
+    const result = completion('{"file_path":"src/generated.ts"}')
+    result.choices[0].finish_reason =
+      finishMarker as ChatCompletionResponse["choices"][number]["finish_reason"]
+    queue(result)
+    const response = await send(payload(false, inputSchema))
+    expect(response.status).toBe(502)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"finishReason":"unknown"')
+    for (const sensitive of [finishMarker, privateName, privateValue])
+      expect(captured).not.toContain(sensitive)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 })
 

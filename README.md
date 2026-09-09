@@ -596,12 +596,14 @@ including response-body reading. It does not use nested transport, image, or
 empty-response retries. Streaming `Write` requests keep the existing strict SSE
 behavior and are never buffered for this feature. The proxy only validates and
 returns tool input: it never executes `Write`, changes caller permissions, or
-assumes execution authority. Fixed-name diagnostics report only booleans, JSON
-type labels, finish reason, and bounded property counts—never paths, contents,
-values, lengths, hashes, arbitrary property names, schemas, or AJV parameters.
-This is a guarded mitigation for the standard missing-`content` case, not a
-guarantee to repair every `Write` failure or evidence about a historical
-payload whose exact arguments were not retained.
+assumes execution authority. Nonstreaming schema-mismatch diagnostics report
+only fixed-name booleans, JSON type labels, a controlled finish reason, and
+bounded property counts—never paths, contents, values, lengths, hashes,
+arbitrary property names, schemas, or AJV parameters. Streaming keeps its
+existing strict error path without this additional metadata. This is a guarded
+mitigation for the standard missing-`content` case, not a guarantee to repair
+every `Write` failure or evidence about a historical payload whose exact
+arguments were not retained.
 
 ### Optional StructuredOutput recovery
 

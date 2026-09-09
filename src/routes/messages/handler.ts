@@ -451,10 +451,17 @@ const completeOutputTool: OutputCompletion = async (request, requestSignal) => {
 async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
   const disconnect = new AbortController()
   const signal = AbortSignal.any([c.req.raw.signal, disconnect.signal])
+  const structuredOutputAllowed = usesStructuredOutputRecovery(payload)
+  const writeAllowed = usesWriteToolRecovery(payload)
   const run = () =>
     fetchNonStreamingAnthropicResponse(
       { ...payload, stream: false },
-      { signal, complete: completeOutputTool },
+      {
+        signal,
+        complete: completeOutputTool,
+        structuredOutputAllowed,
+        writeAllowed,
+      },
     )
   if (payload.stream) {
     return streamSSE(c, async (stream) => {
@@ -1003,9 +1010,16 @@ export function buildSyntheticCompactionResponse(
   }
 }
 
+interface NonStreamingRecoveryOptions {
+  signal: AbortSignal
+  complete: OutputCompletion
+  structuredOutputAllowed: boolean
+  writeAllowed: boolean
+}
+
 async function fetchNonStreamingAnthropicResponse(
   anthropicPayload: AnthropicMessagesPayload,
-  outputRecovery?: { signal: AbortSignal; complete: OutputCompletion },
+  outputRecovery?: NonStreamingRecoveryOptions,
 ): Promise<AnthropicResponse> {
   let preparedPayload = anthropicPayload
   const initial = new AbortController()
@@ -1067,7 +1081,7 @@ async function fetchNonStreamingAnthropicResponse(
   let anthropicResponse: AnthropicResponse
   if (!outputRecovery) {
     anthropicResponse = translateToAnthropic(response, toolNameMap)
-  } else if (usesWriteToolRecovery(preparedPayload)) {
+  } else if (outputRecovery.writeAllowed) {
     try {
       anthropicResponse = await translateWithWriteRecovery(
         preparedPayload,
@@ -1077,7 +1091,7 @@ async function fetchNonStreamingAnthropicResponse(
     } catch (error) {
       if (
         !(error instanceof ToolSchemaMismatchError)
-        || !usesStructuredOutputRecovery(preparedPayload)
+        || !outputRecovery.structuredOutputAllowed
       )
         throw error
       anthropicResponse = await translateWithOutputRecovery(
