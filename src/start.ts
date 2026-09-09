@@ -98,7 +98,7 @@ function configureSearchProvider(): void {
   }
   if (provider === "copilot") {
     consola.info(
-      "Experimental Copilot native search selected; each search requires an advertised bing-search skill. No third-party fallback.",
+      "Copilot native MCP search selected; each search requires advertised read-only web_search. No third-party fallback.",
     )
   } else if (provider === "off") {
     consola.info("Web search disabled")

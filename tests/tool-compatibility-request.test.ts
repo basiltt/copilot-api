@@ -23,6 +23,8 @@ import {
 } from "~/services/copilot/get-models"
 import { translateToResponsesPayload } from "~/services/copilot/responses-translation"
 
+import { createNativeMcpFixture } from "./fixtures/native-mcp"
+
 const app = new Hono().route("/v1/messages", messageRoutes)
 const originalState = { ...state }
 let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">> | undefined
@@ -157,32 +159,6 @@ async function send(payload: AnthropicMessagesPayload) {
   })
 }
 
-function nativeSearchStream(extra: Record<string, unknown> = {}) {
-  return new Response(
-    `data: ${JSON.stringify({
-      copilot_references: [
-        {
-          type: "github.web-search",
-          id: "source",
-          data: {
-            type: "web-search",
-            query: "example",
-            results: [
-              {
-                title: "Example reference",
-                url: "https://example.com/docs",
-                excerpt: "Documented source excerpt.",
-              },
-            ],
-          },
-        },
-      ],
-      ...extra,
-    })}\n\ndata: [DONE]\n\n`,
-    { headers: { "content-type": "text/event-stream" } },
-  )
-}
-
 describe("native server search through Messages route", () => {
   test.each([false, true])(
     "search coexists with client calls (stream=%s) without fabricated client results",
@@ -190,24 +166,15 @@ describe("native server search through Messages route", () => {
       mockUpstream(Response.json(completion("{}")))
       state.webSearchProvider = "copilot"
       state.githubToken = "test-github-login"
+      const native = createNativeMcpFixture({ sse: stream })
       let chatCalls = 0
       const urls: Array<string> = []
       fetchSpy?.mockImplementation(
         Object.assign(
           (url: string | URL | Request, init?: RequestInit) => {
             urls.push(urlText(url))
-            if (urlText(url).endsWith("/skills"))
-              return Promise.resolve(
-                Response.json({ skills: [{ slug: "bing-search" }] }),
-              )
-            if (urlText(url).endsWith("/agents/chat")) {
-              const body = upstreamBody(init?.body)
-              expect(body.copilot_skills).toEqual(["bing-search"])
-              expect(new Headers(init?.headers).get("authorization")).toBe(
-                "Bearer test-github-login",
-              )
-              return Promise.resolve(nativeSearchStream())
-            }
+            const nativeResponse = native.handle(url, init)
+            if (nativeResponse) return Promise.resolve(nativeResponse)
             chatCalls++
             const body = upstreamBody(init?.body)
             const internal = searchName(body)
@@ -239,7 +206,11 @@ describe("native server search through Messages route", () => {
       expect(text).toContain('"stop_reason":"tool_use"')
       expect(text).toContain("web_search_result_location")
       expect(chatCalls).toBe(1)
-      expect(urls.filter((url) => url.endsWith("/agents/chat"))).toHaveLength(1)
+      expect(
+        native.calls.filter((call) => call.method === "tools/call"),
+      ).toHaveLength(1)
+      expect(text).toContain("Copilot-generated search summary")
+      expect(text).toContain('"cited_text":""')
       expect(
         urls.every((url) => url.startsWith("https://api.githubcopilot.com/")),
       ).toBe(true)
@@ -250,19 +221,13 @@ describe("native server search through Messages route", () => {
     mockUpstream(Response.json(completion("{}")))
     state.webSearchProvider = "copilot"
     state.githubToken = "test-github-login"
-    let searches = 0
+    const native = createNativeMcpFixture()
     let completions = 0
     fetchSpy?.mockImplementation(
       Object.assign(
         (url: string | URL | Request, init?: RequestInit) => {
-          if (urlText(url).endsWith("/skills"))
-            return Promise.resolve(
-              Response.json({ skills: [{ slug: "bing-search" }] }),
-            )
-          if (urlText(url).endsWith("/agents/chat")) {
-            searches++
-            return Promise.resolve(nativeSearchStream())
-          }
+          const nativeResponse = native.handle(url, init)
+          if (nativeResponse) return Promise.resolve(nativeResponse)
           const body = upstreamBody(init?.body)
           completions++
           if (completions === 1) {
@@ -305,63 +270,39 @@ describe("native server search through Messages route", () => {
     const body = (await result.json()) as AnthropicResponse
     expect(JSON.stringify(body)).toContain("max_uses_exceeded")
     expect(body.stop_reason).toBe("end_turn")
-    expect(searches).toBe(1)
+    expect(
+      native.calls.filter((call) => call.method === "tools/call"),
+    ).toHaveLength(1)
     expect(completions).toBe(2)
   })
 
-  test.each(["missing-skill", "error-frame", "no-references", "confirmation"])(
+  test.each(["missing-tool", "error-frame", "malformed-result", "tool-error"])(
     "%s is a visible search failure, never a silent empty success",
     async (scenario) => {
       mockUpstream(Response.json(completion("{}")))
       state.webSearchProvider = "copilot"
       state.githubToken = "test-github-login"
+      const native = createNativeMcpFixture({
+        ...(scenario === "missing-tool" ? { pages: [{ tools: [] }] } : {}),
+        ...(scenario === "error-frame" ?
+          { rpcError: { code: -32001, message: "policy_denied" } }
+        : {}),
+        ...(scenario === "malformed-result" ? { result: { content: [] } } : {}),
+        ...(scenario === "tool-error" ?
+          {
+            result: {
+              isError: true,
+              content: [{ type: "text", text: "policy_denied" }],
+            },
+          }
+        : {}),
+      })
       let count = 0
       fetchSpy?.mockImplementation(
         Object.assign(
-          (url: string | URL | Request) => {
-            if (urlText(url).endsWith("/skills"))
-              return Promise.resolve(
-                Response.json({
-                  skills:
-                    scenario === "missing-skill" ?
-                      []
-                    : [{ slug: "bing-search" }],
-                }),
-              )
-            if (urlText(url).endsWith("/agents/chat")) {
-              if (scenario === "error-frame")
-                return Promise.resolve(
-                  nativeSearchStream({
-                    copilot_references: [],
-                    copilot_errors: [
-                      {
-                        type: "policy",
-                        code: "policy_denied",
-                        message: "Search blocked by policy.",
-                        agent: "bing-search",
-                      },
-                    ],
-                  }),
-                )
-              if (scenario === "confirmation")
-                return Promise.resolve(
-                  nativeSearchStream({
-                    copilot_confirmation: { title: "Authorize" },
-                  }),
-                )
-              return Promise.resolve(
-                nativeSearchStream({
-                  copilot_references: [],
-                  choices: [
-                    {
-                      delta: {
-                        content: "Fabricated prose URL https://example.net",
-                      },
-                    },
-                  ],
-                }),
-              )
-            }
+          (url: string | URL | Request, init?: RequestInit) => {
+            const nativeResponse = native.handle(url, init)
+            if (nativeResponse) return Promise.resolve(nativeResponse)
             count++
             if (count > 1) {
               const result = completion("{}")
@@ -387,7 +328,7 @@ describe("native server search through Messages route", () => {
       ]
       const result = await send(payload)
       const text = await result.text()
-      if (scenario === "error-frame") {
+      if (scenario === "error-frame" || scenario === "tool-error") {
         expect(result.status).toBe(502)
         expect(text).toContain("policy_denied")
       } else {

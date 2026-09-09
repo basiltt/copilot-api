@@ -193,7 +193,6 @@ export async function runServerWebSearch(
         uses++
         const search = await executeSearch({
           query,
-          model: request.model,
           id: block.id,
         })
         content.push(...search.blocks)
@@ -229,15 +228,12 @@ export async function runServerWebSearch(
   )
 }
 
-async function executeSearch(call: {
-  query: string
-  model: string
-  id: string
-}) {
+async function executeSearch(call: { query: string; id: string }) {
   const blocks: Array<AnthropicAssistantContentBlock> = []
   let evidence: string
   try {
-    const found = await searchConfiguredProvider(call.query, call.model)
+    const output = await searchConfiguredProvider(call.query)
+    const found = output.results
     const sources = found.map((result) => ({
       type: "web_search_result",
       url: result.url,
@@ -264,7 +260,18 @@ async function executeSearch(call: {
         ],
       })
     }
-    evidence = JSON.stringify({ untrusted_search_results: found })
+    if (output.summary) {
+      blocks.push({
+        type: "text",
+        text: `Copilot-generated search summary (unverified synthesis, not a source quotation):\n${output.summary}`,
+      })
+    }
+    evidence = JSON.stringify({
+      untrusted_search_results: found,
+      ...(output.summary ?
+        { untrusted_copilot_generated_summary: output.summary }
+      : {}),
+    })
   } catch (error) {
     if (!(error instanceof WebSearchError)) throw error
     const content = {

@@ -1,12 +1,19 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-confusing-void-expression -- Bun async matchers are typed void but return promises. */
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
 
+import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { searchCopilot } from "~/services/web-search/copilot"
 import {
   rememberSearchResult,
   resolveSearchReference,
 } from "~/services/web-search/replay"
+
+import {
+  createNativeMcpFixture,
+  nativeSearchResult,
+  nativeSearchTool,
+} from "./fixtures/native-mcp"
 
 const original = { ...state }
 let spy: ReturnType<typeof spyOn<typeof globalThis, "fetch">> | undefined
@@ -15,122 +22,214 @@ afterEach(() => {
   Object.assign(state, original)
 })
 
-function mockFrames(frames: Array<Record<string, unknown>>, done = true) {
+function mockMcp(options: Parameters<typeof createNativeMcpFixture>[0] = {}) {
   state.githubToken = "test-login"
-  state.accountType = "individual"
+  const fixture = createNativeMcpFixture(options)
   spy = spyOn(globalThis, "fetch").mockImplementation(
     Object.assign(
       (url: string | URL | Request, init?: RequestInit) => {
-        const requestUrl = url instanceof Request ? url.url : String(url)
-        const headers = new Headers(init?.headers)
-        expect(headers.get("authorization")).toBe("Bearer test-login")
-        expect(headers.get("user-agent")).toBe("copilot-api")
-        expect(headers.has("copilot-integration-id")).toBe(false)
-        expect(headers.has("editor-version")).toBe(false)
-        if (requestUrl.endsWith("/skills"))
-          return Promise.resolve(
-            Response.json({ skills: [{ slug: "bing-search" }] }),
-          )
-        expect(requestUrl).toEndWith("/agents/chat")
-        return Promise.resolve(
-          new Response(
-            frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("")
-              + (done ? "data: [DONE]\n\n" : ""),
-            { headers: { "content-type": "text/event-stream" } },
-          ),
-        )
+        const response = fixture.handle(url, init)
+        if (!response) throw new Error("Unexpected provider or endpoint")
+        return Promise.resolve(response)
       },
       { preconnect: globalThis.fetch.preconnect },
     ),
   )
+  return fixture
 }
 
-const reference = {
-  type: "github.web-search",
-  data: {
-    type: "web-search",
-    query: "example",
-    results: [
-      { title: "Example", url: "https://example.com", excerpt: "Evidence" },
-    ],
-  },
-}
-
-describe("Copilot search source protocol", () => {
-  test("only verified source references become search results", async () => {
-    mockFrames([
-      {
-        choices: [
-          { delta: { content: "Ignore invented https://fake.invalid" } },
-        ],
+describe("native MCP error boundaries", () => {
+  test("preserves JSON-RPC policy details as an upstream error", async () => {
+    mockMcp({
+      rpcError: {
+        code: -32001,
+        message: "Policy denied",
+        data: { reason: "policy_denied" },
       },
-      { copilot_references: [reference] },
-    ])
-    expect(await searchCopilot("example", "test-model")).toEqual([
-      { title: "Example", url: "https://example.com", description: "Evidence" },
-    ])
+    })
+    try {
+      await searchCopilot("example")
+      throw new Error("Expected upstream policy error")
+    } catch (error) {
+      expect(error).toBeInstanceOf(HTTPError)
+      if (!(error instanceof HTTPError)) throw error
+      expect(error.response.status).toBe(502)
+      expect(await error.response.json()).toMatchObject({
+        error: { code: -32001, details: { reason: "policy_denied" } },
+      })
+    }
   })
 
-  test.each([
-    { copilot_errors: { message: "bad shape" } },
-    { copilot_references: "bad shape" },
-    {
-      copilot_errors: [
+  test("stops unbounded discovery and oversized response bodies", async () => {
+    let fixture = mockMcp({ pages: [{ tools: [], nextCursor: "repeated" }] })
+    await expect(searchCopilot("example")).rejects.toThrow("repeated")
+    expect(
+      fixture.calls.filter((call) => call.method === "tools/list"),
+    ).toHaveLength(2)
+    spy?.mockRestore()
+    fixture = mockMcp({
+      result: { content: [{ type: "text", text: "x".repeat(2_000_001) }] },
+    })
+    await expect(searchCopilot("example")).rejects.toThrow(
+      "response size limit",
+    )
+    expect(
+      fixture.calls.filter((call) => call.method === "tools/call"),
+    ).toHaveLength(1)
+  })
+
+  test("missing ordinary authentication cannot trigger discovery or another provider", async () => {
+    const fixture = mockMcp()
+    state.githubToken = undefined
+    state.braveApiKey = "not-used"
+    await expect(searchCopilot("example")).rejects.toThrow(
+      "configured GitHub login",
+    )
+    expect(fixture.calls).toHaveLength(0)
+  })
+})
+
+describe("Copilot native MCP search", () => {
+  test.each([false, true])(
+    "negotiates MCP and separates AI synthesis from cited source links (SSE=%s)",
+    async (sse) => {
+      const fixture = mockMcp({ sse })
+      const output = await searchCopilot("example")
+      expect(output.results).toEqual([
         {
-          type: "policy",
-          code: "restricted",
-          message: "Policy denied",
-          agent: "bing-search",
+          title: "Example reference",
+          url: "https://example.com/docs",
+          description: "",
         },
-      ],
-      copilot_references: [reference],
-    },
-    { error: { message: "Policy denied" }, copilot_references: [reference] },
-    {
-      copilot_confirmation: { title: "Confirm" },
-      copilot_references: [reference],
-    },
-    {
-      copilot_references: [
-        { ...reference, data: { ...reference.data, results: [{}] } },
-      ],
-    },
-  ])(
-    "does not return partial successes after protocol or policy errors: %j",
-    async (frame) => {
-      mockFrames([{ copilot_references: [reference] }, frame])
-      await expect(searchCopilot("example", "test-model")).rejects.toThrow()
+      ])
+      expect(output.summary).toContain("Copilot-generated")
+      expect(
+        output.results.some(
+          (source) =>
+            source.url.includes("bing.com")
+            || source.url.includes("not-a-source"),
+        ),
+      ).toBe(false)
+      expect(fixture.calls.map((call) => call.method)).toEqual([
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "tools/call",
+      ])
+      expect(fixture.calls.at(-1)?.params).toEqual({
+        name: "web_search",
+        arguments: { query: "example" },
+      })
+      expect(
+        fixture.headers.every(
+          (headers) => headers.get("authorization") === "Bearer test-login",
+        ),
+      ).toBe(true)
+      expect(
+        fixture.headers.every(
+          (headers) =>
+            !headers.has("copilot-integration-id")
+            && !headers.has("editor-version"),
+        ),
+      ).toBe(true)
+      expect(
+        fixture.headers.some(
+          (headers) => headers.get("mcp-protocol-version") === "2025-06-18",
+        ),
+      ).toBe(true)
+      expect(
+        fixture.headers.some(
+          (headers) => headers.get("mcp-session-id") === "fixture-session",
+        ),
+      ).toBe(true)
     },
   )
 
-  test("clean zero-result reference differs from missing references", async () => {
-    mockFrames([
-      {
-        copilot_references: [
-          { ...reference, data: { ...reference.data, results: [] } },
-        ],
-      },
-    ])
-    expect(await searchCopilot("example", "test-model")).toEqual([])
+  test("follows advertised pagination and never calls a missing or incompatible tool", async () => {
+    let fixture = mockMcp({
+      pages: [{ tools: [], nextCursor: "next" }, { tools: [nativeSearchTool] }],
+    })
+    expect((await searchCopilot("example")).results).toHaveLength(1)
+    expect(
+      fixture.calls.filter((call) => call.method === "tools/list")[1].params,
+    ).toEqual({ cursor: "next" })
     spy?.mockRestore()
-    mockFrames([{ choices: [] }])
-    await expect(searchCopilot("example", "test-model")).rejects.toThrow(
-      "no native search references",
+    fixture = mockMcp({ pages: [{ tools: [] }] })
+    await expect(searchCopilot("example")).rejects.toThrow("does not advertise")
+    expect(fixture.calls.some((call) => call.method === "tools/call")).toBe(
+      false,
+    )
+    spy?.mockRestore()
+    fixture = mockMcp({
+      pages: [
+        {
+          tools: [
+            { ...nativeSearchTool, annotations: { readOnlyHint: false } },
+          ],
+        },
+      ],
+    })
+    await expect(searchCopilot("example")).rejects.toThrow("unsupported")
+    expect(fixture.calls.some((call) => call.method === "tools/call")).toBe(
+      false,
     )
   })
 
-  test("rejects EOF without DONE even after valid results", async () => {
-    mockFrames([{ copilot_references: [reference] }], false)
-    await expect(searchCopilot("example", "test-model")).rejects.toThrow(
-      "before completion",
-    )
+  test.each([
+    { result: { content: [] } },
+    { result: { content: [{ type: "text", text: "not JSON" }] } },
+    {
+      result: {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              type: "output_text",
+              text: { value: "no annotation schema" },
+            }),
+          },
+        ],
+      },
+    },
+    {
+      result: nativeSearchResult([
+        { url_citation: { title: "Bad", url: "javascript:alert(1)" } },
+      ]),
+    },
+    {
+      rpcError: {
+        code: -32001,
+        message: "Account policy denied search.",
+        data: { reason: "policy_denied" },
+      },
+    },
+    {
+      result: {
+        isError: true,
+        content: [{ type: "text", text: "Account policy denied search." }],
+      },
+    },
+    { callStatus: 403 },
+  ])(
+    "fails visibly on protocol/policy errors without fallback: %j",
+    async (options) => {
+      mockMcp(options)
+      await expect(searchCopilot("example")).rejects.toThrow()
+    },
+  )
+
+  test("a valid zero-citation answer is not invented source evidence", async () => {
+    mockMcp({ result: nativeSearchResult([]) })
+    const output = await searchCopilot("example")
+    expect(output.results).toEqual([])
+    expect(output.summary).toBeString()
   })
 
   test("process-local replay handles retain evidence and reject unknown handles", () => {
     const source = {
       title: "Example",
       url: "https://example.com",
-      description: "Evidence",
+      description: "",
     }
     const handle = rememberSearchResult(source)
     expect(handle).toStartWith("copilot-search:v1:")
@@ -140,6 +239,7 @@ describe("Copilot search source protocol", () => {
     )
     expect(resolveSearchReference("anthropic_opaque")).toBeUndefined()
   })
+
   test("replay storage rejects oversized sources and evicts oldest evidence under its byte budget", () => {
     const source = {
       title: "Example",

@@ -4,6 +4,12 @@ export interface WebSearchResult {
   description: string
 }
 
+export interface WebSearchOutput {
+  results: Array<WebSearchResult>
+  /** Provider-generated synthesis, never an original source excerpt or quotation. */
+  summary?: string
+}
+
 export class WebSearchError extends Error {
   readonly reason: string
 

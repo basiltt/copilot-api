@@ -263,7 +263,7 @@ Create a `.env` file in the project root. It is gitignored.
 
 ```env
 # Web Search (optional — pick one)
-WEB_SEARCH_PROVIDER=copilot      # Experimental native search; requires account bing-search skill
+WEB_SEARCH_PROVIDER=copilot      # Native GitHub MCP search; requires advertised web_search
 # WEB_SEARCH_PROVIDER=tavily     # Requires TAVILY_API_KEY
 # WEB_SEARCH_PROVIDER=brave      # Requires BRAVE_API_KEY
 # WEB_SEARCH_PROVIDER=off        # Disable even when keys are present
@@ -434,22 +434,36 @@ incoming-request rate limiter.
 
 ### Setup
 
-**Copilot native (experimental, no unrelated search API key):** set
-`WEB_SEARCH_PROVIDER=copilot` and use the proxy's existing GitHub login. Before
-each query the adapter requests `GET /skills` with that GitHub user's bearer token
-and requires an advertised `bing-search` skill. It then uses
-`POST /agents/chat` with `copilot_skills: ["bing-search"]`. Only genuine
-`copilot_references` of type `github.web-search` become sources; generated prose
-is never treated as a search result. Missing skill, permission/policy errors,
-authorization confirmations, missing references, and incomplete streams fail
-visibly. Organization/account policy remains authoritative.
+**Copilot native (no unrelated search API key):** set
+`WEB_SEARCH_PROVIDER=copilot` and use the proxy's existing GitHub login. The
+official MCP client SDK initializes a Streamable HTTP connection to GitHub's
+documented `https://api.githubcopilot.com/mcp/x/all` endpoint using that user's
+ordinary bearer token. It follows `tools/list` pagination and requires the
+advertised read-only `web_search` tool with its `query` input, then invokes only
+`web_search({query})`. The adapter does not expose or invoke the other MCP tools.
+Protocol negotiation, session headers, JSON responses, and SSE are handled by
+the SDK; requests have a 90-second total deadline and bounded response bodies.
 
-This is a **source-backed, undocumented VS Code remote-agent protocol**, not a
-promise that every Copilot plan, host, or model supports search. Its fixture tests
-do not establish availability for your account. It does not enable search by
-passing an Anthropic/OpenAI tool type blindly to `/chat/completions` or `/responses`.
-No token, entitlement, privileged-header, or confirmation bypass is attempted.
-Selecting Copilot never falls back to third parties, even if their keys exist.
+Source links come exclusively from the native result's
+`text.annotations[].url_citation`, never from URLs in generated prose or
+`bing_searches`. This endpoint supplies **AI synthesis plus source links, not
+original source excerpts**. The synthesis is separately labeled
+Copilot-generated/unverified and treated as untrusted evidence; source
+descriptions and citation `cited_text` remain empty when no excerpt exists.
+Do not treat the generated answer as a quotation or authoritative model metadata.
+
+A harmless live adapter query successfully returned an official source link on
+September 9, 2026. Availability still depends on the configured login, host, and
+organization policy; this does not establish access for a deployed server's
+account. Missing tools and malformed result schemas fail visibly. HTTP,
+JSON-RPC, and tool-level policy errors are preserved. The legacy `/skills` /
+`bing-search` capability is **not** a prerequisite: an account may advertise
+native MCP search without that older skill.
+
+No token, entitlement, privileged-header, confirmation, or account-switching
+bypass is attempted. Selecting Copilot never falls back to third parties, even
+if their keys exist, and never blindly forwards a search tool type to
+`/chat/completions` or `/responses`.
 
 **Explicit alternatives:** set `WEB_SEARCH_PROVIDER=tavily` with `TAVILY_API_KEY`,
 or `WEB_SEARCH_PROVIDER=brave` with `BRAVE_API_KEY`. With no provider selector,
@@ -482,10 +496,12 @@ Restarting the proxy or eviction beyond 2,000 sources / 8MB total expires them:
 search again. Individual replay records over 64KB fail explicitly.
 Retrieved content is untrusted evidence, not instructions.
 
-Native protocol sources (reviewed September 9, 2026): pinned
-[VS Code remoteAgents.ts](https://github.com/microsoft/vscode-copilot-chat/blob/5863f5a7088958050792b5dccbe8b46c6e13eccc/src/extension/conversation/vscode-node/remoteAgents.ts),
-[@vscode/copilot-api 0.5.2](https://www.npmjs.com/package/@vscode/copilot-api/v/0.5.2),
-and [upstream reference-stream fixture](https://github.com/microsoft/vscode-copilot-chat/blob/5863f5a7088958050792b5dccbe8b46c6e13eccc/src/extension/completions-core/vscode-node/lib/src/openai/test/stream.test.ts).
+Native protocol sources (reviewed September 9, 2026):
+[GitHub remote MCP server and documented toolset URLs](https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md),
+[MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports),
+and the [official TypeScript SDK client](https://github.com/modelcontextprotocol/typescript-sdk/blob/v1.x/docs/client.md).
+The exact `web_search` capability and answer/citation schema were also confirmed
+through ordinary authenticated discovery and one harmless native query.
 
 ## Anthropic tool compatibility
 
