@@ -1,13 +1,14 @@
 import type { Context } from "hono"
 
 import consola from "consola"
-import { streamSSE, type SSEMessage } from "hono/streaming"
+import { type SSEMessage } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { resolveModelId } from "~/lib/model-resolver"
 import { selectModelForTokenCount } from "~/lib/model-selector"
-import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
+import { checkAdmission } from "~/lib/rate-limit"
 import { normalizeReasoningEffort } from "~/lib/reasoning-effort"
+import { streamSSE, throwIfRequestAborted } from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
 import { isNullish } from "~/lib/utils"
@@ -34,8 +35,6 @@ function withResolvedModel(
 }
 
 export async function handleCompletion(c: Context) {
-  await checkRateLimit(state)
-
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
 
@@ -43,7 +42,7 @@ export async function handleCompletion(c: Context) {
   // `claude-opus-4.8`) to a real Copilot model before lookup or forwarding.
   payload = withResolvedModel(payload)
 
-  await checkBurstLimit(state, payload.model)
+  await checkAdmission(state, { model: payload.model })
 
   // Find the selected model
   let selectedModel = state.models?.data.find(
@@ -116,6 +115,7 @@ export async function handleCompletion(c: Context) {
   return streamSSE(c, async (stream) => {
     let sentDone = false
     for await (const chunk of response) {
+      throwIfRequestAborted()
       consola.debug("Streaming chunk:", JSON.stringify(chunk))
       // Forward the terminal `[DONE]` sentinel, then stop iterating rather than
       // waiting for the upstream HTTP connection to close (which can hang if

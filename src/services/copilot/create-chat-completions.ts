@@ -1,9 +1,15 @@
 import consola from "consola"
-import { events } from "fetch-event-stream"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
+import { abortableDelay, requestSignal } from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
+import {
+  createInactivityAbort,
+  fetchWithInactivity,
+  readResponseBody,
+  responseEvents,
+} from "~/lib/upstream-lifecycle"
 
 import {
   translateToResponsesPayload,
@@ -12,55 +18,9 @@ import {
   createResponsesStreamState,
 } from "./responses-translation"
 
-// Inactivity timeout for upstream fetches.  Unlike AbortSignal.timeout() which
-// is a hard wall-clock deadline, this resets every time data arrives — so a
-// slow-but-active stream (e.g. a 6000-line Write tool call) won't be killed
-// as long as chunks keep flowing.  The timeout only fires when the upstream
-// goes completely silent for this duration, indicating a stalled connection.
-const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes of silence
 const MAX_TRANSIENT_HTTP_RETRIES = 5
 const BASE_HTTP_RETRY_DELAY_MS = 750
 const RETRIABLE_UPSTREAM_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
-
-/**
- * Creates an AbortController with an inactivity timer that resets on each
- * call to `keepAlive()`.  If no keepAlive is received within `timeoutMs`,
- * the controller aborts with a descriptive TimeoutError.
- *
- * Call `clear()` when the operation finishes to prevent the timer from
- * firing after the stream is fully consumed.
- */
-function createInactivityAbort(timeoutMs: number = INACTIVITY_TIMEOUT_MS) {
-  const controller = new AbortController()
-  let timer: ReturnType<typeof setTimeout> | undefined
-
-  const schedule = () => {
-    if (timer !== undefined) clearTimeout(timer)
-    timer = setTimeout(() => {
-      const error = new Error(
-        `Upstream connection inactive for ${Math.round(timeoutMs / 1000)}s`,
-      )
-      error.name = "TimeoutError"
-      controller.abort(error)
-    }, timeoutMs)
-  }
-
-  // Start the initial timer immediately
-  schedule()
-
-  return {
-    signal: controller.signal,
-    /** Reset the inactivity timer — call on every received chunk. */
-    keepAlive: schedule,
-    /** Cancel the timer (call when the stream ends normally). */
-    clear: () => {
-      if (timer !== undefined) {
-        clearTimeout(timer)
-        timer = undefined
-      }
-    },
-  }
-}
 
 function isRetriableUpstreamStatus(status: number): boolean {
   return RETRIABLE_UPSTREAM_STATUS_CODES.has(status)
@@ -149,10 +109,6 @@ function getTransientRetryDelayMs(response: Response, attempt: number): number {
   )
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 function buildRequestHeaders(
   payload: ChatCompletionsPayload,
 ): Record<string, string> {
@@ -185,14 +141,18 @@ export const createResponsesCompletion = async (
 
   const inactivity = createInactivityAbort()
 
-  const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(responsesPayload),
-    signal: inactivity.signal,
-    // @ts-expect-error — Bun-specific option
-    timeout: false,
-  })
+  const response = await fetchWithInactivity(
+    `${copilotBaseUrl(state)}/responses`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(responsesPayload),
+      signal: inactivity.signal,
+      // @ts-expect-error — Bun-specific option
+      timeout: false,
+    },
+    inactivity,
+  )
 
   // Headers arrived — reset the inactivity timer
   inactivity.keepAlive()
@@ -212,7 +172,7 @@ export const createResponsesCompletion = async (
         consola.debug("[responses-stream] Starting stream iteration")
         let eventCount = 0
         let yieldCount = 0
-        for await (const event of events(response)) {
+        for await (const event of responseEvents(response, inactivity.signal)) {
           inactivity.keepAlive()
           eventCount++
           consola.debug(
@@ -272,11 +232,16 @@ export const createResponsesCompletion = async (
     return streamChunks()
   }
 
-  inactivity.clear()
-  const data = await response.json()
-  return translateFromResponsesResponse(
-    data as Parameters<typeof translateFromResponsesResponse>[0],
-  )
+  try {
+    const data: unknown = JSON.parse(
+      await readResponseBody(response, inactivity.signal, inactivity.keepAlive),
+    )
+    return translateFromResponsesResponse(
+      data as Parameters<typeof translateFromResponsesResponse>[0],
+    )
+  } finally {
+    inactivity.clear()
+  }
 }
 
 export const createChatCompletions = async (
@@ -291,18 +256,22 @@ export const createChatCompletions = async (
   let response: Response | undefined
 
   for (let attempt = 1; attempt <= MAX_TRANSIENT_HTTP_RETRIES; attempt++) {
-    response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: inactivity.signal,
-      // Bun's internal fetch timer defaults to ~4 minutes and fires mid-stream
-      // when Copilot pauses between chunks on large (6000+ line) file edits.
-      // Setting timeout:false disables it; the inactivity abort above is the
-      // safety net — it only fires when the upstream goes completely silent.
-      // @ts-expect-error — Bun-specific option, not in the standard fetch types
-      timeout: false,
-    })
+    response = await fetchWithInactivity(
+      `${copilotBaseUrl(state)}/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: inactivity.signal,
+        // Bun's internal fetch timer defaults to ~4 minutes and fires mid-stream
+        // when Copilot pauses between chunks on large (6000+ line) file edits.
+        // Setting timeout:false disables it; the inactivity abort above is the
+        // safety net — it only fires when the upstream goes completely silent.
+        // @ts-expect-error — Bun-specific option, not in the standard fetch types
+        timeout: false,
+      },
+      inactivity,
+    )
 
     // Headers arrived — reset the inactivity timer
     inactivity.keepAlive()
@@ -325,7 +294,7 @@ export const createChatCompletions = async (
     if (response.body) {
       void response.body.cancel().catch(() => undefined)
     }
-    await sleep(retryDelayMs)
+    await abortableDelay(retryDelayMs, inactivity.signal)
   }
 
   if (!response?.ok) {
@@ -337,7 +306,7 @@ export const createChatCompletions = async (
     // Wrap the events iterator to reset the inactivity timer on each chunk
     // and clean up when the stream ends.  This ensures a slow-but-active
     // stream (e.g. a large Write tool call) is never killed prematurely.
-    const upstream = events(response)
+    const upstream = responseEvents(response, inactivity.signal)
 
     async function* withInactivityReset() {
       try {
@@ -353,8 +322,13 @@ export const createChatCompletions = async (
     return withInactivityReset()
   }
 
-  inactivity.clear()
-  return (await response.json()) as ChatCompletionResponse
+  try {
+    return JSON.parse(
+      await readResponseBody(response, inactivity.signal, inactivity.keepAlive),
+    ) as ChatCompletionResponse
+  } finally {
+    inactivity.clear()
+  }
 }
 
 function buildChatRequestBody(
@@ -375,44 +349,15 @@ function buildChatRequestBody(
   return body
 }
 
-async function readCompletionBody(
-  response: Response,
-  signal: AbortSignal,
-): Promise<string> {
-  if (signal.aborted) await response.body?.cancel()
-  signal.throwIfAborted()
-  if (!response.body) return ""
-  const reader = response.body.getReader()
-  const cancel = () => {
-    void reader.cancel().catch(() => undefined)
-  }
-  signal.addEventListener("abort", cancel, { once: true })
-  const decoder = new TextDecoder()
-  let text = ""
-  try {
-    while (true) {
-      signal.throwIfAborted()
-      const chunk: { value?: unknown; done: boolean } = await reader.read()
-      const { value, done } = chunk
-      signal.throwIfAborted()
-      if (done) return text + decoder.decode()
-      if (!(value instanceof Uint8Array))
-        throw new Error("Upstream completion body contained a non-byte chunk")
-      text += decoder.decode(value, { stream: true })
-    }
-  } finally {
-    signal.removeEventListener("abort", cancel)
-    reader.releaseLock()
-  }
-}
-
 /** One non-streaming request, including body consumption, with no hidden retries. */
 export async function createOneShotCompletion(
   payload: ChatCompletionsPayload,
   usesResponses: boolean,
   signal: AbortSignal,
 ): Promise<ChatCompletionResponse> {
-  signal.throwIfAborted()
+  const downstream = requestSignal()
+  const combined = downstream ? AbortSignal.any([signal, downstream]) : signal
+  combined.throwIfAborted()
   const nonStreaming = { ...payload, stream: false, stream_options: undefined }
   const body =
     usesResponses ?
@@ -424,12 +369,12 @@ export async function createOneShotCompletion(
       method: "POST",
       headers: buildRequestHeaders(payload),
       body: JSON.stringify(body),
-      signal,
+      signal: combined,
       // @ts-expect-error — Bun-specific option; the caller owns the deadline.
       timeout: false,
     },
   )
-  const text = await readCompletionBody(response, signal)
+  const text = await readResponseBody(response, combined)
   if (!response.ok) {
     throw new HTTPError(
       "Copilot completion failed",

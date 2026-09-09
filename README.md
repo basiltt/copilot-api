@@ -505,6 +505,41 @@ and the [official TypeScript SDK client](https://github.com/modelcontextprotocol
 The exact `web_search` capability and answer/citation schema were also confirmed
 through ordinary authenticated discovery and one harmless native query.
 
+## Concurrent requests and shared admission limits
+
+Inference routes handle independent HTTP requests asynchronously. A slow JSON
+response or SSE stream does not hold a server-wide completion lock: another
+request can enter upstream and finish while the first remains active. Tool
+schemas, call IDs, name mappings and streamed argument buffers are request-local.
+This is separate from multiple tool calls inside a single model response.
+
+Optional interval and burst limits gate **request starts**, not response
+lifetimes. Waiting requests recheck shared account capacity atomically after
+waking; interval and burst reservations happen together. `--rate-limit` accepts
+finite non-negative seconds. Without `--wait`, an interval rejection returns
+HTTP 429 with `Retry-After`; burst limits retain their waiting behavior.
+Canceled waiting requests consume no admission slot. Cancellation propagates to
+active completion transports/body readers and native Copilot search; SSE
+disconnects stop their request's keepalive timers. A canceled request cannot
+trigger a subsequent model retry. A connected client observing cancellation may
+receive HTTP 499 before response headers have been committed.
+
+No limit means no proxy admission delay, **not unlimited upstream capacity**.
+All clients of one proxy process share its configured GitHub/Copilot identity,
+account quota and upstream policy. Model-scoped burst limits are optional
+operator settings, not per-user account isolation. A public unauthenticated
+deployment is not a multi-tenant authentication system; this behavior adds
+neither client authentication nor account pooling. Embeddings retain their
+existing admission behavior and also propagate client cancellation.
+
+A `Write` error such as `required at $` means generated input is missing a
+required root property of that request's schema. It does not identify which
+property, prove request mixing, or establish why generation took a long time.
+Request-log duration includes request processing and upstream wait, not just
+admission. Validation remains strict: invalid executable tool arguments are not
+committed, fabricated or automatically regenerated. The optional output-only
+`StructuredOutput` recovery below does **not** apply to `Write` or `Bash`.
+
 ## Anthropic tool compatibility
 
 | Capability | Behavior and execution boundary |

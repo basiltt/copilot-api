@@ -4,12 +4,14 @@ import {
   forwardAnthropicError,
   sendAnthropicInvalidRequestError,
 } from "~/lib/error"
+import { requestLifecycle } from "~/lib/request-lifecycle"
 
 import { handleCountTokens } from "./count-tokens-handler"
 import { handleCompletion } from "./handler"
 import { validateAnthropicPayload } from "./validate-payload"
 
 export const messageRoutes = new Hono()
+messageRoutes.use(requestLifecycle)
 
 messageRoutes.post("/", async (c) => {
   try {

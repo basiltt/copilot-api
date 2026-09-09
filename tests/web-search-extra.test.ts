@@ -1,4 +1,12 @@
-import { describe, test, expect, spyOn, afterEach, mock } from "bun:test"
+import {
+  describe,
+  test,
+  expect,
+  spyOn,
+  beforeEach,
+  afterEach,
+  mock,
+} from "bun:test"
 
 import type {
   ChatCompletionsPayload,
@@ -126,6 +134,15 @@ describe("webSearchInterceptor — streaming preservation", () => {
 })
 
 describe("isWebSearchEnabled — Tavily", () => {
+  let originalProvider: typeof stateModule.state.webSearchProvider
+  beforeEach(() => {
+    originalProvider = stateModule.state.webSearchProvider
+    stateModule.state.webSearchProvider = undefined
+  })
+  afterEach(() => {
+    stateModule.state.webSearchProvider = originalProvider
+  })
+
   test("returns false when neither key is set", () => {
     const originalBrave = stateModule.state.braveApiKey
     const originalTavily = stateModule.state.tavilyApiKey

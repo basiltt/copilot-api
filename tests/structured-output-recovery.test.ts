@@ -150,6 +150,9 @@ afterEach(() => {
   timerSpy?.mockRestore()
   timerSpy = undefined
   for (const log of logs) log.mockRestore()
+  for (const key of Object.keys(state)) {
+    if (!Object.hasOwn(originalState, key)) Reflect.deleteProperty(state, key)
+  }
   Object.assign(state, originalState)
   if (originalEnv === undefined) delete process.env.STRUCTURED_OUTPUT_RECOVERY
   else process.env.STRUCTURED_OUTPUT_RECOVERY = originalEnv

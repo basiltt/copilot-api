@@ -2,6 +2,7 @@ import { Hono } from "hono"
 
 import { forwardOpenAIError } from "~/lib/error"
 import { resolveModelId } from "~/lib/model-resolver"
+import { requestLifecycle } from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
 import {
   createEmbeddings,
@@ -9,6 +10,7 @@ import {
 } from "~/services/copilot/create-embeddings"
 
 export const embeddingRoutes = new Hono()
+embeddingRoutes.use(requestLifecycle)
 
 embeddingRoutes.post("/", async (c) => {
   try {

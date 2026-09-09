@@ -265,6 +265,17 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   void srvxServer.ready().then(() => console.log())
 }
 
+function parseRateLimit(raw: string | undefined): number | undefined {
+  const value = raw === undefined ? undefined : Number(raw)
+  if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    consola.error(
+      "--rate-limit must be a finite, non-negative number of seconds",
+    )
+    process.exit(1)
+  }
+  return value
+}
+
 export const start = defineCommand({
   meta: {
     name: "start",
@@ -352,9 +363,7 @@ export const start = defineCommand({
   },
   run({ args }) {
     const rateLimitRaw = args["rate-limit"]
-    const rateLimit =
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      rateLimitRaw === undefined ? undefined : Number.parseInt(rateLimitRaw, 10)
+    const rateLimit = parseRateLimit(rateLimitRaw)
 
     const rawBurstCount = args["burst-count"]
     const rawBurstWindow = args["burst-window"]

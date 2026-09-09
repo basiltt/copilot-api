@@ -550,6 +550,15 @@ describe("prepareWebSearchPayload — always-on injection", () => {
 })
 
 describe("isWebSearchEnabled", () => {
+  let originalProvider: typeof state.webSearchProvider
+  beforeEach(() => {
+    originalProvider = state.webSearchProvider
+    state.webSearchProvider = undefined
+  })
+  afterEach(() => {
+    state.webSearchProvider = originalProvider
+  })
+
   test("returns false when braveApiKey is not set", () => {
     const originalKey = stateModule.state.braveApiKey
     stateModule.state.braveApiKey = undefined

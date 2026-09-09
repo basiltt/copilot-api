@@ -3,6 +3,8 @@ import type { ContentfulStatusCode } from "hono/utils/http-status"
 
 import consola from "consola"
 
+import { requestSignal } from "./request-lifecycle"
+
 export class HTTPError extends Error {
   response: Response
 
@@ -13,6 +15,8 @@ export class HTTPError extends Error {
 }
 
 export async function forwardError(c: Context, error: unknown) {
+  if (requestSignal()?.aborted || c.req.raw.signal.aborted)
+    return new Response(null, { status: 499 })
   consola.error("Error occurred:", error)
 
   if (error instanceof HTTPError) {
@@ -128,6 +132,8 @@ function isAnthropicErrorBody(value: unknown): boolean {
  * context-window special case that drives auto-compaction.
  */
 export async function forwardAnthropicError(c: Context, error: unknown) {
+  if (requestSignal()?.aborted || c.req.raw.signal.aborted)
+    return new Response(null, { status: 499 })
   consola.error("Error occurred:", error)
 
   if (error instanceof HTTPError) {
@@ -292,6 +298,8 @@ function getUpstreamErrorCode(value: unknown): string | undefined {
  * `{"error": {"message", "type", "param", "code"}}`.
  */
 export async function forwardOpenAIError(c: Context, error: unknown) {
+  if (requestSignal()?.aborted || c.req.raw.signal.aborted)
+    return new Response(null, { status: 499 })
   if (error instanceof HTTPError) {
     const errorText = await error.response.text()
     const contentType = error.response.headers.get("content-type")

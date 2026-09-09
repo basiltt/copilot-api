@@ -4,7 +4,6 @@ import type { Context } from "hono"
 import type { SSEStreamingApi } from "hono/streaming"
 
 import consola from "consola"
-import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import {
@@ -17,7 +16,12 @@ import {
 } from "~/lib/error"
 import { knownModelMetadata, isFable51 } from "~/lib/known-models"
 import { resolveModelId } from "~/lib/model-resolver"
-import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
+import { checkAdmission } from "~/lib/rate-limit"
+import {
+  requestSignal,
+  streamSSE,
+  throwIfRequestAborted,
+} from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
 import {
   createChatCompletions,
@@ -92,17 +96,24 @@ export function startSSEKeepalive(
   stream: Pick<SSEStreamingApi, "writeSSE">,
   intervalMs: number = PING_INTERVAL_MS,
 ): () => void {
+  const signal = requestSignal()
+  const stop = () => {
+    clearInterval(timer)
+    signal?.removeEventListener("abort", stop)
+  }
   const timer = setInterval(() => {
     consola.debug("Sending periodic SSE ping")
     stream
       .writeSSE({ event: "ping", data: JSON.stringify({ type: "ping" }) })
       .catch((error: unknown) => {
-        clearInterval(timer)
+        stop()
         consola.debug("Stopping SSE keepalive after write failure:", error)
       })
   }, intervalMs)
 
-  return () => clearInterval(timer)
+  signal?.addEventListener("abort", stop, { once: true })
+  if (signal?.aborted) stop()
+  return stop
 }
 
 // Maximum time to wait for the next upstream chunk inside pipeStreamToClient
@@ -150,6 +161,7 @@ const RETRIABLE_ERROR_NAMES = new Set([
  * 500 instead of being retried.  We match against both.
  */
 export function isRetriableFetchError(error: unknown): error is Error {
+  if (requestSignal()?.aborted) return false
   if (!(error instanceof Error)) return false
   const code = (error as { code?: unknown }).code
   return (
@@ -188,8 +200,6 @@ function lookupModelLimit(modelId: string): number | undefined {
 
 // eslint-disable-next-line complexity, max-lines-per-function -- Keep route precedence and shared error recovery explicit.
 export async function handleCompletion(c: Context) {
-  await checkRateLimit(state)
-
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   if (!usesStructuredOutputRecovery(anthropicPayload)) {
     consola.debug(
@@ -208,7 +218,7 @@ export async function handleCompletion(c: Context) {
     anthropicPayload.model = resolvedModel
   }
 
-  await checkBurstLimit(state, anthropicPayload.model)
+  await checkAdmission(state, { model: anthropicPayload.model })
 
   if (
     isFable51(anthropicPayload.model)
@@ -487,6 +497,7 @@ async function handleNonStreaming(
     )
   } catch (error) {
     // 413 cascade exhausted — all images stripped, still too large.
+    throwIfRequestAborted()
     // Return invalid_request_error to trigger Claude Code auto-compaction.
     // This is safe because images are already gone and compaction will
     // reduce the text content, producing a convergently smaller request.
@@ -639,6 +650,7 @@ async function handleStructuredOutput(
     // Non-streaming should return ChatCompletionResponse directly
     response = result as ChatCompletionResponse
   } catch (error) {
+    throwIfRequestAborted()
     consola.error("[structured-output] Upstream fetch failed:", error)
     if (error instanceof HTTPError) throw error
     return c.json(
@@ -1119,6 +1131,7 @@ async function fetchPlainTextCompactionResponse(
     }
     return fallbackResult.response
   } catch (error) {
+    throwIfRequestAborted()
     consola.warn("Plain-text compaction fallback failed:", error)
     return buildSyntheticCompactionResponse(payload, originalResponse.usage)
   }
@@ -1267,6 +1280,7 @@ async function handleStreaming(
     }
   } catch (error) {
     // Errors here occur during stream piping (after the initial fetch
+    if (requestSignal()?.aborted) return
     // succeeded).  The SSE connection is already committed to HTTP 200,
     // so we can only emit SSE error events — not HTTP-level errors.
     // Context window errors and CompactionNeededError are already handled
@@ -1311,6 +1325,7 @@ async function fetchCopilotResponse(
   anthropicPayload: AnthropicMessagesPayload,
   outputSignal?: AbortSignal,
 ): ReturnType<typeof createChatCompletions> {
+  throwIfRequestAborted()
   const openAIPayload = translateToOpenAI(anthropicPayload)
   if (!outputSignal) {
     consola.debug(
@@ -1570,6 +1585,7 @@ async function pipeStreamToClient(
 
     await handleIncompleteStream(stream, streamState)
   } catch (error) {
+    if (requestSignal()?.aborted) return true
     consola.error("Stream error from Copilot:", error)
 
     if (streamState.contentBlockOpen) {
@@ -1658,11 +1674,13 @@ async function nextWithTimeout(
   }
 
   // Race the next chunk against a stall timeout.
-  const stallTimeout = new Promise<"timeout">((resolve) =>
-    setTimeout(() => resolve("timeout"), STREAM_STALL_TIMEOUT_MS),
-  )
-
-  const result = await Promise.race([iter.next(), stallTimeout])
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const stallTimeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), STREAM_STALL_TIMEOUT_MS)
+  })
+  const result = await Promise.race([iter.next(), stallTimeout]).finally(() => {
+    clearTimeout(timer)
+  })
 
   if (result === "timeout") {
     consola.debug(
@@ -1884,6 +1902,7 @@ async function emitStreamingError(
   error: unknown,
   modelId?: string,
 ): Promise<void> {
+  if (requestSignal()?.aborted) return
   const { errorMessage, errorType } = await extractStreamingErrorDetails(error)
 
   const contextWindowError = isContextWindowError(errorMessage)

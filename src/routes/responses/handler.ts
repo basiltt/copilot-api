@@ -1,8 +1,6 @@
 import type { Context } from "hono"
 
 import consola from "consola"
-import { events } from "fetch-event-stream"
-import { streamSSE } from "hono/streaming"
 
 import type { ResponsesPayload } from "~/services/copilot/responses-translation"
 
@@ -16,9 +14,20 @@ import {
   isContextWindowError,
 } from "~/lib/error"
 import { resolveModelId } from "~/lib/model-resolver"
-import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
+import { checkAdmission } from "~/lib/rate-limit"
 import { normalizeReasoningEffort } from "~/lib/reasoning-effort"
+import {
+  requestSignal,
+  streamSSE,
+  throwIfRequestAborted,
+} from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
+import {
+  createInactivityAbort,
+  fetchWithInactivity,
+  readResponseBody,
+  responseEvents,
+} from "~/lib/upstream-lifecycle"
 import { createChatCompletions } from "~/services/copilot/create-chat-completions"
 import {
   requiresChatCompletionsApi,
@@ -28,44 +37,12 @@ import {
   createCCToResponsesStreamState,
 } from "~/services/copilot/responses-translation"
 
-const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000
 const MAX_IMAGE_SEARCH_DEPTH = 12
 const IMAGE_REMOVED_PLACEHOLDER =
   "[Image removed by proxy after Copilot rejected the request body]"
 const imageRejectedWindowKeys = new Set<string>()
 
-function createInactivityAbort(timeoutMs: number = INACTIVITY_TIMEOUT_MS) {
-  const controller = new AbortController()
-  let timer: ReturnType<typeof setTimeout> | undefined
-
-  const schedule = () => {
-    if (timer !== undefined) clearTimeout(timer)
-    timer = setTimeout(() => {
-      const error = new Error(
-        `Upstream connection inactive for ${Math.round(timeoutMs / 1000)}s`,
-      )
-      error.name = "TimeoutError"
-      controller.abort(error)
-    }, timeoutMs)
-  }
-
-  schedule()
-
-  return {
-    signal: controller.signal,
-    keepAlive: schedule,
-    clear: () => {
-      if (timer !== undefined) {
-        clearTimeout(timer)
-        timer = undefined
-      }
-    },
-  }
-}
-
 export async function handleResponses(c: Context) {
-  await checkRateLimit(state)
-
   const payload = await c.req.json<Record<string, unknown>>()
   consola.debug("Responses API request:", JSON.stringify(payload).slice(-400))
 
@@ -85,7 +62,7 @@ export async function handleResponses(c: Context) {
     }
   }
 
-  await checkBurstLimit(state, model)
+  await checkAdmission(state, { model })
 
   if (state.manualApprove) await awaitApproval()
 
@@ -121,9 +98,14 @@ export async function handleResponses(c: Context) {
     return streamResponsesPassthrough(c, response, inactivity)
   }
 
-  inactivity.clear()
-  const data = await response.json()
-  return c.json(data)
+  try {
+    const data: unknown = JSON.parse(
+      await readResponseBody(response, inactivity.signal, inactivity.keepAlive),
+    )
+    return c.json(data)
+  } finally {
+    inactivity.clear()
+  }
 }
 
 /**
@@ -189,17 +171,21 @@ async function postResponsesUpstream(
   inactivity: ReturnType<typeof createInactivityAbort>,
   opts: { enableVision: boolean; isAgentCall: boolean },
 ): Promise<Response> {
-  const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
-    method: "POST",
-    headers: {
-      ...copilotHeaders(state, opts.enableVision),
-      "X-Initiator": opts.isAgentCall ? "agent" : "user",
+  const response = await fetchWithInactivity(
+    `${copilotBaseUrl(state)}/responses`,
+    {
+      method: "POST",
+      headers: {
+        ...copilotHeaders(state, opts.enableVision),
+        "X-Initiator": opts.isAgentCall ? "agent" : "user",
+      },
+      body: JSON.stringify(body),
+      signal: inactivity.signal,
+      // @ts-expect-error — Bun-specific option
+      timeout: false,
     },
-    body: JSON.stringify(body),
-    signal: inactivity.signal,
-    // @ts-expect-error — Bun-specific option
-    timeout: false,
-  })
+    inactivity,
+  )
   inactivity.keepAlive()
   return response
 }
@@ -328,7 +314,8 @@ function streamResponsesPassthrough(
 ) {
   return streamSSE(c, async (stream) => {
     try {
-      for await (const event of events(response)) {
+      for await (const event of responseEvents(response, inactivity.signal)) {
+        throwIfRequestAborted()
         inactivity.keepAlive()
         if (!event.data) continue
         if (event.data === "[DONE]") {
@@ -554,6 +541,7 @@ async function handleViaCC(c: Context, payload: ResponsesPayload) {
           }
         }
       } catch (error) {
+        if (requestSignal()?.aborted) return
         // Once `streamSSE` has begun, headers are already 200 and the route's
         // try/catch can no longer produce an HTTP error response.  Without a
         // terminal event here the socket simply closes, and the Codex SSE

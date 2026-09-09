@@ -13,11 +13,10 @@ state.accountType = "individual"
 // Helper to mock fetch
 const fetchMock = mock(
   (_url: string, opts: { headers: Record<string, string> }) => {
-    return {
-      ok: true,
-      json: () => ({ id: "123", object: "chat.completion", choices: [] }),
-      headers: opts.headers,
-    }
+    return Response.json(
+      { id: "123", object: "chat.completion", choices: [] },
+      { headers: opts.headers },
+    )
   },
 )
 // @ts-expect-error - Mock fetch doesn't implement all fetch properties

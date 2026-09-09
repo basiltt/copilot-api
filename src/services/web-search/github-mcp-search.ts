@@ -6,6 +6,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js"
 
 import { HTTPError } from "~/lib/error"
+import { requestSignal } from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
 
 import { WebSearchError } from "./types"
@@ -20,7 +21,10 @@ export async function callGitHubWebSearch(query: string) {
     throw new WebSearchError(
       "Copilot native search requires the configured GitHub login.",
     )
-  const signal = AbortSignal.timeout(REQUEST_TIMEOUT)
+  const downstream = requestSignal()
+  const deadline = AbortSignal.timeout(REQUEST_TIMEOUT)
+  const signal = downstream ? AbortSignal.any([downstream, deadline]) : deadline
+  signal.throwIfAborted()
   const transport = new StreamableHTTPClientTransport(new URL(ENDPOINT), {
     requestInit: {
       headers: {
@@ -56,6 +60,7 @@ export async function callGitHubWebSearch(query: string) {
     )
     return CallToolResultSchema.parse(result)
   } catch (error) {
+    signal.throwIfAborted()
     if (!(error instanceof McpError)) throw error
     throw new HTTPError(
       "GitHub native search RPC failed",
@@ -124,6 +129,7 @@ async function boundedMcpFetch(
 ): Promise<Response> {
   if (String(url) !== ENDPOINT)
     throw new WebSearchError("Unexpected GitHub MCP transport destination.")
+  signal.throwIfAborted()
   const response = await fetch(url, {
     ...init,
     redirect: "error",

@@ -3,123 +3,103 @@ import consola from "consola"
 import type { State } from "./state"
 
 import { HTTPError } from "./error"
-import { sleep } from "./utils"
+import { abortableDelay, requestSignal } from "./request-lifecycle"
 
-export async function checkRateLimit(state: State) {
-  if (state.rateLimitSeconds === undefined) return
-
-  const now = Date.now()
-
-  if (!state.lastRequestTimestamp) {
-    state.lastRequestTimestamp = now
-    return
-  }
-
-  const elapsedSeconds = (now - state.lastRequestTimestamp) / 1000
-
-  if (elapsedSeconds > state.rateLimitSeconds) {
-    state.lastRequestTimestamp = now
-    return
-  }
-
-  const waitTimeSeconds = Math.ceil(state.rateLimitSeconds - elapsedSeconds)
-
-  if (!state.rateLimitWait) {
-    consola.warn(
-      `Rate limit exceeded. Need to wait ${waitTimeSeconds} more seconds.`,
-    )
-    throw new HTTPError(
-      "Rate limit exceeded",
-      Response.json({ message: "Rate limit exceeded" }, { status: 429 }),
-    )
-  }
-
-  const waitTimeMs = waitTimeSeconds * 1000
-  consola.warn(
-    `Rate limit reached. Waiting ${waitTimeSeconds} seconds before proceeding...`,
-  )
-  await sleep(waitTimeMs)
-  // eslint-disable-next-line require-atomic-updates
-  state.lastRequestTimestamp = now
-  consola.info("Rate limit wait completed, proceeding with request")
-  return
+interface AdmissionOptions {
+  model?: string
+  signal?: AbortSignal
+  interval?: boolean
+  burst?: boolean
 }
 
-const burstQueues = new Map<string, Promise<void>>()
+function intervalDelay(state: State, now: number): number {
+  if (
+    state.rateLimitSeconds === undefined
+    || state.lastRequestTimestamp === undefined
+  )
+    return 0
+  return Math.max(
+    0,
+    state.lastRequestTimestamp + state.rateLimitSeconds * 1000 - now,
+  )
+}
 
-export async function checkBurstLimit(state: State, model?: string) {
+function burstSlot(state: State, model: string | undefined, now: number) {
   if (state.burstCount === undefined || state.burstWindowSeconds === undefined)
-    return
-
-  const key = state.burstScope === "model" && model ? model : "__global__"
-
-  const prev = burstQueues.get(key) ?? Promise.resolve()
-  const ticket = prev.then(() => acquireBurstSlot(state, key))
-  burstQueues.set(
-    key,
-    ticket.catch(() => {}),
-  )
-  return ticket
-}
-
-function getTimestamps(state: State, key: string): Array<number> {
-  if (key === "__global__") return state.burstRequestTimestamps
-  let ts = state.burstPerModelTimestamps.get(key)
-  if (!ts) {
-    ts = []
-    state.burstPerModelTimestamps.set(key, ts)
+    return undefined
+  const windowMs = state.burstWindowSeconds * 1000
+  const horizon = Math.max(windowMs, state.burstMinSpacingMs)
+  // Drop idle model histories too, rather than retaining every model ever seen.
+  for (const [key, history] of state.burstPerModelTimestamps) {
+    const recent = history.filter((time) => time > now - horizon)
+    if (recent.length > 0) state.burstPerModelTimestamps.set(key, recent)
+    else state.burstPerModelTimestamps.delete(key)
   }
-  return ts
+  const key = state.burstScope === "model" && model ? model : undefined
+  const history = (
+    key ?
+      (state.burstPerModelTimestamps.get(key) ?? [])
+    : state.burstRequestTimestamps).filter((time) => time > now - horizon)
+  const window = history.filter((time) => time > now - windowMs)
+  const last = history.at(-1)
+  const spacing = last === undefined ? 0 : last + state.burstMinSpacingMs - now
+  const capacity =
+    window.length < state.burstCount ? 0 : window[0] + windowMs - now
+  return { key, history, delay: Math.max(0, spacing, capacity) }
 }
 
-function setTimestamps(state: State, key: string, ts: Array<number>) {
-  if (key === "__global__") {
-    state.burstRequestTimestamps = ts
-  } else {
-    state.burstPerModelTimestamps.set(key, ts)
-  }
-}
-
-async function acquireBurstSlot(state: State, key: string) {
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-  const windowMs = state.burstWindowSeconds! * 1000
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-  const maxBurst = state.burstCount!
-  const minSpacingMs = state.burstMinSpacingMs
-  const label = key === "__global__" ? "" : ` [${key}]`
-
+/** Reserve start admission atomically, never hold a slot for a response lifetime. */
+export async function checkAdmission(
+  state: State,
+  options: AdmissionOptions = {},
+): Promise<void> {
+  const signal = options.signal ?? requestSignal()
   while (true) {
+    signal?.throwIfAborted()
     const now = Date.now()
-
-    const filtered = getTimestamps(state, key).filter(
-      (ts) => ts > now - windowMs,
-    )
-    setTimestamps(state, key, filtered)
-
-    if (filtered.length < maxBurst) {
-      if (minSpacingMs > 0) {
-        const last = filtered.at(-1)
-        const elapsed = last !== undefined ? now - last : Infinity
-        if (elapsed < minSpacingMs) {
-          const gap = minSpacingMs - elapsed
-          const gapLabel =
-            gap < 1000 ? `${gap}ms` : `${(gap / 1000).toFixed(1)}s`
-          consola.debug(`${label} Spacing requests: waiting ${gapLabel}`)
-          await sleep(gap)
-        }
-      }
-      getTimestamps(state, key).push(Date.now())
-      return
+    const interval = options.interval === false ? 0 : intervalDelay(state, now)
+    if (interval > 0 && !state.rateLimitWait) {
+      const retryAfter = Math.ceil(interval / 1000)
+      consola.warn(`Rate limit exceeded. Retry after ${retryAfter} seconds.`)
+      throw new HTTPError(
+        "Rate limit exceeded",
+        Response.json(
+          { message: "Rate limit exceeded" },
+          { status: 429, headers: { "retry-after": String(retryAfter) } },
+        ),
+      )
     }
-
-    const oldest = filtered[0] ?? now
-    const waitMs = Math.max(0, oldest + windowMs - now)
-    const waitLabel =
-      waitMs < 1000 ? `${waitMs}ms` : `${(waitMs / 1000).toFixed(1)}s`
-    consola.warn(
-      `${label} Burst limit reached. Waiting ${waitLabel} before proceeding...`,
-    )
-    await sleep(waitMs)
-    consola.debug(`${label} Burst limit wait completed, re-checking...`)
+    const burst =
+      options.burst === false ? undefined : burstSlot(state, options.model, now)
+    const delay = Math.max(interval, burst?.delay ?? 0)
+    if (delay > 0) {
+      consola.debug(`Request admission waiting ${Math.ceil(delay)}ms`)
+      await abortableDelay(delay, signal)
+      continue
+    }
+    // No await between checking capacity and updating shared account timestamps.
+    if (options.interval !== false && state.rateLimitSeconds !== undefined)
+      state.lastRequestTimestamp = now
+    if (burst) {
+      burst.history.push(now)
+      if (burst.key) state.burstPerModelTimestamps.set(burst.key, burst.history)
+      else state.burstRequestTimestamps = burst.history
+    }
+    return
   }
+}
+
+export function checkRateLimit(
+  state: State,
+  signal?: AbortSignal,
+): Promise<void> {
+  return checkAdmission(state, { signal, burst: false })
+}
+
+export function checkBurstLimit(
+  state: State,
+  model?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  return checkAdmission(state, { model, signal, interval: false })
 }
