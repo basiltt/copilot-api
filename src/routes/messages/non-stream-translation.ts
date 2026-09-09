@@ -32,7 +32,12 @@ import {
   isThinkingRequested,
 } from "./anthropic-types"
 import { clientTools } from "./client-tools"
-import { parseToolInput, toolInputSchema } from "./tool-input"
+import {
+  logWriteToolSchemaMismatch,
+  parseToolInput,
+  ToolSchemaMismatchError,
+  toolInputSchema,
+} from "./tool-input"
 import {
   createToolNameMapFromAnthropicPayload,
   toAnthropicToolIdentity,
@@ -898,6 +903,7 @@ export function translateToAnthropic(
         undefined
       : choice.message.tool_calls,
       toolNameMap,
+      choice.finish_reason,
     )
 
     allTextBlocks.push(...textBlocks)
@@ -1000,18 +1006,42 @@ function getAnthropicTextBlocks(
 function getAnthropicToolUseBlocks(
   toolCalls: Array<ToolCall> | undefined,
   toolNameMap?: ToolNameMap,
+  finishReason: string | null = null,
 ): Array<AnthropicToolUseBlock> {
   if (!toolCalls) {
     return []
   }
-  return toolCalls.map((toolCall) => ({
-    type: "tool_use",
-    id: toolCall.id,
-    ...toAnthropicToolIdentity(toolCall.function.name, toolNameMap),
-    input: parseToolInput(
-      toolCall.function.arguments,
+  return toolCalls.map((toolCall) => {
+    const identity = toAnthropicToolIdentity(
       toolCall.function.name,
-      toolNameMap?.inputSchemas?.[toolCall.function.name],
-    ),
-  }))
+      toolNameMap,
+    )
+    const schema = toolNameMap?.inputSchemas?.[toolCall.function.name]
+    try {
+      return {
+        type: "tool_use",
+        id: toolCall.id,
+        ...identity,
+        input: parseToolInput(
+          toolCall.function.arguments,
+          toolCall.function.name,
+          schema,
+        ),
+      }
+    } catch (error) {
+      if (
+        error instanceof ToolSchemaMismatchError
+        && identity.name === "Write"
+        && identity.toolset_name === undefined
+        && schema
+      ) {
+        logWriteToolSchemaMismatch(
+          toolCall.function.arguments,
+          schema,
+          finishReason,
+        )
+      }
+      throw error
+    }
+  })
 }

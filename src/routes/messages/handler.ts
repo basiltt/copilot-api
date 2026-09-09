@@ -71,11 +71,17 @@ import {
   translateWithOutputRecovery,
   usesStructuredOutputRecovery,
 } from "./structured-output-recovery"
+import { ToolSchemaMismatchError } from "./tool-input"
 import {
   createToolNameMapFromAnthropicPayload,
   type ToolNameMap,
 } from "./tool-name-mapping"
 import { EMPTY_VISIBLE_OUTPUT_TEXT, toAnthropicMessageId } from "./utils"
+import {
+  hasLogicalWriteTool,
+  translateWithWriteRecovery,
+  usesWriteToolRecovery,
+} from "./write-tool-recovery"
 
 // Interval at which SSE ping events are sent to keep the downstream
 // connection alive while waiting for Copilot to start responding or
@@ -201,7 +207,10 @@ function lookupModelLimit(modelId: string): number | undefined {
 // eslint-disable-next-line complexity, max-lines-per-function -- Keep route precedence and shared error recovery explicit.
 export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
-  if (!usesStructuredOutputRecovery(anthropicPayload)) {
+  if (
+    !usesStructuredOutputRecovery(anthropicPayload)
+    && !hasLogicalWriteTool(anthropicPayload)
+  ) {
     consola.debug(
       "Anthropic request payload:",
       JSON.stringify(anthropicPayload),
@@ -286,7 +295,8 @@ export async function handleCompletion(c: Context) {
     return handleServerSearch(c, anthropicPayload, searchLimit)
   }
   if (
-    usesStructuredOutputRecovery(anthropicPayload)
+    (usesStructuredOutputRecovery(anthropicPayload)
+      || usesWriteToolRecovery(anthropicPayload))
     && !looksLikeCompactionRequest(anthropicPayload)
   ) {
     return handleOutputTool(c, anthropicPayload)
@@ -542,10 +552,12 @@ async function handleNonStreaming(
     )
   }
 
-  consola.debug(
-    "Non-streaming response from Copilot:",
-    JSON.stringify(result.response).slice(-400),
-  )
+  if (!hasLogicalWriteTool(anthropicPayload)) {
+    consola.debug(
+      "Non-streaming response from Copilot:",
+      JSON.stringify(result.response).slice(-400),
+    )
+  }
 
   // Detect empty non-streaming responses: some models (notably Gemini)
   // return finish_reason "stop" with empty/null content and 0 output tokens.
@@ -592,10 +604,12 @@ async function handleNonStreaming(
     )
   }
 
-  consola.debug(
-    "Translated Anthropic response:",
-    JSON.stringify(anthropicResponse),
-  )
+  if (!hasLogicalWriteTool(anthropicPayload)) {
+    consola.debug(
+      "Translated Anthropic response:",
+      JSON.stringify(anthropicResponse),
+    )
+  }
   return c.json(anthropicResponse)
 }
 
@@ -1050,13 +1064,35 @@ async function fetchNonStreamingAnthropicResponse(
   }
 
   const toolNameMap = createToolNameMapFromAnthropicPayload(anthropicPayload)
-  const anthropicResponse =
-    outputRecovery ?
-      await translateWithOutputRecovery(preparedPayload, response, {
-        map: toolNameMap,
-        ...outputRecovery,
-      })
-    : translateToAnthropic(response, toolNameMap)
+  let anthropicResponse: AnthropicResponse
+  if (!outputRecovery) {
+    anthropicResponse = translateToAnthropic(response, toolNameMap)
+  } else if (usesWriteToolRecovery(preparedPayload)) {
+    try {
+      anthropicResponse = await translateWithWriteRecovery(
+        preparedPayload,
+        response,
+        { map: toolNameMap, ...outputRecovery },
+      )
+    } catch (error) {
+      if (
+        !(error instanceof ToolSchemaMismatchError)
+        || !usesStructuredOutputRecovery(preparedPayload)
+      )
+        throw error
+      anthropicResponse = await translateWithOutputRecovery(
+        preparedPayload,
+        response,
+        { map: toolNameMap, ...outputRecovery },
+      )
+    }
+  } else {
+    anthropicResponse = await translateWithOutputRecovery(
+      preparedPayload,
+      response,
+      { map: toolNameMap, ...outputRecovery },
+    )
+  }
   if (result.strippedBase64Chars > 0) {
     anthropicResponse.usage.input_tokens += estimateTokensForStrippedImages(
       result.strippedBase64Chars,
@@ -1327,7 +1363,7 @@ async function fetchCopilotResponse(
 ): ReturnType<typeof createChatCompletions> {
   throwIfRequestAborted()
   const openAIPayload = translateToOpenAI(anthropicPayload)
-  if (!outputSignal) {
+  if (!outputSignal && !hasLogicalWriteTool(anthropicPayload)) {
     consola.debug(
       "Translated OpenAI request payload:",
       JSON.stringify(openAIPayload),

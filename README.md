@@ -537,8 +537,9 @@ required root property of that request's schema. It does not identify which
 property, prove request mixing, or establish why generation took a long time.
 Request-log duration includes request processing and upstream wait, not just
 admission. Validation remains strict: invalid executable tool arguments are not
-committed, fabricated or automatically regenerated. The optional output-only
-`StructuredOutput` recovery below does **not** apply to `Write` or `Bash`.
+committed or fabricated. The narrowly gated `Write` correction below applies
+only to one known missing-`content` shape; `Bash` and every other executable
+tool retain strict validation without regeneration.
 
 ## Anthropic tool compatibility
 
@@ -568,6 +569,39 @@ JSON Schema draft-07, 2019-09, and 2020-12 local references are validated withou
 coercion or default insertion. Invalid/unsupported schemas fail as request errors;
 remote schemas are not fetched. Tool names are request-scoped and reversible, so
 custom `screenshot`, `browser.screenshot`, and `computer.screenshot` cannot collide.
+
+### Optional Write missing-content recovery
+
+`WRITE_TOOL_RECOVERY=1` enables one model-only correction for a nonstreaming,
+complete, sole custom unscoped `Write` call that is missing only the required
+root `content` field. It is **off by default**; `0` disables it and any other
+value fails startup. The supplied `file_path` must already be a valid nonempty
+string, and the request must use a conservative flat schema that directly
+declares required string `file_path` and `content` properties. References,
+unions, conditionals, nested schemas, malformed arguments, unknown properties,
+other missing requirements, invalid existing values, mixed calls, prose,
+refusals, policy errors, and truncated turns are not corrected.
+
+The one additional request uses the original model, conversation, and unchanged
+schema, exposes only the original `Write` tool, and uses `tool_choice: auto`.
+Existing arguments are sent back to the same model as explicitly untrusted data
+to preserve, never logged by the recovery path, and must remain deeply
+identical. The final arguments still have to validate against the full original
+schema. A valid correction retains the original call ID and sums both calls'
+usage; any changed value, extra action, wrong identity/model, invalid output,
+timeout, or disconnect fails without another attempt or a client-visible tool.
+
+Correction permits at most one extra model call and 20 seconds of wall time,
+including response-body reading. It does not use nested transport, image, or
+empty-response retries. Streaming `Write` requests keep the existing strict SSE
+behavior and are never buffered for this feature. The proxy only validates and
+returns tool input: it never executes `Write`, changes caller permissions, or
+assumes execution authority. Fixed-name diagnostics report only booleans, JSON
+type labels, finish reason, and bounded property counts—never paths, contents,
+values, lengths, hashes, arbitrary property names, schemas, or AJV parameters.
+This is a guarded mitigation for the standard missing-`content` case, not a
+guarantee to repair every `Write` failure or evidence about a historical
+payload whose exact arguments were not retained.
 
 ### Optional StructuredOutput recovery
 

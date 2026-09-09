@@ -126,6 +126,19 @@ export function configureStructuredOutputRecovery(): void {
   }
 }
 
+export function configureWriteToolRecovery(): void {
+  const value = process.env.WRITE_TOOL_RECOVERY?.trim()
+  if (value !== undefined && value !== "0" && value !== "1") {
+    throw new Error("WRITE_TOOL_RECOVERY must be 0 or 1.")
+  }
+  state.writeToolRecovery = value === "1"
+  if (state.writeToolRecovery) {
+    consola.info(
+      "Write missing-content recovery enabled: one same-model correction, maximum 20s; the proxy does not execute tools.",
+    )
+  }
+}
+
 // eslint-disable-next-line max-lines-per-function -- Startup ordering coordinates authentication, configuration, and server lifetime.
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
@@ -167,6 +180,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   configureSearchProvider()
   configureStructuredOutputRecovery()
+  configureWriteToolRecovery()
 
   await ensurePaths()
   await cacheVSCodeVersion()

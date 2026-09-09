@@ -97,7 +97,7 @@ function failedRecovery(
   )
 }
 
-function addUsage(
+export function addRecoveryUsage(
   original: ChatCompletionResponse["usage"],
   repaired: ChatCompletionResponse["usage"],
 ): ChatCompletionResponse["usage"] {
@@ -223,7 +223,7 @@ async function regenerate(
             },
           },
         ],
-        usage: addUsage(response.usage, repaired.usage),
+        usage: addRecoveryUsage(response.usage, repaired.usage),
       },
       map,
     )

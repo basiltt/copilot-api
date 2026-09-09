@@ -1,6 +1,7 @@
 import Ajv, { type ErrorObject, type ValidateFunction } from "ajv"
 import Ajv2019 from "ajv/dist/2019"
 import Ajv2020 from "ajv/dist/2020"
+import consola from "consola"
 
 import { HTTPError } from "~/lib/error"
 
@@ -58,6 +59,77 @@ const DIAGNOSTIC_KEYWORDS = new Set([
 export interface ToolValidationDiagnostic {
   keyword: string
   location: string
+}
+
+function jsonType(value: unknown): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  return typeof value
+}
+
+// eslint-disable-next-line complexity -- Fixed fields avoid exposing arbitrary schema or candidate data.
+export function logWriteToolSchemaMismatch(
+  raw: string,
+  schema: Record<string, unknown>,
+  finishReason: string | null,
+): void {
+  let candidate: Record<string, unknown> | undefined
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed))
+      candidate = parsed as Record<string, unknown>
+  } catch {
+    // The fixed metadata below distinguishes malformed/non-object input.
+  }
+  const properties =
+    (
+      schema.properties !== null
+      && typeof schema.properties === "object"
+      && !Array.isArray(schema.properties)
+    ) ?
+      (schema.properties as Record<string, unknown>)
+    : undefined
+  const required = Array.isArray(schema.required) ? schema.required : []
+  const requiredNames = required.filter(
+    (entry): entry is string => typeof entry === "string",
+  )
+  const presentNames = candidate ? Object.keys(candidate) : []
+  const declaredNames = properties ? Object.keys(properties) : []
+  consola.warn("Write tool schema mismatch", {
+    finishReason,
+    candidateType: candidate ? "object" : "invalid",
+    filePathDeclared: Boolean(
+      properties && Object.hasOwn(properties, "file_path"),
+    ),
+    filePathPresent: Boolean(
+      candidate && Object.hasOwn(candidate, "file_path"),
+    ),
+    filePathType:
+      candidate && Object.hasOwn(candidate, "file_path") ?
+        jsonType(candidate.file_path)
+      : "missing",
+    contentDeclared: Boolean(
+      properties && Object.hasOwn(properties, "content"),
+    ),
+    contentPresent: Boolean(candidate && Object.hasOwn(candidate, "content")),
+    contentType:
+      candidate && Object.hasOwn(candidate, "content") ?
+        jsonType(candidate.content)
+      : "missing",
+    declaredCount: declaredNames.length,
+    requiredCount: requiredNames.length,
+    presentCount: presentNames.length,
+    otherDeclaredCount: declaredNames.filter(
+      (name) => name !== "file_path" && name !== "content",
+    ).length,
+    otherPresentCount: presentNames.filter(
+      (name) => name !== "file_path" && name !== "content",
+    ).length,
+    missingRequiredCount:
+      candidate ?
+        requiredNames.filter((name) => !Object.hasOwn(candidate, name)).length
+      : requiredNames.length,
+  })
 }
 
 function validationDiagnostics(
