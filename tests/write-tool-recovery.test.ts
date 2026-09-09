@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import consola from "consola"
 import { Hono } from "hono"
@@ -768,6 +769,7 @@ describe("Write recovery deadline and request isolation", () => {
       },
     }
     const repairResolvers: Array<(value: Response) => void> = []
+    const bothRepairsEntered = Promise.withResolvers<boolean>()
     fetchSpy.mockImplementation(
       Object.assign(
         (_url: string | URL | Request, init?: RequestInit) => {
@@ -798,6 +800,7 @@ describe("Write recovery deadline and request isolation", () => {
           }
           return new Promise<Response>((resolve) => {
             repairResolvers.push(resolve)
+            if (repairResolvers.length === 2) bothRepairsEntered.resolve(true)
           })
         },
         { preconnect: globalThis.fetch.preconnect },
@@ -805,7 +808,8 @@ describe("Write recovery deadline and request isolation", () => {
     )
     const first = send(payload(false, firstSchema))
     const second = send(payload(false, secondSchema))
-    while (repairResolvers.length < 2) await Promise.resolve()
+    await bothRepairsEntered.promise
+    expect(repairResolvers).toHaveLength(2)
     repairResolvers[1](
       Response.json(
         repaired(
@@ -830,5 +834,5 @@ describe("Write recovery deadline and request isolation", () => {
       .map((body) => body.tools?.[0].function.parameters)
     expect(repairSchemas).toContainEqual(firstSchema)
     expect(repairSchemas).toContainEqual(secondSchema)
-  })
+  }, 5_000)
 })
