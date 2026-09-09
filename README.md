@@ -7,7 +7,7 @@ A reverse-engineered proxy exposing **OpenAI** and **Anthropic** compatibility e
 - **Triple API Compatibility** — OpenAI Chat Completions, OpenAI Responses API, and Anthropic Messages API, all backed by GitHub Copilot
 - **Claude Code Integration** — Interactive model selector (`--claude-code`), client tools and toolsets, token counting, and auto-compaction
 - **Automatic Endpoint Routing** — Models that only support `/responses` (e.g. gpt-5.4-mini) are transparently routed through the Responses API with bidirectional translation
-- **Web Search** — Explicit, capability-gated experimental Copilot native search, or configured [Tavily](https://tavily.com)/[Brave Search](https://brave.com/search/api/) alternatives; no silent provider fallback
+- **Web Search** — Native GitHub MCP `web_search` with capability discovery, or explicitly configured [Tavily](https://tavily.com)/[Brave Search](https://brave.com/search/api/) alternatives; no silent provider fallback
 - **Smart Context Management** — Auto-switches to the largest-context model when token count exceeds the requested model's window; image stripping cascade on 413 errors to trigger compaction
 - **Rate Limiting** — Interval-based and sliding-window burst limiting with configurable wait-or-reject behavior
 - **Usage Dashboard** — Web UI showing Copilot quota, premium interactions, and detailed usage stats
@@ -47,7 +47,7 @@ https://github.com/user-attachments/assets/7654b383-669d-4eb9-b23c-06d7aefee8c5
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Middleware Pipeline                           │
 │  Rate Limiter → Burst Limiter → Manual Approval → Token Counter     │
-│  → Model Selector → Web Search Interceptor → Image Validator        │
+│  → Model Selector → Typed Server Search → Image Validator           │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
@@ -100,7 +100,7 @@ The proxy maintains three API protocol translators that convert between formats 
 │  │ • Claude models → Chat Completions translation  │    │
 │  │ • gpt-5/o-series → Responses API translation   │    │
 │  │ • Streaming event translation both directions   │    │
-│  │ • JSON repair for truncated tool arguments      │    │
+│  │ • Validate complete buffered tool arguments     │    │
 │  │ • Reasoning/thinking delta handling             │    │
 │  └─────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────┘
@@ -130,37 +130,36 @@ The proxy maintains three API protocol translators that convert between formats 
 
 ### Web Search Architecture
 
+```text
+Messages request with a supported typed web_search declaration
+  |
+  +-- tool_choice:none --> ordinary completion; no search execution
+  |
+  v
+Shared request preparation and Copilot completion
+  |
+  +-- no search calls --> return normal answer or client tool calls
+  |
+  v
+Execute requested searches within the per-request max_uses budget
+  |
+  +-- WEB_SEARCH_PROVIDER=copilot
+  |     GitHub MCP initialization -> tools/list -> web_search({query})
+  +-- explicit Tavily / Brave configuration
+  |
+  v
+Server tool results + source-link citations + separately labeled AI summary
+  |
+  +-- client tools also requested --> return them for client execution
+  |
+  +-- search-only turn --> feed evidence back to Copilot and continue
+                          (disable further search when budget is exhausted)
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Two-Pass Web Search Flow                       │
-│                                                                  │
-│  Client Request (with web_search tool)                           │
-│        │                                                         │
-│        ▼                                                         │
-│  ┌─────────────┐   Is it a web search?   ┌────────────────────┐ │
-│  │  Interceptor │ ─────────────────────► │ Pass 1: Non-stream │ │
-│  │  Detection   │   typed tool or         │ call to Copilot    │ │
-│  │              │   recognized name       │ (asks what to      │ │
-│  └──────────────┘                         │  search)           │ │
-│                                           └────────┬───────────┘ │
-│                                                    │             │
-│                                                    ▼             │
-│                                 ┌────────────────────────────┐   │
-│                                 │  Execute Search             │   │
-│                                 │  Tavily (preferred)         │   │
-│                                 │   or Brave Search           │   │
-│                                 │  5s timeout, max 5 results  │   │
-│                                 └────────────┬───────────────┘   │
-│                                              │                   │
-│                                              ▼                   │
-│                                 ┌────────────────────────────┐   │
-│                                 │  Pass 2: Full call          │   │
-│                                 │  Injects search results     │   │
-│                                 │  tool_choice: "none"        │   │
-│                                 │  (original stream mode)     │   │
-│                                 └────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
-```
+
+Custom tool names never trigger search interception. Streaming requests receive
+keepalive pings during orchestration, then the same ordered content as nonstream
+responses. Structured-output and compaction requests retain their dedicated
+handling; provider failures never select an unrelated fallback service.
 
 ### Project Structure
 
@@ -491,9 +490,12 @@ keyword preflight or interception on the Messages endpoint.
 Search references use bounded, process-local `copilot-search:v1:` opaque handles
 in the compatibility `encrypted_content`/`encrypted_index` fields. They are **not
 Anthropic ciphertext, encryption, or portable Anthropic replay data**. Replayed
-handles resolve original source snippets; unknown/expired handles fail explicitly.
-Restarting the proxy or eviction beyond 2,000 sources / 8MB total expires them:
-search again. Individual replay records over 64KB fail explicitly.
+handles restore source metadata and any available excerpts; native MCP results
+have no original excerpts. Unknown/expired handles fail explicitly. Restarting
+the proxy or eviction beyond 2,000 sources / 8MB total expires them. Recovery may
+require starting a new conversation or removing the expired search blocks before
+searching again; resending the same rejected history will not repair its handles.
+Individual replay records over 64KB fail explicitly.
 Retrieved content is untrusted evidence, not instructions.
 
 Native protocol sources (reviewed September 9, 2026):
