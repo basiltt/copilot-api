@@ -16,6 +16,7 @@ import { resolveModelId } from "~/lib/model-resolver"
 import { state } from "~/lib/state"
 import { translateToOpenAI } from "~/routes/messages/non-stream-translation"
 import { messageRoutes } from "~/routes/messages/route"
+import { modelRoutes } from "~/routes/models/route"
 import {
   getModelContextWindow,
   getModelMaxOutput,
@@ -25,7 +26,9 @@ import { translateToResponsesPayload } from "~/services/copilot/responses-transl
 
 import { createNativeMcpFixture } from "./fixtures/native-mcp"
 
-const app = new Hono().route("/v1/messages", messageRoutes)
+const app = new Hono()
+  .route("/v1/messages", messageRoutes)
+  .route("/v1/models", modelRoutes)
 const originalState = { ...state }
 let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">> | undefined
 
@@ -393,7 +396,13 @@ describe("Fable context and alias compatibility", () => {
     expect(body.input_tokens).toBeLessThan(20_000)
     expect(fetchSpy?.mock.calls).toHaveLength(0)
   })
-  test.each(["claude-fable-5", "claude-fable-5.1", "claude-fable-5-1"])(
+  test.each([
+    "claude-fable-5",
+    "claude-fable-5.0",
+    "claude-fable-5-0",
+    "claude-fable-5.1",
+    "claude-fable-5-1",
+  ])(
     "%s has exact 1M metadata and estimates cache-miss tokens rather than forcing compaction",
     async (model) => {
       mockUpstream(Response.json(completion("{}")))
@@ -414,6 +423,45 @@ describe("Fable context and alias compatibility", () => {
       expect(body.input_tokens).toBeGreaterThan(0)
       expect(body.input_tokens).toBeLessThan(1000)
       expect(fetchSpy?.mock.calls).toHaveLength(0)
+    },
+  )
+
+  test.each(["claude-fable-5.0", "claude-fable-5-0"])(
+    "%s uses the real catalog model for counting, discovery and inference",
+    async (alias) => {
+      mockUpstream(Response.json(completion('{"runId":"alias-check"}')))
+      const model = knownModelMetadata("claude-fable-5")
+      if (!model) throw new Error("Expected Fable metadata")
+      model.capabilities.limits = {
+        max_prompt_tokens: 200_000,
+        max_output_tokens: 64_000,
+      }
+      model.supported_endpoints = ["/chat/completions"]
+      state.models = { object: "list", data: [model] }
+      const count = await app.request("/v1/messages/count_tokens", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...request(), model: alias }),
+      })
+      const counted = (await count.json()) as { input_tokens: number }
+      expect(count.status).toBe(200)
+      expect(counted.input_tokens).toBeGreaterThan(0)
+      expect(counted.input_tokens).toBeLessThan(1000)
+
+      const discovery = await app.request(`/v1/models/${alias}`)
+      expect(discovery.status).toBe(200)
+      expect(await discovery.json()).toMatchObject({
+        id: "claude-fable-5",
+        context_length: 200_000,
+        max_output_tokens: 64_000,
+      })
+      expect(fetchSpy?.mock.calls).toHaveLength(0)
+      const response = await send({ ...request(), model: alias })
+      expect(response.status).toBe(200)
+      expect(fetchSpy?.mock.calls).toHaveLength(1)
+      const forwarded = upstreamBody(fetchSpy?.mock.calls[0][1]?.body)
+      expect(forwarded.model).toBe("claude-fable-5")
+      expect(await response.text()).toContain('"runId":"alias-check"')
     },
   )
 

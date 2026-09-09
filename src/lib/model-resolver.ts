@@ -7,10 +7,14 @@ import type { ModelsResponse } from "~/services/copilot/get-models"
  * frequently request the all-hyphen form (`claude-opus-4-8`).  Collapsing the
  * separator lets the two forms compare equal.
  *
- * `claude-opus-4.8` and `claude-opus-4-8` both canonicalize to `claude-opus-4-8`.
+ * Fable 5 also accepts an explicit zero minor version; other versions remain
+ * distinct, and catalog matching still prefers exact ids.
  */
-function canonicalize(modelId: string): string {
-  return modelId.toLowerCase().replaceAll(".", "-")
+export function canonicalizeModelId(modelId: string): string {
+  return modelId
+    .toLowerCase()
+    .replaceAll(".", "-")
+    .replace(/^claude-fable-5-0$/, "claude-fable-5")
 }
 
 /**
@@ -50,7 +54,7 @@ export function hasContextWindowSuffix(modelId: string): boolean {
 
 /**
  * Attempts to match a requested id against the catalog, first by exact id,
- * then by separator-insensitive {@link canonicalize} comparison.  Returns the
+ * then by separator-insensitive {@link canonicalizeModelId} comparison. Returns the
  * real catalog id on success, or `undefined` when nothing matches.
  */
 function matchCatalogId(
@@ -61,8 +65,8 @@ function matchCatalogId(
   if (models.data.some((m) => m.id === requestedId)) return requestedId
 
   // Fall back to canonical (separator-insensitive) matching.
-  const target = canonicalize(requestedId)
-  return models.data.find((m) => canonicalize(m.id) === target)?.id
+  const target = canonicalizeModelId(requestedId)
+  return models.data.find((m) => canonicalizeModelId(m.id) === target)?.id
 }
 
 /**
@@ -73,7 +77,7 @@ function matchCatalogId(
  *  1. Exact match — returned verbatim.  This guarantees legitimately
  *     hyphenated ids (e.g. `gpt-4-0125-preview`, `gpt-4`) are never rewritten.
  *  2. Canonical match — the requested id is compared against each available
- *     model using {@link canonicalize}, so `claude-opus-4-8` resolves to the
+ *     model using {@link canonicalizeModelId}, so `claude-opus-4-8` resolves to the
  *     real `claude-opus-4.8`.  The first catalog entry that canonicalizes
  *     equal wins (catalog order, mirroring `Array.find`).
  *  3. Date-stamped match — Anthropic's trailing `-YYYYMMDD` stamp is stripped
@@ -96,7 +100,7 @@ function matchCatalogId(
  * live catalog in preference order.  These are cheap, mechanical turns, so a
  * small fast model is the right target.
  */
-const CODEX_INTERNAL_MODEL_FALLBACKS: Record<string, Array<string>> = {
+const CODEX_INTERNAL_MODEL_FALLBACKS: Partial<Record<string, Array<string>>> = {
   "codex-auto-review": ["gpt-5.4-mini", "gpt-5-mini", "gpt-4o-mini"],
   "trajectory-compaction": ["gpt-5.4-mini", "gpt-5-mini", "gpt-4o-mini"],
 }

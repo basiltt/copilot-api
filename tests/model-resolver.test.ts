@@ -98,6 +98,34 @@ describe("resolveModelId — hyphen/dot normalization", () => {
   })
 })
 
+describe("resolveModelId Fable zero-minor aliases", () => {
+  test.each([
+    "claude-fable-5.0",
+    "claude-fable-5-0",
+    "Claude-Fable-5.0",
+    "claude-fable-5.0[1m]",
+    "claude-fable-5-0-20260901",
+  ])("resolves %s only against an available matching model", (alias) => {
+    expect(resolveModelId(alias, makeModels(["claude-fable-5"]))).toBe(
+      "claude-fable-5",
+    )
+  })
+
+  test("an exact zero-minor catalog entry still wins", () => {
+    const models = makeModels(["claude-fable-5", "claude-fable-5.0"])
+    expect(resolveModelId("claude-fable-5.0", models)).toBe("claude-fable-5.0")
+    expect(resolveModelId("claude-fable-5", models)).toBe("claude-fable-5")
+  })
+
+  test.each([
+    "claude-fable-5.2",
+    "claude-fable-50",
+    "claude-fable-5.0-preview",
+  ])("does not guess a model for %s", (id) => {
+    expect(resolveModelId(id, makeModels(["claude-fable-5"]))).toBe(id)
+  })
+})
+
 describe("resolveModelId — Anthropic date-stamp stripping", () => {
   test("resolves claude-haiku-4-5-20251001 to claude-haiku-4.5", () => {
     expect(resolveModelId("claude-haiku-4-5-20251001", COPILOT_MODELS)).toBe(
@@ -170,9 +198,9 @@ describe("resolveModelId — [1m] context-window marker", () => {
   })
 
   test("strips [1m] combined with an Anthropic date stamp", () => {
-    expect(resolveModelId("claude-haiku-4-5-20251001[1m]", COPILOT_MODELS)).toBe(
-      "claude-haiku-4.5",
-    )
+    expect(
+      resolveModelId("claude-haiku-4-5-20251001[1m]", COPILOT_MODELS),
+    ).toBe("claude-haiku-4.5")
   })
 
   test("is case-insensitive", () => {
@@ -222,7 +250,9 @@ describe("resolveModelId — Codex internal model aliases", () => {
 
   test("returns the id unchanged when no fallback exists in the catalog", () => {
     const noMini = makeModels(["gpt-5.6-sol"])
-    expect(resolveModelId("codex-auto-review", noMini)).toBe("codex-auto-review")
+    expect(resolveModelId("codex-auto-review", noMini)).toBe(
+      "codex-auto-review",
+    )
   })
 
   test("a real catalog entry of the same name always wins", () => {

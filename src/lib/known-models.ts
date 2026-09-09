@@ -1,11 +1,13 @@
 import type { Model } from "~/services/copilot/get-models"
 
+import {
+  canonicalizeModelId,
+  stripContextWindowSuffix,
+} from "~/lib/model-resolver"
+
 /** Estimation metadata only; never added to the catalog or treated as entitlement. */
 export function knownModelMetadata(id: string): Model | undefined {
-  const canonical = id
-    .toLowerCase()
-    .replace(/\[1m\]$/, "")
-    .replaceAll(".", "-")
+  const canonical = canonicalizeModelId(stripContextWindowSuffix(id))
   if (canonical !== "claude-fable-5" && canonical !== "claude-fable-5-1")
     return undefined
   return {

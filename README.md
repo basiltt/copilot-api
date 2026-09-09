@@ -545,8 +545,11 @@ Primary Anthropic references:
 
 ### Claude Fable model metadata
 
-`claude-fable-5` and Fable 5.1 (`claude-fable-5-1` / `claude-fable-5.1`) use exact
-1,000,000-token context and 128,000-token output metadata only when cached metadata
+Fable 5 (`claude-fable-5`, `claude-fable-5.0`, `claude-fable-5-0`) and Fable 5.1
+(`claude-fable-5-1` / `claude-fable-5.1`) share catalog-aware alias normalization
+across discovery, token counting, and inference. Exact catalog IDs take priority;
+the zero-minor alias is anchored to Fable 5, not guessed for unrelated models.
+They use exact 1,000,000-token context and 128,000-token output metadata only when cached metadata
 is missing. The real Copilot catalog ID and limits always win. Known-family cache
 misses estimate actual request tokens rather than returning a synthetic 200,000
 tokens to force compaction; unrelated unknown models are not assigned 1M context.
