@@ -113,6 +113,19 @@ function configureSearchProvider(): void {
   }
 }
 
+export function configureStructuredOutputRecovery(): void {
+  const value = process.env.STRUCTURED_OUTPUT_RECOVERY?.trim().toLowerCase()
+  if (value !== undefined && !["0", "1", "false", "true"].includes(value)) {
+    throw new Error("STRUCTURED_OUTPUT_RECOVERY must be 0, 1, false, or true.")
+  }
+  state.structuredOutputRecovery = value === "1" || value === "true"
+  if (state.structuredOutputRecovery) {
+    consola.info(
+      "StructuredOutput output-only recovery enabled: one same-model regeneration, maximum 20s; executable tools are not recovered.",
+    )
+  }
+}
+
 // eslint-disable-next-line max-lines-per-function -- Startup ordering coordinates authentication, configuration, and server lifetime.
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
@@ -153,6 +166,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.showToken = options.showToken
 
   configureSearchProvider()
+  configureStructuredOutputRecovery()
 
   await ensurePaths()
   await cacheVSCodeVersion()

@@ -105,7 +105,7 @@ type ResponsesContentPart =
 interface ResponsesOutputMessage {
   type: "message"
   role: "assistant"
-  content: Array<{ type: string; text?: string }>
+  content: Array<{ type: string; text?: string; refusal?: string }>
 }
 
 interface ResponsesFunctionCall {
@@ -130,6 +130,7 @@ interface ResponsesResponse {
     input_tokens: number
     output_tokens: number
     total_tokens: number
+    input_tokens_details?: { cached_tokens: number }
   }
 }
 
@@ -1032,8 +1033,33 @@ function emitDoneEvents(
   }
 }
 
+function validateBufferedResponse(resp: ResponsesResponse): void {
+  if (!resp.status) {
+    throw invalidToolInput(
+      "response",
+      "buffered output lacks an explicit completion status",
+    )
+  }
+  if (
+    resp.output.some(
+      (item) =>
+        !["function_call", "message", "reasoning"].includes(item.type)
+        || (item.type === "message"
+          && item.content.some(
+            (part) => !["output_text", "refusal"].includes(part.type),
+          )),
+    )
+  ) {
+    throw invalidToolInput(
+      "response",
+      "unexpected server action in buffered output",
+    )
+  }
+}
+
 export function translateFromResponsesResponse(
   resp: ResponsesResponse,
+  strictOutput = false,
 ): ChatCompletionResponse {
   if (resp.status && resp.status !== "completed") {
     throwResponseError({
@@ -1041,6 +1067,14 @@ export function translateFromResponsesResponse(
       response: { ...resp },
     })
   }
+  if (strictOutput) validateBufferedResponse(resp)
+  const refused =
+    strictOutput
+    && resp.output.some(
+      (item) =>
+        item.type === "message"
+        && item.content.some((part) => part.type === "refusal"),
+    )
   let textContent: string | null = null
   const toolCalls: Array<ToolCall> = []
 
@@ -1049,13 +1083,14 @@ export function translateFromResponsesResponse(
       const texts = item.content
         .filter(
           (c) =>
-            c.type === "output_text" && c.text !== undefined && c.text !== "",
+            (c.type === "output_text" && c.text !== undefined && c.text !== "")
+            || (refused && c.type === "refusal"),
         )
-        .map((c) => c.text as string)
+        .map((c) => c.refusal ?? c.text ?? "")
       if (texts.length > 0) {
         textContent = texts.join("\n\n")
       }
-    } else if (item.type === "function_call") {
+    } else if (item.type === "function_call" && !refused) {
       parseToolInput(item.arguments, item.name)
       toolCalls.push({
         id: item.call_id,
@@ -1068,7 +1103,8 @@ export function translateFromResponsesResponse(
     }
   }
 
-  const finishReason = toolCalls.length > 0 ? "tool_calls" : "stop"
+  const normalFinishReason = toolCalls.length > 0 ? "tool_calls" : "stop"
+  const finishReason = refused ? "content_filter" : normalFinishReason
 
   return {
     id: resp.id,
@@ -1091,6 +1127,9 @@ export function translateFromResponsesResponse(
       prompt_tokens: resp.usage.input_tokens,
       completion_tokens: resp.usage.output_tokens,
       total_tokens: resp.usage.total_tokens,
+      ...(resp.usage.input_tokens_details && {
+        prompt_tokens_details: resp.usage.input_tokens_details,
+      }),
     },
   }
 }

@@ -286,17 +286,7 @@ export const createChatCompletions = async (
 
   const inactivity = createInactivityAbort()
 
-  // Newer models (gpt-5.x) reject `max_tokens` and require
-  // `max_completion_tokens`. Claude models still use `max_tokens`.
-  const { max_tokens, ...rest } = payload
-  const usesMaxCompletionTokens =
-    rest.model.startsWith("gpt-5") || rest.model.startsWith("o")
-  let body: Record<string, unknown> = rest
-  if (max_tokens !== null && max_tokens !== undefined) {
-    const tokenKey =
-      usesMaxCompletionTokens ? "max_completion_tokens" : "max_tokens"
-    body = { ...rest, [tokenKey]: max_tokens }
-  }
+  const body = buildChatRequestBody(payload)
 
   let response: Response | undefined
 
@@ -365,6 +355,136 @@ export const createChatCompletions = async (
 
   inactivity.clear()
   return (await response.json()) as ChatCompletionResponse
+}
+
+function buildChatRequestBody(
+  payload: ChatCompletionsPayload,
+): Record<string, unknown> {
+  // Newer models (gpt-5.x) reject `max_tokens` and require
+  // `max_completion_tokens`. Claude models still use `max_tokens`.
+  const { max_tokens, ...rest } = payload
+  const usesMaxCompletionTokens =
+    rest.model.startsWith("gpt-5") || rest.model.startsWith("o")
+  let body: Record<string, unknown> = rest
+  if (max_tokens !== null && max_tokens !== undefined) {
+    const tokenKey =
+      usesMaxCompletionTokens ? "max_completion_tokens" : "max_tokens"
+    body = { ...rest, [tokenKey]: max_tokens }
+  }
+
+  return body
+}
+
+async function readCompletionBody(
+  response: Response,
+  signal: AbortSignal,
+): Promise<string> {
+  if (signal.aborted) await response.body?.cancel()
+  signal.throwIfAborted()
+  if (!response.body) return ""
+  const reader = response.body.getReader()
+  const cancel = () => {
+    void reader.cancel().catch(() => undefined)
+  }
+  signal.addEventListener("abort", cancel, { once: true })
+  const decoder = new TextDecoder()
+  let text = ""
+  try {
+    while (true) {
+      signal.throwIfAborted()
+      const chunk: { value?: unknown; done: boolean } = await reader.read()
+      const { value, done } = chunk
+      signal.throwIfAborted()
+      if (done) return text + decoder.decode()
+      if (!(value instanceof Uint8Array))
+        throw new Error("Upstream completion body contained a non-byte chunk")
+      text += decoder.decode(value, { stream: true })
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel)
+    reader.releaseLock()
+  }
+}
+
+/** One non-streaming request, including body consumption, with no hidden retries. */
+export async function createOneShotCompletion(
+  payload: ChatCompletionsPayload,
+  usesResponses: boolean,
+  signal: AbortSignal,
+): Promise<ChatCompletionResponse> {
+  signal.throwIfAborted()
+  const nonStreaming = { ...payload, stream: false, stream_options: undefined }
+  const body =
+    usesResponses ?
+      translateToResponsesPayload(nonStreaming)
+    : buildChatRequestBody(nonStreaming)
+  const response = await fetch(
+    `${copilotBaseUrl(state)}/${usesResponses ? "responses" : "chat/completions"}`,
+    {
+      method: "POST",
+      headers: buildRequestHeaders(payload),
+      body: JSON.stringify(body),
+      signal,
+      // @ts-expect-error — Bun-specific option; the caller owns the deadline.
+      timeout: false,
+    },
+  )
+  const text = await readCompletionBody(response, signal)
+  if (!response.ok) {
+    throw new HTTPError(
+      "Copilot completion failed",
+      new Response(text, {
+        status: response.status,
+        headers: response.headers,
+      }),
+    )
+  }
+  let data: unknown
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new HTTPError(
+      "Invalid Copilot completion",
+      Response.json(
+        {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "Upstream completion contained malformed JSON.",
+          },
+        },
+        { status: 502 },
+      ),
+    )
+  }
+  if (data === null || typeof data !== "object") {
+    throw new HTTPError(
+      "Invalid Copilot completion",
+      Response.json(
+        {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: "Upstream completion was not an object.",
+          },
+        },
+        { status: 502 },
+      ),
+    )
+  }
+  if ("error" in data && data.error) {
+    throw new HTTPError(
+      "Copilot completion failed",
+      Response.json(data, { status: 502 }),
+    )
+  }
+  if (usesResponses) {
+    return translateFromResponsesResponse(
+      data as Parameters<typeof translateFromResponsesResponse>[0],
+      true,
+    )
+  }
+  return data as ChatCompletionResponse
 }
 
 // Streaming types
@@ -437,6 +557,7 @@ export interface ChatCompletionResponse {
 interface ResponseMessage {
   role: "assistant"
   content: string | null
+  refusal?: string | null
   tool_calls?: Array<ToolCall>
 }
 

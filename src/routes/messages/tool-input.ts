@@ -1,4 +1,4 @@
-import Ajv, { type ValidateFunction } from "ajv"
+import Ajv, { type ErrorObject, type ValidateFunction } from "ajv"
 import Ajv2019 from "ajv/dist/2019"
 import Ajv2020 from "ajv/dist/2020"
 
@@ -19,6 +19,79 @@ const validators = {
 }
 const compiled = new WeakMap<Record<string, unknown>, ValidateFunction>()
 const WORKFLOW_SELECTORS = ["script", "name", "scriptPath", "runId"]
+const DIAGNOSTIC_KEYWORDS = new Set([
+  "type",
+  "required",
+  "additionalProperties",
+  "unevaluatedProperties",
+  "enum",
+  "const",
+  "anyOf",
+  "oneOf",
+  "allOf",
+  "not",
+  "if",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "minItems",
+  "maxItems",
+  "uniqueItems",
+  "contains",
+  "minContains",
+  "maxContains",
+  "items",
+  "additionalItems",
+  "minProperties",
+  "maxProperties",
+  "dependentRequired",
+  "dependencies",
+  "propertyNames",
+  "false schema",
+])
+
+export interface ToolValidationDiagnostic {
+  keyword: string
+  location: string
+}
+
+function validationDiagnostics(
+  errors: Array<ErrorObject> | null | undefined,
+): Array<ToolValidationDiagnostic> {
+  return (errors ?? []).slice(0, 5).map((error) => {
+    // Even JSON Pointer segments can be customer data (map keys, emails).
+    // Only disclose bounded depth and a known validator keyword, never params.
+    const depth = error.instancePath.split("/").length - 1
+    return {
+      keyword:
+        DIAGNOSTIC_KEYWORDS.has(error.keyword) ? error.keyword : "schema",
+      location:
+        "$" + "/*".repeat(Math.min(depth, 6)) + (depth > 6 ? "/..." : ""),
+    }
+  })
+}
+
+export class ToolSchemaMismatchError extends HTTPError {
+  readonly diagnostics: Array<ToolValidationDiagnostic>
+
+  constructor(name: string, errors: Array<ErrorObject> | null | undefined) {
+    const diagnostics = validationDiagnostics(errors)
+    const detail = diagnostics
+      .map(({ keyword, location }) => `${keyword} at ${location}`)
+      .join("; ")
+    const error = invalidToolInput(
+      name,
+      `arguments do not match the declared input_schema (${detail || "schema mismatch"}; property names and values redacted)`,
+    )
+    super(error.message, error.response)
+    this.diagnostics = diagnostics
+  }
+}
 
 export function toolInputSchema(
   tool: AnthropicCustomTool,
@@ -100,17 +173,17 @@ export function parseToolInput(
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw invalidToolInput(name, "arguments must be a JSON object")
   }
-  if (schema && !compileToolSchema(schema)(input)) {
-    throw invalidToolInput(
-      name,
-      "arguments do not match the declared input_schema",
-    )
+  if (schema) {
+    const validate = compileToolSchema(schema)
+    if (!validate(input))
+      throw new ToolSchemaMismatchError(name, validate.errors)
   }
   return input as Record<string, unknown>
 }
 
 export function invalidToolInput(name: string, reason: string): HTTPError {
-  const message = `Invalid upstream tool call "${name}": ${reason}. No tool was executed; retry the request.`
+  const safeName = /^[\w-]{1,64}$/.test(name) ? name : "[redacted tool name]"
+  const message = `Invalid upstream tool call "${safeName}": ${reason}. No tool was executed; retry the request.`
   return new HTTPError(
     message,
     Response.json(

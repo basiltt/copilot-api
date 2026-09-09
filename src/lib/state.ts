@@ -11,6 +11,7 @@ export interface State {
   manualApprove: boolean
   rateLimitWait: boolean
   showToken: boolean
+  structuredOutputRecovery?: boolean
 
   // Rate limiting configuration
   rateLimitSeconds?: number
@@ -35,6 +36,7 @@ export const state: State = {
   manualApprove: false,
   rateLimitWait: false,
   showToken: false,
+  structuredOutputRecovery: false,
   burstRequestTimestamps: [],
   burstMinSpacingMs: 0,
   burstScope: "global",

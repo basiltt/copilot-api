@@ -21,6 +21,7 @@ import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import {
   createChatCompletions,
+  createOneShotCompletion,
   createResponsesCompletion,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
@@ -61,6 +62,11 @@ import {
   translateChunkToAnthropicEvents,
   translateErrorToAnthropicErrorEvent,
 } from "./stream-translation"
+import {
+  type OutputCompletion,
+  translateWithOutputRecovery,
+  usesStructuredOutputRecovery,
+} from "./structured-output-recovery"
 import {
   createToolNameMapFromAnthropicPayload,
   type ToolNameMap,
@@ -185,7 +191,12 @@ export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
-  consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
+  if (!usesStructuredOutputRecovery(anthropicPayload)) {
+    consola.debug(
+      "Anthropic request payload:",
+      JSON.stringify(anthropicPayload),
+    )
+  }
 
   // Normalize the requested model id (e.g. `claude-opus-4-8` → `claude-opus-4.8`)
   // to a real Copilot model before any downstream lookup or forwarding.
@@ -263,6 +274,12 @@ export async function handleCompletion(c: Context) {
     && !looksLikeCompactionRequest(anthropicPayload)
   ) {
     return handleServerSearch(c, anthropicPayload, searchLimit)
+  }
+  if (
+    usesStructuredOutputRecovery(anthropicPayload)
+    && !looksLikeCompactionRequest(anthropicPayload)
+  ) {
+    return handleOutputTool(c, anthropicPayload)
   }
   // For non-streaming requests just fetch and translate synchronously —
   // no SSE connection needed, so no ping mechanism required.
@@ -393,6 +410,56 @@ async function handleServerSearch(
     const contextWindowMessage = await extractContextWindowMessage(error)
     if (error instanceof CompactionNeededError || contextWindowMessage) {
       return sendAnthropicContextWindowError(c, contextWindowMessage ?? "", {
+        status: 400,
+        modelLimit: lookupModelLimit(payload.model),
+      })
+    }
+    throw error
+  }
+}
+
+const completeOutputTool: OutputCompletion = async (request, requestSignal) => {
+  const response = await fetchCopilotResponse(
+    { ...request, stream: false },
+    requestSignal,
+  )
+  if (!isNonStreaming(response))
+    throw new Error("Expected buffered output response")
+  return response
+}
+
+async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
+  const disconnect = new AbortController()
+  const signal = AbortSignal.any([c.req.raw.signal, disconnect.signal])
+  const run = () =>
+    fetchNonStreamingAnthropicResponse(
+      { ...payload, stream: false },
+      { signal, complete: completeOutputTool },
+    )
+  if (payload.stream) {
+    return streamSSE(c, async (stream) => {
+      const stopKeepalive = startSSEKeepalive(stream)
+      stream.onAbort(() => {
+        stopKeepalive()
+        disconnect.abort(new Error("Client disconnected"))
+      })
+      try {
+        const response = await run()
+        signal.throwIfAborted()
+        await emitAnthropicResponseAsSSE(stream, response)
+      } catch (error) {
+        if (!signal.aborted)
+          await emitStreamingError(stream, error, payload.model)
+      } finally {
+        stopKeepalive()
+      }
+    })
+  }
+  try {
+    return c.json(await run())
+  } catch (error) {
+    if (error instanceof CompactionNeededError) {
+      return sendAnthropicContextWindowError(c, "", {
         status: 400,
         modelLimit: lookupModelLimit(payload.model),
       })
@@ -912,20 +979,45 @@ export function buildSyntheticCompactionResponse(
 
 async function fetchNonStreamingAnthropicResponse(
   anthropicPayload: AnthropicMessagesPayload,
+  outputRecovery?: { signal: AbortSignal; complete: OutputCompletion },
 ): Promise<AnthropicResponse> {
-  const result = await fetchWithImageStripping(
-    fetchCopilotResponse,
-    anthropicPayload,
-  )
+  let preparedPayload = anthropicPayload
+  const initial = new AbortController()
+  const timer =
+    outputRecovery ?
+      setTimeout(
+        () => initial.abort(new Error("Initial output generation timed out")),
+        300_000,
+      )
+    : undefined
+  const signal =
+    outputRecovery ?
+      AbortSignal.any([initial.signal, outputRecovery.signal])
+    : undefined
+  let result: ImageStrippingResult<
+    Awaited<ReturnType<typeof fetchCopilotResponse>>
+  >
+  try {
+    result = await fetchWithImageStripping(async (prepared) => {
+      preparedPayload = prepared
+      if (outputRecovery && signal)
+        return outputRecovery.complete(prepared, signal)
+      return fetchCopilotResponse(prepared)
+    }, anthropicPayload)
+  } finally {
+    clearTimeout(timer)
+  }
 
   if (!isNonStreaming(result.response)) {
     throw new Error("Unexpected streaming response.")
   }
 
-  consola.debug(
-    "Non-streaming response from Copilot:",
-    JSON.stringify(result.response).slice(-400),
-  )
+  if (!outputRecovery) {
+    consola.debug(
+      "Non-streaming response from Copilot:",
+      JSON.stringify(result.response).slice(-400),
+    )
+  }
 
   let response = result.response
   if (isEmptyNonStreamingResponse(response)) {
@@ -946,17 +1038,25 @@ async function fetchNonStreamingAnthropicResponse(
   }
 
   const toolNameMap = createToolNameMapFromAnthropicPayload(anthropicPayload)
-  const anthropicResponse = translateToAnthropic(response, toolNameMap)
+  const anthropicResponse =
+    outputRecovery ?
+      await translateWithOutputRecovery(preparedPayload, response, {
+        map: toolNameMap,
+        ...outputRecovery,
+      })
+    : translateToAnthropic(response, toolNameMap)
   if (result.strippedBase64Chars > 0) {
     anthropicResponse.usage.input_tokens += estimateTokensForStrippedImages(
       result.strippedBase64Chars,
     )
   }
 
-  consola.debug(
-    "Translated Anthropic response:",
-    JSON.stringify(anthropicResponse),
-  )
+  if (!outputRecovery) {
+    consola.debug(
+      "Translated Anthropic response:",
+      JSON.stringify(anthropicResponse),
+    )
+  }
   return anthropicResponse
 }
 
@@ -1209,12 +1309,15 @@ function clampMaxTokens(
 
 async function fetchCopilotResponse(
   anthropicPayload: AnthropicMessagesPayload,
+  outputSignal?: AbortSignal,
 ): ReturnType<typeof createChatCompletions> {
   const openAIPayload = translateToOpenAI(anthropicPayload)
-  consola.debug(
-    "Translated OpenAI request payload:",
-    JSON.stringify(openAIPayload),
-  )
+  if (!outputSignal) {
+    consola.debug(
+      "Translated OpenAI request payload:",
+      JSON.stringify(openAIPayload),
+    )
+  }
 
   const selectedModel = state.models?.data.find(
     (m) => m.id === openAIPayload.model,
@@ -1224,6 +1327,13 @@ async function fetchCopilotResponse(
     openAIPayload,
     selectedModel ? getModelMaxOutput(selectedModel) : undefined,
   )
+  if (outputSignal) {
+    return createOneShotCompletion(
+      openAIPayload,
+      selectedModel !== undefined && requiresResponsesApi(selectedModel),
+      outputSignal,
+    )
+  }
   consola.debug(
     `[routing] model=${openAIPayload.model} found=${selectedModel !== undefined} requiresResponses=${selectedModel !== undefined && requiresResponsesApi(selectedModel)} endpoints=${JSON.stringify(selectedModel?.supported_endpoints)}`,
   )
