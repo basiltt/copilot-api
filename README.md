@@ -582,6 +582,13 @@ unions, conditionals, nested schemas, malformed arguments, unknown properties,
 other missing requirements, invalid existing values, mixed calls, prose,
 refusals, policy errors, and truncated turns are not corrected.
 
+Enabling the flag routes an otherwise eligible nonstreaming request that
+declares this flat `Write` tool through the existing one-shot output-tool
+transport for its initial completion, even when the model does not call
+`Write`. That initial completion therefore does not use the normal completion
+transport's transient HTTP retries. A valid response or a response without a
+`Write` call is returned without the additional correction request.
+
 The one additional request uses the original model, conversation, and unchanged
 schema, exposes only the original `Write` tool, and uses `tool_choice: auto`.
 Existing arguments are sent back to the same model as explicitly untrusted data
