@@ -4,6 +4,7 @@ import { HTTPError } from "~/lib/error"
 import { extractSessionId } from "~/lib/session-id"
 
 import type {
+  AnthropicBrowserStateBlock,
   AnthropicDocumentBlock,
   AnthropicImageBlock,
   AnthropicMessagesPayload,
@@ -105,6 +106,7 @@ function collectToolResultImages(
     | AnthropicImageBlock
     | AnthropicDocumentBlock
     | AnthropicToolReferenceBlock
+    | AnthropicBrowserStateBlock
   >,
   refs: Array<ImageRef>,
   messageIndex: number,

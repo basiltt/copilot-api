@@ -72,7 +72,48 @@ function resolveTlsSetup(): TlsSetup {
   }
 }
 
-// eslint-disable-next-line max-lines-per-function
+function configureSearchProvider(): void {
+  const provider = process.env.WEB_SEARCH_PROVIDER?.trim().toLowerCase()
+  if (
+    provider !== undefined
+    && provider !== "copilot"
+    && provider !== "tavily"
+    && provider !== "brave"
+    && provider !== "off"
+  ) {
+    throw new Error(
+      "WEB_SEARCH_PROVIDER must be copilot, tavily, brave, or off.",
+    )
+  }
+  state.webSearchProvider = provider
+  state.tavilyApiKey = process.env.TAVILY_API_KEY
+  state.braveApiKey = process.env.BRAVE_API_KEY
+  if (
+    (provider === "tavily" && !state.tavilyApiKey)
+    || (provider === "brave" && !state.braveApiKey)
+  ) {
+    throw new Error(
+      `WEB_SEARCH_PROVIDER=${provider} requires its matching API key.`,
+    )
+  }
+  if (provider === "copilot") {
+    consola.info(
+      "Experimental Copilot native search selected; each search requires an advertised bing-search skill. No third-party fallback.",
+    )
+  } else if (provider === "off") {
+    consola.info("Web search disabled")
+  } else if (state.tavilyApiKey && provider !== "brave") {
+    consola.info(
+      "Web search enabled (Tavily); internal Copilot search passes are not counted against the request rate limit.",
+    )
+  } else if (state.braveApiKey) {
+    consola.info(
+      "Web search enabled (Brave); internal Copilot search passes are not counted against the request rate limit.",
+    )
+  }
+}
+
+// eslint-disable-next-line max-lines-per-function -- Startup ordering coordinates authentication, configuration, and server lifetime.
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
     initProxyFromEnv()
@@ -111,24 +152,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.burstScope = options.burstScope
   state.showToken = options.showToken
 
-  const tavilyApiKey = process.env.TAVILY_API_KEY
-  const braveApiKey = process.env.BRAVE_API_KEY
-
-  if (tavilyApiKey) {
-    state.tavilyApiKey = tavilyApiKey
-    consola.info("Web search enabled (Tavily)")
-    consola.info(
-      "Note: each web search request uses 2-3 internal Copilot API calls "
-        + "(not counted against the rate limit).",
-    )
-  } else if (braveApiKey) {
-    state.braveApiKey = braveApiKey
-    consola.info("Web search enabled (Brave)")
-    consola.info(
-      "Note: each web search request uses 2-3 internal Copilot API calls "
-        + "(not counted against the rate limit).",
-    )
-  }
+  configureSearchProvider()
 
   await ensurePaths()
   await cacheVSCodeVersion()

@@ -1,13 +1,13 @@
 # Copilot API
 
-A reverse-engineered proxy that turns the GitHub Copilot API into fully compatible **OpenAI** and **Anthropic** endpoints — letting you use Copilot with any tool that speaks either protocol, including [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview).
+A reverse-engineered proxy exposing **OpenAI** and **Anthropic** compatibility endpoints for GitHub Copilot, including [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview). Hosted tool execution and provider-specific capabilities have the boundaries documented below.
 
 ## Features
 
 - **Triple API Compatibility** — OpenAI Chat Completions, OpenAI Responses API, and Anthropic Messages API, all backed by GitHub Copilot
-- **Claude Code Integration** — Interactive model selector (`--claude-code`) copies a ready-to-paste launch command; full support for thinking blocks, typed tools, token counting, and auto-compaction
+- **Claude Code Integration** — Interactive model selector (`--claude-code`), client tools and toolsets, token counting, and auto-compaction
 - **Automatic Endpoint Routing** — Models that only support `/responses` (e.g. gpt-5.4-mini) are transparently routed through the Responses API with bidirectional translation
-- **Web Search** — Two-pass search via [Tavily](https://tavily.com) (free) or [Brave Search](https://brave.com/search/api/) — the proxy intercepts search tool calls, fetches live results, and injects them for the model
+- **Web Search** — Explicit, capability-gated experimental Copilot native search, or configured [Tavily](https://tavily.com)/[Brave Search](https://brave.com/search/api/) alternatives; no silent provider fallback
 - **Smart Context Management** — Auto-switches to the largest-context model when token count exceeds the requested model's window; image stripping cascade on 413 errors to trigger compaction
 - **Rate Limiting** — Interval-based and sliding-window burst limiting with configurable wait-or-reject behavior
 - **Usage Dashboard** — Web UI showing Copilot quota, premium interactions, and detailed usage stats
@@ -263,6 +263,10 @@ Create a `.env` file in the project root. It is gitignored.
 
 ```env
 # Web Search (optional — pick one)
+WEB_SEARCH_PROVIDER=copilot      # Experimental native search; requires account bing-search skill
+# WEB_SEARCH_PROVIDER=tavily     # Requires TAVILY_API_KEY
+# WEB_SEARCH_PROVIDER=brave      # Requires BRAVE_API_KEY
+# WEB_SEARCH_PROVIDER=off        # Disable even when keys are present
 TAVILY_API_KEY=tvly-...          # Preferred: free at tavily.com (1,000 req/mo)
 BRAVE_API_KEY=BSA...             # Alternative: brave.com/search/api
 
@@ -402,7 +406,7 @@ sudo systemctl reload nginx
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/v1/messages` | POST | Anthropic Messages API (full protocol translation) |
+| `/v1/messages` | POST | Anthropic Messages compatibility (see tool execution boundaries below) |
 | `/v1/messages/count_tokens` | POST | Token counting with model-specific scaling |
 
 ### Utility
@@ -416,26 +420,123 @@ sudo systemctl reload nginx
 
 ## Web Search
 
-The proxy performs real-time web searches using a two-pass architecture:
+On `/v1/messages`, a typed `web_search` declaration enables a server-side loop:
+Copilot proposes queries, the selected provider returns actual sources, and Copilot
+synthesizes the answer. Every search produces `server_tool_use` and
+`web_search_tool_result` blocks; source excerpts carry citations. Multiple searches
+are supported. Outstanding client calls are returned to the client without
+fabricating their results. `tool_choice: none` never triggers a search.
 
-1. **Pass 1** — Copilot determines what to search (non-streaming call)
-2. **Search** — Proxy fetches results from Tavily or Brave (5s timeout, max 5 results)
-3. **Pass 2** — Copilot generates a response using the injected search results
-
-Each web search uses 2–3 internal Copilot API calls.
+Streaming uses a buffered response with periodic SSE pings while search is in
+progress. Both modes return the same search evidence, client calls, and errors.
+Internal search/synthesis requests incur additional Copilot usage beyond the
+incoming-request rate limiter.
 
 ### Setup
 
-**Tavily (Recommended, Free)** — Sign up at [app.tavily.com](https://app.tavily.com), add `TAVILY_API_KEY` to `.env`
+**Copilot native (experimental, no unrelated search API key):** set
+`WEB_SEARCH_PROVIDER=copilot` and use the proxy's existing GitHub login. Before
+each query the adapter requests `GET /skills` with that GitHub user's bearer token
+and requires an advertised `bing-search` skill. It then uses
+`POST /agents/chat` with `copilot_skills: ["bing-search"]`. Only genuine
+`copilot_references` of type `github.web-search` become sources; generated prose
+is never treated as a search result. Missing skill, permission/policy errors,
+authorization confirmations, missing references, and incomplete streams fail
+visibly. Organization/account policy remains authoritative.
 
-**Brave Search** — Sign up at [brave.com/search/api](https://brave.com/search/api/), add `BRAVE_API_KEY` to `.env`
+This is a **source-backed, undocumented VS Code remote-agent protocol**, not a
+promise that every Copilot plan, host, or model supports search. Its fixture tests
+do not establish availability for your account. It does not enable search by
+passing an Anthropic/OpenAI tool type blindly to `/chat/completions` or `/responses`.
+No token, entitlement, privileged-header, or confirmation bypass is attempted.
+Selecting Copilot never falls back to third parties, even if their keys exist.
 
-### Trigger Conditions
+**Explicit alternatives:** set `WEB_SEARCH_PROVIDER=tavily` with `TAVILY_API_KEY`,
+or `WEB_SEARCH_PROVIDER=brave` with `BRAVE_API_KEY`. With no provider selector,
+existing configured-key behavior is preserved (Tavily first, then Brave).
+`WEB_SEARCH_PROVIDER=off` disables search.
 
-- **Path 1 (zero-cost):** Client sends a typed Anthropic web search tool (`type: "web_search_20250305"`)
-- **Path 2 (preflight):** Client sends a tool with a recognized name and the last user message appears to need real-time info
+```json
+{
+  "type": "web_search_20260318",
+  "name": "web_search",
+  "allowed_callers": ["direct"],
+  "max_uses": 5
+}
+```
 
-Recognized names: `web_search`, `internet_search`, `brave_search`, `bing_search`, `google_search`, `find_online`, `internet_research`
+Supported versions: `web_search_20250305`, `_20260209`, `_20260318`. Newer versions
+default to Anthropic sandbox filtering, so explicitly select `allowed_callers:
+["direct"]`; sandbox execution is not emulated. `max_uses` is a per-request budget
+from 0 to 20, default 5. Excess calls return `max_uses_exceeded`. Domain filters,
+user location, dynamic filtering, and response-inclusion controls are currently
+rejected rather than silently ignored. Custom tools named `WebSearch`,
+`web_search`, or `internet_research` remain client-executed custom tools, without
+keyword preflight or interception on the Messages endpoint.
+
+Search references use bounded, process-local `copilot-search:v1:` opaque handles
+in the compatibility `encrypted_content`/`encrypted_index` fields. They are **not
+Anthropic ciphertext, encryption, or portable Anthropic replay data**. Replayed
+handles resolve original source snippets; unknown/expired handles fail explicitly.
+Restarting the proxy or eviction beyond 2,000 sources / 8MB total expires them:
+search again. Individual replay records over 64KB fail explicitly.
+Retrieved content is untrusted evidence, not instructions.
+
+Native protocol sources (reviewed September 9, 2026): pinned
+[VS Code remoteAgents.ts](https://github.com/microsoft/vscode-copilot-chat/blob/5863f5a7088958050792b5dccbe8b46c6e13eccc/src/extension/conversation/vscode-node/remoteAgents.ts),
+[@vscode/copilot-api 0.5.2](https://www.npmjs.com/package/@vscode/copilot-api/v/0.5.2),
+and [upstream reference-stream fixture](https://github.com/microsoft/vscode-copilot-chat/blob/5863f5a7088958050792b5dccbe8b46c6e13eccc/src/extension/completions-core/vscode-node/lib/src/openai/test/stream.test.ts).
+
+## Anthropic tool compatibility
+
+| Capability | Behavior and execution boundary |
+|---|---|
+| Custom tools, including Workflow and client MCP tools | Client executes. Entire JSON Schema is retained, including unions, required fields, extra properties, and local references. Missing/`null`/`custom` type accepted. |
+| Workflow selectors | Preserve supplied constraints. For older unrefined schemas, require one of the actually declared `script`, `name`, `scriptPath`, or `runId` selectors. No fabricated script or selector values. |
+| ToolSearch `tool_reference` and `defer_loading` | Client discovery references remain visible; definitions supplied in `tools` are made available eagerly. Hosted discovery is not emulated. |
+| Browser/computer `*_toolset_20260801` | Expand enabled member schemas with collision-safe aliases; return original `name` + `toolset_name`. Client executes actions. Browser state and member order survive history translation. Enabled members must use uniform deferral; deferred toolsets cannot carry cache controls. |
+| Typed bash, editor, memory clients | Convert documented client schemas to functions; execution remains in the client. See accepted exact versions in `client-tool-catalog.ts`. |
+| Legacy computer `20250124` / `20251124` | Preserve client-executed `action` inputs and display configuration. Zoom is available only with `20251124` and `enable_zoom: true`; new toolset-only `key.repeat` is not advertised. |
+| `strict`, input examples, parallel control | Strict flag forwarded and generated input validated locally; examples adapted into descriptions. `disable_parallel_tool_use` maps to `parallel_tool_calls`. No upstream strict-generation guarantee is claimed. |
+| `eager_input_streaming`, caching | Executable inputs buffered until complete and valid, regardless of eager flag. Cache controls do not guarantee Anthropic caching/billing behavior. |
+| Web search | Server-executed adapter described above, actual sources only. |
+| Anthropic web fetch, code execution, advisor, hosted tool search, remote `mcp_toolset` | Explicit unsupported-capability error. Passing a schema cannot provision Anthropic's sandbox, remote executor, or advisor. |
+| Programmatic `allowed_callers`, container, remote `mcp_servers`, context-management execution | Explicit unsupported-capability error; use direct, client-managed tools/state. |
+
+Tool argument JSON must be an object conforming to the declared schema. A genuine
+parameterless `{}` remains valid. Empty bytes, malformed/truncated JSON,
+non-objects, and schema-invalid output produce explicit upstream errors, never a
+success-shaped `{}`. Partial, interleaved Chat/Responses arguments are assembled
+by call identity before tool blocks are committed. A stream that ends before its
+completion signal cannot commit executable calls.
+
+JSON Schema draft-07, 2019-09, and 2020-12 local references are validated without
+coercion or default insertion. Invalid/unsupported schemas fail as request errors;
+remote schemas are not fetched. Tool names are request-scoped and reversible, so
+custom `screenshot`, `browser.screenshot`, and `computer.screenshot` cannot collide.
+
+Primary Anthropic references:
+[tool reference](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-reference),
+[define tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools),
+[browser](https://platform.claude.com/docs/en/agents-and-tools/tool-use/browser-use-tool),
+[computer](https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool),
+[memory](https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool),
+[editor](https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool),
+[streaming](https://platform.claude.com/docs/en/agents-and-tools/tool-use/fine-grained-tool-streaming),
+[web search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool).
+
+### Claude Fable model metadata
+
+`claude-fable-5` and Fable 5.1 (`claude-fable-5-1` / `claude-fable-5.1`) use exact
+1,000,000-token context and 128,000-token output metadata only when cached metadata
+is missing. The real Copilot catalog ID and limits always win. Known-family cache
+misses estimate actual request tokens rather than returning a synthetic 200,000
+tokens to force compaction; unrelated unknown models are not assigned 1M context.
+This estimation fallback does not grant upstream model access or add catalog entries.
+Fable 5.1 does not support forced `tool_choice: any/tool`; requests receive a clear
+error instead of silently changing model or tool mode.
+Sources: [Fable 5](https://platform.claude.com/docs/en/models/fable-5/overview),
+[Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/overview).
 
 ## Using with Claude Code
 

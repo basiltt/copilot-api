@@ -426,7 +426,7 @@ describe("translateFromResponsesStream", () => {
     // Simulate a tool call being added
     const addedEvent = {
       type: "response.output_item.added",
-      item: { call_id: "call_123", name: "my_tool" },
+      item: { call_id: "call_123", name: "my_tool", arguments: "{}" },
     }
     translateFromResponsesStream(addedEvent, {
       responseId: "resp_xyz",
@@ -446,7 +446,7 @@ describe("translateFromResponsesStream", () => {
     expect(chunks).not.toBeNull()
     expect(Array.isArray(chunks)).toBe(true)
     const arr = chunks as Array<{ data: string }>
-    const parsed = JSON.parse(arr[0].data) as {
+    const parsed = JSON.parse(arr[1].data) as {
       choices: Array<{ delta: Record<string, unknown>; finish_reason: string }>
     }
     expect(parsed.choices[0].finish_reason).toBe("tool_calls")
@@ -475,7 +475,7 @@ describe("translateFromResponsesStream", () => {
 // ─── translateFromResponsesStream (tool calls) ───────────────────────────
 
 describe("translateFromResponsesStream (tool calls)", () => {
-  test("translates function_call delta event to tool_calls delta chunk (without prior output_item.added)", () => {
+  test("rejects function arguments without a known tool identity", () => {
     const state = createResponsesStreamState()
     const event = {
       type: "response.function_call_arguments.delta",
@@ -483,25 +483,16 @@ describe("translateFromResponsesStream (tool calls)", () => {
       item_id: "call_1",
       output_index: 0,
     }
-    const chunk = translateFromResponsesStream(event, {
-      responseId: "resp_xyz",
-      model: "gpt-5.4",
-      streamState: state,
-    })
-    expect(chunk).not.toBeNull()
-    if (!chunk || Array.isArray(chunk)) throw new Error("unexpected result")
-    const parsed = JSON.parse(chunk.data as string) as {
-      choices: Array<{
-        delta: { tool_calls: Array<{ function: { arguments: string } }> }
-        finish_reason: string | null
-      }>
-    }
-    expect(parsed.choices[0].delta.tool_calls[0].function.arguments).toBe(
-      '{"city":',
-    )
+    expect(() =>
+      translateFromResponsesStream(event, {
+        responseId: "resp_xyz",
+        model: "gpt-5.4",
+        streamState: state,
+      }),
+    ).toThrow("unknown indexed")
   })
 
-  test("attaches call_id and name from output_item.added to first function_call delta", () => {
+  test("buffers arguments and retains identity when Copilot obfuscates item ids", () => {
     const state = createResponsesStreamState()
 
     // First, the Responses API sends the output_item.added event with function call metadata.
@@ -537,25 +528,7 @@ describe("translateFromResponsesStream (tool calls)", () => {
       model: "gpt-5.4",
       streamState: state,
     })
-    expect(chunk).not.toBeNull()
-    if (!chunk || Array.isArray(chunk)) throw new Error("unexpected result")
-    const parsed = JSON.parse(chunk.data as string) as {
-      choices: Array<{
-        delta: {
-          tool_calls: Array<{
-            index: number
-            id?: string
-            type?: string
-            function: { name?: string; arguments: string }
-          }>
-        }
-      }>
-    }
-    const tc = parsed.choices[0].delta.tool_calls[0]
-    expect(tc.id).toBe("call_abc123")
-    expect(tc.type).toBe("function")
-    expect(tc.function.name).toBe("get_weather")
-    expect(tc.function.arguments).toBe('{"city":')
+    expect(chunk).toBeNull()
 
     // Subsequent deltas should NOT include id/name again
     const delta2Event = {
@@ -569,9 +542,17 @@ describe("translateFromResponsesStream (tool calls)", () => {
       model: "gpt-5.4",
       streamState: state,
     })
-    expect(chunk2).not.toBeNull()
-    if (!chunk2 || Array.isArray(chunk2)) throw new Error("unexpected result")
-    const parsed2 = JSON.parse(chunk2.data as string) as {
+    expect(chunk2).toBeNull()
+    const finished = translateFromResponsesStream(
+      { type: "response.completed" },
+      {
+        responseId: "resp_xyz",
+        model: "gpt-5.4",
+        streamState: state,
+      },
+    )
+    if (!Array.isArray(finished)) throw new Error("Expected completion chunks")
+    const parsed2 = JSON.parse(finished[0].data as string) as {
       choices: Array<{
         delta: {
           tool_calls: Array<{
@@ -584,10 +565,10 @@ describe("translateFromResponsesStream (tool calls)", () => {
       }>
     }
     const tc2 = parsed2.choices[0].delta.tool_calls[0]
-    expect(tc2.id).toBeUndefined()
-    expect(tc2.type).toBeUndefined()
-    expect(tc2.function.name).toBeUndefined()
-    expect(tc2.function.arguments).toBe('"London"}')
+    expect(tc2.id).toBe("call_abc123")
+    expect(tc2.type).toBe("function")
+    expect(tc2.function.name).toBe("get_weather")
+    expect(tc2.function.arguments).toBe('{"city":"London"}')
   })
 
   test("returns null for unrecognised event types", () => {

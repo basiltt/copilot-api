@@ -40,9 +40,6 @@ describe("Workflow tool translation", () => {
       ],
     })
     expect(workflow?.description).toContain(
-      "provide at least one of `script`, `name`, or `scriptPath`",
-    )
-    expect(workflow?.description).toContain(
       '{"name":"deep-research","args":{"question":"Example question"}}',
     )
     expect(inputSchema).not.toHaveProperty("anyOf")

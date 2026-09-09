@@ -40,6 +40,7 @@
     "*": "bun run lint --fix"
   },
   "dependencies": {
+    "ajv": "^8.17.1",
     "citty": "^0.1.6",
     "clipboardy": "^5.0.0",
     "consola": "^3.4.2",

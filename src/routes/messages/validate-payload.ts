@@ -10,6 +10,83 @@
  * Validation lives here, and runs in the route wrapper rather than the handler,
  * so the handler stays focused on translation.
  */
+import { expandClientTool } from "./client-tool-catalog"
+
+const WEB_SEARCH_TYPES = new Set([
+  "web_search_20250305",
+  "web_search_20260209",
+  "web_search_20260318",
+])
+
+function validateTools(tools: unknown): string | undefined {
+  if (tools === undefined) return undefined
+  if (!Array.isArray(tools)) return "`tools` must be an array."
+  const names = new Set<string>()
+  for (const [index, entry] of (tools as Array<unknown>).entries()) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      return `tools.${index}: must be an object.`
+    const tool = entry as Record<string, unknown>
+    try {
+      for (const identity of toolIdentities(tool)) {
+        if (names.has(identity))
+          return `tools.${index}: duplicate tool or toolset identity.`
+        names.add(identity)
+      }
+    } catch (error) {
+      return `tools.${index}: ${error instanceof Error ? error.message : "invalid client tool definition"}.`
+    }
+  }
+  return undefined
+}
+
+function toolIdentities(tool: Record<string, unknown>): Array<string> {
+  if ("input_schema" in tool) {
+    validateCustomTool(tool)
+    return [JSON.stringify(["client", tool.name])]
+  }
+  if (typeof tool.type === "string" && WEB_SEARCH_TYPES.has(tool.type)) {
+    if (tool.name !== "web_search")
+      throw new Error('Web search requires name "web_search"')
+    return [JSON.stringify(["server", "web_search"])]
+  }
+  const expanded = expandClientTool(tool)
+  if (!expanded)
+    throw new Error(
+      `${String(tool.type)} is not a supported client tool. Anthropic hosted discovery, sandbox, advisor, and remote MCP execution are not supplied by Copilot; use client-executed custom tools instead`,
+    )
+  const scoped = expanded[0].toolset_name
+  return scoped ?
+      [JSON.stringify(["toolset", scoped]), JSON.stringify(["client", scoped])]
+    : expanded.map((member) => JSON.stringify(["client", member.name]))
+}
+
+function validateCustomTool(tool: Record<string, unknown>): void {
+  if (tool.type !== undefined && tool.type !== null && tool.type !== "custom") {
+    throw new Error(
+      "Typed tools cannot become custom executors by supplying input_schema",
+    )
+  }
+  if (typeof tool.name !== "string" || !tool.name)
+    throw new Error("name must be a non-empty string")
+  if (
+    !tool.input_schema
+    || typeof tool.input_schema !== "object"
+    || Array.isArray(tool.input_schema)
+  ) {
+    throw new Error("input_schema must be a JSON Schema object")
+  }
+  const callers = tool.allowed_callers
+  if (
+    callers !== undefined
+    && (!Array.isArray(callers)
+      || callers.length !== 1
+      || callers[0] !== "direct")
+  ) {
+    throw new Error(
+      'Only allowed_callers: ["direct"] is supported; Anthropic programmatic execution is not available through Copilot',
+    )
+  }
+}
 
 /**
  * Validates the `messages` array.
@@ -86,5 +163,18 @@ export function validateAnthropicPayload(payload: unknown): string | undefined {
     return "`model` is required and must be a non-empty string."
   }
 
-  return validateMessagesArray(p.messages) ?? validateMaxTokens(p.max_tokens)
+  if (
+    (p.mcp_servers !== null
+      && p.mcp_servers !== undefined
+      && (!Array.isArray(p.mcp_servers) || p.mcp_servers.length > 0))
+    || (p.container !== null && p.container !== undefined)
+    || (p.context_management !== null && p.context_management !== undefined)
+  ) {
+    return "Anthropic mcp_servers, container, and context_management execution are not supported through Copilot. Use client-managed tools and conversation state."
+  }
+  return (
+    validateMessagesArray(p.messages)
+    ?? validateMaxTokens(p.max_tokens)
+    ?? validateTools(p.tools)
+  )
 }

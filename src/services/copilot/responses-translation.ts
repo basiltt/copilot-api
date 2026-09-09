@@ -7,7 +7,9 @@ import type { SSEMessage } from "hono/streaming"
 
 import consola from "consola"
 
+import { HTTPError, extractUpstreamErrorMessage } from "~/lib/error"
 import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
+import { invalidToolInput, parseToolInput } from "~/routes/messages/tool-input"
 
 import type {
   ContentPart,
@@ -61,7 +63,11 @@ export interface ResponsesPayload {
   top_p?: number
   stream?: boolean | null
   tools?: Array<ResponsesTool>
-  tool_choice?: ChatCompletionsPayload["tool_choice"]
+  tool_choice?:
+    | "none"
+    | "auto"
+    | "required"
+    | { type: "function"; name: string }
   parallel_tool_calls?: boolean
   reasoning?: ChatCompletionsPayload["reasoning"]
   text?: {
@@ -109,11 +115,16 @@ interface ResponsesFunctionCall {
   arguments: string
 }
 
-type ResponsesOutputItem = ResponsesOutputMessage | ResponsesFunctionCall
+type ResponsesOutputItem =
+  | ResponsesOutputMessage
+  | ResponsesFunctionCall
+  | { type: "reasoning"; summary?: Array<{ text?: string }> }
 
 interface ResponsesResponse {
   id: string
   model: string
+  status?: string
+  error?: unknown
   output: Array<ResponsesOutputItem>
   usage: {
     input_tokens: number
@@ -277,13 +288,18 @@ function buildOptionalScalars(
   payload: ChatCompletionsPayload,
 ): Partial<ResponsesPayload> {
   const out: Partial<ResponsesPayload> = {}
+  if (isSet(payload.parallel_tool_calls))
+    out.parallel_tool_calls = payload.parallel_tool_calls
   if (isSet(payload.max_tokens)) out.max_output_tokens = payload.max_tokens
   if (isSet(payload.temperature)) out.temperature = payload.temperature
   if (isSet(payload.top_p)) out.top_p = payload.top_p
   if (isSet(payload.stream)) out.stream = payload.stream
   if (isSet(payload.tools)) out.tools = buildResponsesTools(payload.tools)
   if (isSet(payload.tool_choice) && out.tools && out.tools.length > 0)
-    out.tool_choice = payload.tool_choice
+    out.tool_choice =
+      typeof payload.tool_choice === "object" ?
+        { type: "function", name: payload.tool_choice.function.name }
+      : payload.tool_choice
   // Forward reasoning controls (effort + summary). `summary: "auto"` is what
   // makes Copilot stream reasoning_summary_text.delta events in real time so
   // the thinking block renders incrementally instead of all at once.
@@ -462,7 +478,10 @@ function applyOptionalPayloadFields(
     && result.tools
     && result.tools.length > 0
   )
-    result.tool_choice = payload.tool_choice
+    result.tool_choice =
+      typeof payload.tool_choice === "object" ?
+        { type: "function", function: { name: payload.tool_choice.name } }
+      : payload.tool_choice
 }
 
 function applyToolsAndFormat(
@@ -982,19 +1001,8 @@ function emitDoneEvents(
   for (const index of streamState.toolItemsAdded) {
     const info = streamState.pendingToolCalls.get(index)
     if (!info) continue
-    let args = streamState.accumulatedToolArgs.get(index) ?? ""
-
-    // If the stream was truncated (finish_reason: "length"), tool call
-    // arguments may be incomplete JSON.  Try to repair by closing open
-    // braces/brackets; if that fails, skip emitting this tool call entirely
-    // so the client doesn't choke on unparseable arguments.
-    try {
-      JSON.parse(args)
-    } catch {
-      const repaired = tryRepairJson(args)
-      if (repaired === null) continue
-      args = repaired
-    }
+    const args = streamState.accumulatedToolArgs.get(index) ?? ""
+    parseToolInput(args, info.name)
 
     out.push(
       {
@@ -1027,6 +1035,12 @@ function emitDoneEvents(
 export function translateFromResponsesResponse(
   resp: ResponsesResponse,
 ): ChatCompletionResponse {
+  if (resp.status && resp.status !== "completed") {
+    throwResponseError({
+      type: `response.${resp.status}`,
+      response: { ...resp },
+    })
+  }
   let textContent: string | null = null
   const toolCalls: Array<ToolCall> = []
 
@@ -1041,8 +1055,8 @@ export function translateFromResponsesResponse(
       if (texts.length > 0) {
         textContent = texts.join("\n\n")
       }
-    } else {
-      // function_call — the union guarantees this branch
+    } else if (item.type === "function_call") {
+      parseToolInput(item.arguments, item.name)
       toolCalls.push({
         id: item.call_id,
         type: "function",
@@ -1088,24 +1102,23 @@ export function translateFromResponsesResponse(
  * `response.output_item.added` can hand off the tool-call identity
  * (call_id + name) to the subsequent `function_call_arguments.delta` chunks.
  *
- * IDs from the Copilot API may be encrypted/opaque, so `item.id` from
- * `output_item.added` will NOT match `item_id` from the delta events.
- * We therefore use a FIFO queue: the Responses API always sends
- * `output_item.added` before its corresponding `function_call_arguments.delta`
- * events, so we push identity info onto the queue and shift it off when the
- * first delta for a new tool call arrives.
+ * Prefer stable output_index, validate matching item identities, and allow
+ * opaque item IDs only when no indexed owner exists and one call is pending.
+ * Tool arguments remain buffered until response.completed.
  */
 export interface ResponsesStreamState {
-  /** FIFO queue of tool-call identities waiting to be attached to deltas. */
-  pendingToolCalls: Array<{ call_id: string; name: string }>
-  /** Whether the current tool call's first delta has already been sent. */
-  currentToolCallSent: boolean
+  toolCalls: Array<{
+    call_id: string
+    name: string
+    item_id?: string
+    output_index?: number
+    arguments: string
+    done: boolean
+  }>
   /** Whether any tool calls were seen during this response (for finish_reason). */
   hasToolCalls: boolean
   /** Whether any text content was seen during this response. */
   hasTextContent: boolean
-  /** Index of the current tool call (increments per tool call for OpenAI delta format). */
-  toolCallIndex: number
   /** Usage data extracted from response.completed event. */
   usage?: {
     prompt_tokens: number
@@ -1116,11 +1129,9 @@ export interface ResponsesStreamState {
 
 export function createResponsesStreamState(): ResponsesStreamState {
   return {
-    pendingToolCalls: [],
-    currentToolCallSent: false,
+    toolCalls: [],
     hasToolCalls: false,
     hasTextContent: false,
-    toolCallIndex: -1,
   }
 }
 
@@ -1130,12 +1141,19 @@ export interface TranslateStreamOptions {
   streamState: ResponsesStreamState
 }
 
+// eslint-disable-next-line complexity -- Dispatch distinct wire event types without merging identity or terminal semantics.
 export function translateFromResponsesStream(
   event: Record<string, unknown>,
   options: TranslateStreamOptions,
 ): SSEMessage | Array<SSEMessage> | null {
   const { responseId, model, streamState } = options
   const type = event.type as string
+  if (
+    type === "error"
+    || type === "response.incomplete"
+    || type === "response.failed"
+  )
+    throwResponseError(event)
 
   if (type === "response.output_text.delta") {
     streamState.hasTextContent = true
@@ -1166,27 +1184,58 @@ export function translateFromResponsesStream(
     return null
   }
 
-  if (type === "response.output_item.added") {
+  if (
+    type === "response.output_item.added"
+    || type === "response.output_item.done"
+  ) {
     return handleOutputItemAdded(event, streamState)
   }
 
   if (type === "response.function_call_arguments.delta") {
-    return handleFnCallArgsDelta(event, { responseId, model, streamState })
+    const call = findResponseToolCall(event, streamState)
+    if (typeof event.delta !== "string")
+      throw invalidToolInput(call.name, "invalid argument delta")
+    call.arguments += event.delta
+    return null
   }
 
   if (type === "response.function_call_arguments.done") {
-    // Reset so the next tool call can pick up its identity from the queue.
-    // Don't emit a finish chunk here — the response may contain more tool
-    // calls. The finish chunk is emitted once on `response.completed`.
-    streamState.currentToolCallSent = false
+    // Complete this identity independently; other calls may still be pending.
+    const call = findResponseToolCall(event, streamState)
+    reconcileArguments(call, event.arguments)
+    call.done = true
     return null
   }
 
   if (type === "response.completed") {
+    const response = event.response as Record<string, unknown> | undefined
+    if (Array.isArray(response?.output)) {
+      for (const [index, item] of response.output.entries()) {
+        handleOutputItemAdded(
+          { type: "response.output_item.done", output_index: index, item },
+          streamState,
+        )
+      }
+    }
     return handleResponseCompleted(event, { responseId, model, streamState })
   }
 
   return null
+}
+
+function throwResponseError(event: Record<string, unknown>): never {
+  const response = event.response
+  const details =
+    response && typeof response === "object" && !Array.isArray(response) ?
+      (response as Record<string, unknown>)
+    : event
+  const body = details.error ? { error: details.error } : { error: details }
+  const message = extractUpstreamErrorMessage(
+    body,
+    "Upstream response did not complete.",
+    "application/json",
+  )
+  throw new HTTPError(message, Response.json(body, { status: 502 }))
 }
 
 function handleResponseCompleted(
@@ -1205,6 +1254,17 @@ function handleResponseCompleted(
   }
 
   const chunks: Array<SSEMessage> = []
+
+  for (const [index, call] of streamState.toolCalls.entries()) {
+    parseToolInput(call.arguments, call.name)
+    chunks.push(
+      makeToolCallChunk(responseId, model, {
+        index,
+        args: call.arguments,
+        identity: { id: call.call_id, name: call.name, type: "function" },
+      }),
+    )
+  }
 
   chunks.push(
     makeFinishChunk({
@@ -1232,52 +1292,90 @@ function handleOutputItemAdded(
   streamState: ResponsesStreamState,
 ): null {
   const item = event.item as Record<string, unknown> | undefined
-  // The Copilot API may encrypt/obfuscate field values, but `call_id` is
-  // consistently readable. Accept the item if it has a `call_id` — the `type`
-  // field may not always be present or may be obfuscated.
-  if (item && item.call_id) {
-    streamState.pendingToolCalls.push({
-      call_id: item.call_id as string,
-      name: typeof item.name === "string" ? item.name : "function",
-    })
+  if (item && typeof item.call_id === "string") {
+    if (typeof item.name !== "string" || !item.name)
+      throw invalidToolInput("unknown", "missing function name")
+    let call = streamState.toolCalls.find(
+      (candidate) => candidate.call_id === item.call_id,
+    )
+    if (!call) {
+      call = {
+        call_id: item.call_id,
+        name: item.name,
+        arguments: "",
+        done: false,
+        item_id: typeof item.id === "string" ? item.id : undefined,
+        output_index:
+          typeof event.output_index === "number" ?
+            event.output_index
+          : undefined,
+      }
+      streamState.toolCalls.push(call)
+    }
+    if (typeof item.arguments === "string" && item.arguments) {
+      reconcileArguments(call, item.arguments)
+    }
+    if (event.type === "response.output_item.done") call.done = true
     streamState.hasToolCalls = true
   }
   return null
 }
 
 /** Translate a function_call_arguments.delta event into a Chat Completion chunk. */
-function handleFnCallArgsDelta(
+function findResponseToolCall(
   event: Record<string, unknown>,
-  options: Pick<TranslateStreamOptions, "responseId" | "model" | "streamState">,
-): SSEMessage {
-  const { responseId, model, streamState } = options
-
-  // If there's a pending tool call identity and we haven't attached it yet,
-  // this is the first delta for a new tool call → attach id + name.
-  if (
-    streamState.pendingToolCalls.length > 0
-    && !streamState.currentToolCallSent
-  ) {
-    // Safe to shift — length check above guarantees at least one element.
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    const pending = streamState.pendingToolCalls.shift()!
-    streamState.currentToolCallSent = true
-    streamState.toolCallIndex++
-    return makeToolCallChunk(responseId, model, {
-      index: streamState.toolCallIndex,
-      args: event.delta as string,
-      identity: {
-        id: pending.call_id,
-        type: "function",
-        name: pending.name,
-      },
-    })
+  state: ResponsesStreamState,
+): ResponsesStreamState["toolCalls"][number] {
+  const byId =
+    typeof event.item_id === "string" ?
+      state.toolCalls.find((call) => call.item_id === event.item_id)
+    : undefined
+  if (typeof event.output_index === "number") {
+    const byIndex = state.toolCalls.find(
+      (call) => call.output_index === event.output_index,
+    )
+    if (byIndex) {
+      if (byId && byId !== byIndex)
+        throw invalidToolInput(
+          byIndex.name,
+          "conflicting streamed function identities",
+        )
+      return byIndex
+    }
+    // Older Copilot frames omit indices when introducing the call; attach a
+    // later index only to the single unindexed candidate, never another index.
+    const unindexed = state.toolCalls.filter(
+      (call) => !call.done && call.output_index === undefined,
+    )
+    if (unindexed.length !== 1 || (byId && byId !== unindexed[0])) {
+      throw invalidToolInput("unknown", "unknown indexed function identity")
+    }
+    unindexed[0].output_index = event.output_index
+    return unindexed[0]
   }
+  if (byId) return byId
+  // Some Copilot streams use opaque, nonmatching item IDs. Only a single
+  // unfinished call is unambiguous; never guess a FIFO owner for parallel calls.
+  const pending = state.toolCalls.filter((call) => !call.done)
+  if (pending.length !== 1)
+    throw invalidToolInput(
+      "unknown",
+      "ambiguous or missing streamed function identity",
+    )
+  return pending[0]
+}
 
-  return makeToolCallChunk(responseId, model, {
-    index: streamState.toolCallIndex,
-    args: event.delta as string,
-  })
+function reconcileArguments(
+  call: ResponsesStreamState["toolCalls"][number],
+  complete: unknown,
+): void {
+  if (typeof complete !== "string" || !complete.startsWith(call.arguments)) {
+    throw invalidToolInput(
+      call.name,
+      "inconsistent complete arguments and streamed deltas",
+    )
+  }
+  call.arguments = complete
 }
 
 function makeTextDeltaChunk(
@@ -1370,64 +1468,5 @@ function makeChunk(
       model,
       ...extra,
     }),
-  }
-}
-
-function tryRepairJson(input: string): string | null {
-  const trimmed = input.trimEnd()
-  if (!trimmed) return null
-
-  // Strip a trailing incomplete string (no closing quote)
-  let s = trimmed
-  // Track bracket/brace nesting to close them
-  let inString = false
-  let escape = false
-  const stack: Array<string> = []
-
-  for (const ch of s) {
-    if (escape) {
-      escape = false
-      continue
-    }
-    if (ch === "\\") {
-      escape = true
-      continue
-    }
-    if (ch === '"') {
-      inString = !inString
-      continue
-    }
-    if (inString) continue
-    switch (ch) {
-      case "{": {
-        stack.push("}")
-        break
-      }
-      case "[": {
-        stack.push("]")
-        break
-      }
-      case "}":
-      case "]": {
-        stack.pop()
-        break
-      }
-      default: {
-        break
-      }
-    }
-  }
-
-  // If we ended inside a string, close it
-  if (inString) s += '"'
-
-  // Close any open brackets/braces
-  while (stack.length > 0) s += stack.pop() ?? ""
-
-  try {
-    JSON.parse(s)
-    return s
-  } catch {
-    return null
   }
 }

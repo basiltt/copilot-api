@@ -52,7 +52,9 @@ describe("Typed tool detection guard", () => {
       type: "web_search_20260101",
       name: "web_search",
     }
-    expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(true)
+    expect(
+      isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name ?? ""),
+    ).toBe(true)
   })
 
   test("typed tool named internet_research matches", () => {
@@ -60,7 +62,9 @@ describe("Typed tool detection guard", () => {
       type: "internet_research_20260101",
       name: "internet_research",
     }
-    expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(true)
+    expect(
+      isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name ?? ""),
+    ).toBe(true)
   })
 
   test("future versioned type — detected by name, not type string (different version)", () => {
@@ -68,7 +72,9 @@ describe("Typed tool detection guard", () => {
       type: "web_search_20260601",
       name: "web_search",
     }
-    expect(isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name)).toBe(true)
+    expect(
+      isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name ?? ""),
+    ).toBe(true)
   })
 
   test("custom tool named web_search WITH input_schema — NOT matched", () => {

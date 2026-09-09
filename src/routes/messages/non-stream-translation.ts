@@ -1,5 +1,3 @@
-import consola from "consola"
-
 import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
 import {
   type ChatCompletionResponse,
@@ -10,6 +8,7 @@ import {
   type Tool,
   type ToolCall,
 } from "~/services/copilot/create-chat-completions"
+import { searchReplayText } from "~/services/web-search/replay"
 
 import {
   type AnthropicAssistantContentBlock,
@@ -31,11 +30,12 @@ import {
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
   isThinkingRequested,
-  isTypedTool,
 } from "./anthropic-types"
+import { clientTools } from "./client-tools"
+import { parseToolInput, toolInputSchema } from "./tool-input"
 import {
   createToolNameMapFromAnthropicPayload,
-  toAnthropicToolName,
+  toAnthropicToolIdentity,
   toOpenAIToolName,
   type ToolNameMap,
 } from "./tool-name-mapping"
@@ -115,6 +115,9 @@ export function translateToOpenAI(
     user: payload.metadata?.user_id,
     tools,
     tool_choice: toolChoice,
+    ...(payload.tool_choice?.disable_parallel_tool_use !== undefined ?
+      { parallel_tool_calls: !payload.tool_choice.disable_parallel_tool_use }
+    : {}),
     response_format: translateOutputConfig(
       payload.output_config,
       payload.model,
@@ -468,7 +471,7 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
     // Server tool result blocks → serialize as user message
     if (serverToolResultBlocks.length > 0) {
       const text = serverToolResultBlocks
-        .map((b) => `[${b.type}: ${JSON.stringify(b.content)}]`)
+        .map((b) => serializeBlockToText(b))
         .join("\n\n")
       newMessages.push({ role: "user", content: text })
     }
@@ -531,9 +534,7 @@ function handleAssistantMessage(
     ...serverToolUseBlocks.map(
       (b) => `[Server tool use: ${JSON.stringify(b)}]`,
     ),
-    ...serverToolResultBlocks.map(
-      (b) => `[${b.type}: ${JSON.stringify(b.content)}]`,
-    ),
+    ...serverToolResultBlocks.map((b) => serializeBlockToText(b)),
   ]
     .filter(Boolean)
     .join("\n\n")
@@ -547,7 +548,11 @@ function handleAssistantMessage(
             id: toolUse.id,
             type: "function",
             function: {
-              name: toOpenAIToolName(toolUse.name, toolNameMap),
+              name: toOpenAIToolName(
+                toolUse.name,
+                toolNameMap,
+                toolUse.toolset_name,
+              ),
               arguments: JSON.stringify(toolUse.input),
             },
           })),
@@ -694,6 +699,9 @@ function serializeBlockToText(
     case "server_tool_use": {
       return `[Server tool use: ${JSON.stringify(block)}]`
     }
+    case "web_search_tool_result": {
+      return `[web_search_tool_result: ${searchReplayText(block.content)}]`
+    }
     case "search_result": {
       return `[Search: ${block.title}]\nSource: ${block.source}\n${block.content}`
     }
@@ -714,7 +722,10 @@ function serializeBlockToText(
       // tool_result. The OpenAI format has no equivalent content part, and all
       // deferred definitions are already forwarded in `tools`, so preserve the
       // discovery signal as text instead of silently dropping it.
-      return `[Tool loaded: ${block.tool_name}]`
+      return `[Tool loaded: ${block.toolset_name ? `${block.toolset_name}.` : ""}${block.tool_name}]`
+    }
+    case "browser_state": {
+      return `[Browser state: ${JSON.stringify(block.tabs)}]`
     }
     default: {
       // Catch-all: server tool results and future unknown types
@@ -732,7 +743,8 @@ function serializeBlockToText(
 
 function mapContent(
   content:
-    string | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
+    | string
+    | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
 ): string | Array<ContentPart> | null {
   if (typeof content === "string") {
     return content
@@ -783,29 +795,24 @@ function translateAnthropicToolsToOpenAI(
     return undefined
   }
 
-  const customTools: Array<Tool> = anthropicTools
-    .filter((tool): tool is AnthropicCustomTool => !isTypedTool(tool))
-    .map((tool) => ({
-      type: "function",
-      function: {
-        name: toOpenAIToolName(tool.name, toolNameMap),
-        description: translateToolDescription(tool),
-        parameters: translateToolInputSchema(tool),
-        // Forward strict for Structured Outputs; strip all other extra fields
-        // (cache_control, defer_loading, eager_input_streaming, allowed_callers).
-        // input_examples are adapted into the description above because the
-        // OpenAI function format has no equivalent field.
-        ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
-      },
-    }))
+  const customTools: Array<Tool> = clientTools(anthropicTools).map((tool) => ({
+    type: "function",
+    function: {
+      name: toOpenAIToolName(tool.name, toolNameMap, tool.toolset_name),
+      description: translateToolDescription(tool),
+      parameters: toolInputSchema(tool),
+      // Forward strict for Structured Outputs; strip all other extra fields
+      // (cache_control, defer_loading, eager_input_streaming, allowed_callers).
+      // input_examples are adapted into the description above because the
+      // OpenAI function format has no equivalent field.
+      ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+    },
+  }))
   // Return undefined (not []) when all tools are typed — an empty tools array with an active
   // tool_choice would produce a malformed OpenAI request.
   return customTools.length > 0 ? customTools : undefined
 }
 
-const WORKFLOW_SELECTOR_KEYS = ["script", "name", "scriptPath"] as const
-const WORKFLOW_INPUT_REQUIREMENT =
-  "Workflow input requirement: provide at least one of `script`, `name`, or `scriptPath`; never call Workflow with an empty object."
 const MAX_TOOL_INPUT_EXAMPLE_CHARS = 1000
 const MAX_TOOL_INPUT_EXAMPLES = 2
 
@@ -823,7 +830,6 @@ function translateToolDescription(
 ): string | undefined {
   const sections: Array<string> = []
   if (tool.description) sections.push(tool.description)
-  if (tool.name === "Workflow") sections.push(WORKFLOW_INPUT_REQUIREMENT)
 
   const examples = (tool.input_examples ?? [])
     .map((example) => JSON.stringify(example))
@@ -834,33 +840,6 @@ function translateToolDescription(
   }
 
   return sections.length > 0 ? sections.join("\n\n") : undefined
-}
-
-/**
- * Expresses Workflow's custom cross-field validation in JSON Schema so the
- * upstream model cannot treat `{}` as a valid tool call.
- */
-function translateToolInputSchema(
-  tool: AnthropicCustomTool,
-): Record<string, unknown> {
-  if (tool.name !== "Workflow") return tool.input_schema
-
-  const required = tool.input_schema.required
-  const alreadyRequiresSelector =
-    Array.isArray(required)
-    && WORKFLOW_SELECTOR_KEYS.some((key) => required.includes(key))
-  const alreadyHasSelectorUnion =
-    Array.isArray(tool.input_schema.anyOf)
-    || Array.isArray(tool.input_schema.oneOf)
-
-  if (alreadyRequiresSelector || alreadyHasSelectorUnion) {
-    return tool.input_schema
-  }
-
-  return {
-    ...tool.input_schema,
-    anyOf: WORKFLOW_SELECTOR_KEYS.map((key) => ({ required: [key] })),
-  }
 }
 
 function translateAnthropicToolChoiceToOpenAI(
@@ -915,7 +894,9 @@ export function translateToAnthropic(
   for (const choice of response.choices) {
     const textBlocks = getAnthropicTextBlocks(choice.message.content)
     const toolUseBlocks = getAnthropicToolUseBlocks(
-      choice.message.tool_calls,
+      choice.finish_reason === "content_filter" ?
+        undefined
+      : choice.message.tool_calls,
       toolNameMap,
     )
 
@@ -964,53 +945,6 @@ export function translateToAnthropic(
       stop_reason: "refusal",
       stop_sequence: null,
       usage: buildAnthropicUsage(response.usage),
-    }
-  }
-
-  // Guard: detect truncated tool calls when finish_reason is "length".
-  // When the output hits the token limit mid-tool-call, the JSON arguments are
-  // incomplete.  safeParseJson silently returns {} for these, which would cause
-  // Claude Code to execute a tool with empty/wrong input.  Instead, replace the
-  // broken tool use blocks with an explanatory text block and return "end_turn"
-  // so Claude Code reads the feedback and adjusts its strategy.
-  if (correctedStopReason === "length" && allToolUseBlocks.length > 0) {
-    const hasTruncated = response.choices.some((choice) =>
-      choice.message.tool_calls?.some((tc) => {
-        if (!tc.function.arguments) return false
-        try {
-          JSON.parse(tc.function.arguments)
-          return false
-        } catch {
-          return true
-        }
-      }),
-    )
-
-    if (hasTruncated) {
-      const toolName = allToolUseBlocks[0].name
-      consola.debug(
-        `[non-stream] Truncated tool call detected for "${toolName}" — `
-          + `replacing with explanatory text`,
-      )
-      return {
-        id: toAnthropicMessageId(response.id),
-        type: "message",
-        role: "assistant",
-        model: response.model,
-        content: [
-          ...allTextBlocks,
-          {
-            type: "text",
-            text:
-              `[Output truncated: the response exceeded the maximum output token limit`
-              + ` while generating tool call "${toolName}".`
-              + ` Please retry with a smaller output, e.g. write the file in smaller chunks.]`,
-          },
-        ],
-        stop_reason: "end_turn",
-        stop_sequence: null,
-        usage: buildAnthropicUsage(response.usage),
-      }
     }
   }
 
@@ -1073,16 +1007,11 @@ function getAnthropicToolUseBlocks(
   return toolCalls.map((toolCall) => ({
     type: "tool_use",
     id: toolCall.id,
-    name: toAnthropicToolName(toolCall.function.name, toolNameMap),
-    input: safeParseJson(toolCall.function.arguments),
+    ...toAnthropicToolIdentity(toolCall.function.name, toolNameMap),
+    input: parseToolInput(
+      toolCall.function.arguments,
+      toolCall.function.name,
+      toolNameMap?.inputSchemas?.[toolCall.function.name],
+    ),
   }))
-}
-
-function safeParseJson(json: string): Record<string, unknown> {
-  if (!json) return {}
-  try {
-    return JSON.parse(json) as Record<string, unknown>
-  } catch {
-    return {}
-  }
 }

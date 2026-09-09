@@ -4,7 +4,8 @@ import {
   type AnthropicStreamEventData,
   type AnthropicStreamState,
 } from "./anthropic-types"
-import { toAnthropicToolName } from "./tool-name-mapping"
+import { invalidToolInput, parseToolInput } from "./tool-input"
+import { toAnthropicToolIdentity } from "./tool-name-mapping"
 import {
   EMPTY_VISIBLE_OUTPUT_TEXT,
   FILTERED_VISIBLE_OUTPUT_TEXT,
@@ -125,6 +126,20 @@ export function translateChunkToAnthropicEvents(
 
   const choice = chunk.choices[0]
   const { delta } = choice
+  if (state.deferredFinishReason !== undefined || state.messageStopSent) {
+    if (
+      delta.content
+      || delta.reasoning_content
+      || delta.reasoning_text
+      || delta.tool_calls?.length
+    ) {
+      throw invalidToolInput(
+        "response",
+        "received content after the terminal frame",
+      )
+    }
+    return events
+  }
 
   // OpenAI-compatible streams normally begin with a role-only chunk.  Do not
   // commit Anthropic's message_start for that protocol preamble: if the next
@@ -281,115 +296,21 @@ export function translateChunkToAnthropicEvents(
 
   if (delta.tool_calls) {
     for (const toolCall of delta.tool_calls) {
-      const anthropicToolName =
-        toolCall.function?.name ?
-          toAnthropicToolName(toolCall.function.name, state.toolNameMap)
-        : undefined
-
-      if (toolCall.id && toolCall.function?.name) {
-        // New tool call starting.
-        if (state.contentBlockOpen) {
-          // Close any previously open block.
-          events.push({
-            type: "content_block_stop",
-            index: state.contentBlockIndex,
-          })
-          state.contentBlockIndex++
-          state.contentBlockOpen = false
-          state.thinkingBlockOpen = false
-        }
-
-        // Inject a descriptive text block when the model hasn't emitted any
-        // visible text before starting tool calls.  Models like Gemini go
-        // straight to tool_use without any explanatory content — Claude Code
-        // would show a loading animation with no indication of progress.
-        // The description extracts key details from tool arguments (e.g.
-        // file paths, commands) so the user sees what's actually happening.
-        if (
-          !state.hasEmittedText
-          && shouldInjectSyntheticToolDescription(chunk.model)
-        ) {
-          const description = describeToolCall(
-            anthropicToolName ?? toolCall.function.name,
-            toolCall.function.arguments,
-          )
-          events.push(
-            {
-              type: "content_block_start",
-              index: state.contentBlockIndex,
-              content_block: { type: "text", text: "" },
-            },
-            {
-              type: "content_block_delta",
-              index: state.contentBlockIndex,
-              delta: {
-                type: "text_delta",
-                text: description,
-              },
-            },
-            {
-              type: "content_block_stop",
-              index: state.contentBlockIndex,
-            },
-          )
-          state.contentBlockIndex++
-          state.hasEmittedText = true
-        }
-
-        const anthropicBlockIndex = state.contentBlockIndex
-        state.toolCalls[toolCall.index] = {
-          id: toolCall.id,
-          name: anthropicToolName ?? toolCall.function.name,
-          anthropicBlockIndex,
-          accumulatedArgs: "",
-        }
-
-        events.push({
-          type: "content_block_start",
-          index: anthropicBlockIndex,
-          content_block: {
-            type: "tool_use",
-            id: toolCall.id,
-            name: anthropicToolName ?? toolCall.function.name,
-            input: {},
-          },
-        })
-        state.contentBlockOpen = true
+      const info = (state.toolCalls[toolCall.index] ??= {
+        id: "",
+        name: "",
+        anthropicBlockIndex: -1,
+        accumulatedArgs: "",
+      })
+      if (toolCall.id && info.id !== toolCall.id) info.id += toolCall.id
+      if (toolCall.function?.name && info.name !== toolCall.function.name) {
+        info.name += toolCall.function.name
       }
-
-      if (toolCall.function?.arguments) {
-        const toolCallInfo = state.toolCalls[toolCall.index]
-        // Tool call can still be empty
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        if (toolCallInfo) {
-          toolCallInfo.accumulatedArgs += toolCall.function.arguments
-          events.push({
-            type: "content_block_delta",
-            index: toolCallInfo.anthropicBlockIndex,
-            delta: {
-              type: "input_json_delta",
-              partial_json: toolCall.function.arguments,
-            },
-          })
-        }
-      }
+      info.accumulatedArgs += toolCall.function?.arguments ?? ""
     }
   }
 
   if (choice.finish_reason) {
-    // Detect truncated tool calls: when finish_reason is "length" and tool
-    // calls have incomplete JSON arguments, the output hit the token limit
-    // mid-tool-call.  Instead of passing broken JSON to Claude Code (which
-    // would cause it to execute a tool with invalid input), emit an
-    // explanatory text block and use "end_turn" so Claude Code adjusts its
-    // strategy (e.g., writing files in smaller chunks).
-    if (choice.finish_reason === "length") {
-      const truncated = findTruncatedToolCalls(state)
-      if (truncated.length > 0) {
-        return emitTruncationGuardEvents(state, chunk, { events, truncated })
-      }
-    }
-
     const hasToolCalls = Object.keys(state.toolCalls).length > 0
 
     // A filtered tool call must never be committed as a normal Anthropic tool
@@ -426,6 +347,8 @@ export function translateChunkToAnthropicEvents(
       state.contentBlockIndex++
     }
 
+    events.push(...emitBufferedToolCalls(state, chunk.model))
+
     // A reasoning-only or policy-filtered completion is not a usable Claude
     // response.  Once thinking has streamed we cannot transparently retry (a
     // second message_start would violate the Anthropic SSE protocol), so close
@@ -456,6 +379,82 @@ export function translateChunkToAnthropicEvents(
       )
       state.hasEmittedText = true
       state.contentBlockIndex++
+    }
+
+    /**
+     * Tool blocks are committed only after the upstream turn completes. This also
+     * prevents interleaved parallel arguments from arriving after a block's stop.
+     */
+    function emitBufferedToolCalls(
+      state: AnthropicStreamState,
+      model: string,
+    ): Array<AnthropicStreamEventData> {
+      const calls = Object.values(state.toolCalls)
+      for (const call of calls) {
+        if (!call.id || !call.name) {
+          throw invalidToolInput(
+            call.name || "unknown",
+            "missing tool identity",
+          )
+        }
+        parseToolInput(
+          call.accumulatedArgs,
+          call.name,
+          state.toolNameMap?.inputSchemas?.[call.name],
+        )
+      }
+      const events: Array<AnthropicStreamEventData> = []
+      for (const call of calls) {
+        const identity = toAnthropicToolIdentity(call.name, state.toolNameMap)
+        const { name } = identity
+        if (
+          !state.hasEmittedText
+          && shouldInjectSyntheticToolDescription(model)
+        ) {
+          events.push(
+            {
+              type: "content_block_start",
+              index: state.contentBlockIndex,
+              content_block: { type: "text", text: "" },
+            },
+            {
+              type: "content_block_delta",
+              index: state.contentBlockIndex,
+              delta: {
+                type: "text_delta",
+                text: describeToolCall(name, call.accumulatedArgs),
+              },
+            },
+            { type: "content_block_stop", index: state.contentBlockIndex },
+          )
+          state.contentBlockIndex++
+          state.hasEmittedText = true
+        }
+        call.anthropicBlockIndex = state.contentBlockIndex
+        events.push(
+          {
+            type: "content_block_start",
+            index: state.contentBlockIndex,
+            content_block: {
+              type: "tool_use",
+              id: call.id,
+              ...identity,
+              input: {},
+            },
+          },
+          {
+            type: "content_block_delta",
+            index: state.contentBlockIndex,
+            delta: {
+              type: "input_json_delta",
+              partial_json: call.accumulatedArgs,
+            },
+          },
+          { type: "content_block_stop", index: state.contentBlockIndex },
+        )
+        state.contentBlockIndex++
+      }
+      return events
     }
 
     // Some models (notably Gemini) intermittently return a non-tool_calls
@@ -536,15 +535,18 @@ export function flushDeferredFinish(
 }
 
 /**
- * Empty accumulatedArgs are considered valid (no arguments to parse).
+ * Includes missing, non-object, and schema-invalid arguments.
  */
 export function findTruncatedToolCalls(
   state: AnthropicStreamState,
 ): Array<{ id: string; name: string; accumulatedArgs: string }> {
   return Object.values(state.toolCalls).filter((tc) => {
-    if (!tc.accumulatedArgs) return false
     try {
-      JSON.parse(tc.accumulatedArgs)
+      parseToolInput(
+        tc.accumulatedArgs,
+        tc.name,
+        state.toolNameMap?.inputSchemas?.[tc.name],
+      )
       return false
     } catch {
       return true
@@ -580,65 +582,6 @@ export function isEmptyStreamResponse(chunk: ChatCompletionChunk): boolean {
  * with stop_reason "end_turn" so Claude Code reads the feedback instead of
  * trying to execute a broken tool call.
  */
-function emitTruncationGuardEvents(
-  state: AnthropicStreamState,
-  chunk: ChatCompletionChunk,
-  ctx: {
-    events: Array<AnthropicStreamEventData>
-    truncated: Array<{ name: string }>
-  },
-): Array<AnthropicStreamEventData> {
-  const { events, truncated } = ctx
-
-  if (state.contentBlockOpen) {
-    events.push({
-      type: "content_block_stop",
-      index: state.contentBlockIndex,
-    })
-    state.contentBlockIndex++
-    state.contentBlockOpen = false
-  }
-
-  const toolName = truncated[0].name
-  events.push(
-    {
-      type: "content_block_start",
-      index: state.contentBlockIndex,
-      content_block: { type: "text", text: "" },
-    },
-    {
-      type: "content_block_delta",
-      index: state.contentBlockIndex,
-      delta: {
-        type: "text_delta",
-        text:
-          `[Output truncated: the response exceeded the maximum output token limit`
-          + ` while generating tool call "${toolName}".`
-          + ` Please retry with a smaller output, e.g. write the file in smaller chunks.]`,
-      },
-    },
-    {
-      type: "content_block_stop",
-      index: state.contentBlockIndex,
-    },
-    {
-      type: "message_delta",
-      delta: { stop_reason: "end_turn", stop_sequence: null },
-      usage: {
-        input_tokens:
-          ((state.lastSeenUsage ?? chunk.usage)?.prompt_tokens ?? 0)
-          - ((state.lastSeenUsage ?? chunk.usage)?.prompt_tokens_details
-            ?.cached_tokens ?? 0),
-        output_tokens:
-          (state.lastSeenUsage ?? chunk.usage)?.completion_tokens ?? 0,
-      },
-    },
-    { type: "message_stop" },
-  )
-  state.messageStopSent = true
-  return events
-}
-
 export function translateErrorToAnthropicErrorEvent(
   message: string = "An unexpected error occurred during streaming.",
   errorType: string = "api_error",

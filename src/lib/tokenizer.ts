@@ -157,7 +157,9 @@ const getEncodeChatFunction = async (encoding: string): Promise<Encoder> => {
  * Get tokenizer type from model information
  */
 export const getTokenizerFromModel = (model: Model): string => {
-  return model.capabilities.tokenizer || "o200k_base"
+  // Catalog records can omit capability metadata even for available models.
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  return model.capabilities?.tokenizer || "o200k_base"
 }
 
 /**

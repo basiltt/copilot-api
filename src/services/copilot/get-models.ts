@@ -1,5 +1,6 @@
 import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
+import { knownModelMetadata } from "~/lib/known-models"
 import { state } from "~/lib/state"
 
 export const getModels = async () => {
@@ -70,21 +71,32 @@ export interface Model {
  * Some models at runtime lack `capabilities` or `limits` entirely,
  * despite the TypeScript types marking them as required.
  */
-export function getModelContextWindow(model: Model): number | undefined {
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
+type RuntimeModel = Pick<Model, "id"> & {
+  capabilities?: { limits?: Partial<Model["capabilities"]["limits"]> }
+}
+
+export function getModelContextWindow(model: RuntimeModel): number | undefined {
   const limits = model.capabilities?.limits
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime guard
-  if (!limits) return undefined
-  return limits.max_prompt_tokens ?? limits.max_context_window_tokens
+
+  return (
+    limits?.max_prompt_tokens
+    ?? limits?.max_context_window_tokens
+    ?? knownModelMetadata(model.id)?.capabilities.limits
+      .max_context_window_tokens
+  )
 }
 
 /**
  * Safely extracts the max output tokens from a model.
  * Some models at runtime lack `capabilities` or `limits` entirely.
  */
-export function getModelMaxOutput(model: Model): number | undefined {
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
-  return model.capabilities?.limits?.max_output_tokens
+export function getModelMaxOutput(
+  model: Model | RuntimeModel,
+): number | undefined {
+  return (
+    model.capabilities?.limits?.max_output_tokens
+    ?? knownModelMetadata(model.id)?.capabilities.limits.max_output_tokens
+  )
 }
 
 /**
@@ -92,7 +104,12 @@ export function getModelMaxOutput(model: Model): number | undefined {
  * This is `max_context_window_tokens` — the full window size, NOT the
  * enforced input limit.  Use `getModelContextWindow()` for the input ceiling.
  */
-export function getModelTotalContext(model: Model): number | undefined {
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
-  return model.capabilities?.limits?.max_context_window_tokens
+export function getModelTotalContext(
+  model: Model | RuntimeModel,
+): number | undefined {
+  return (
+    model.capabilities?.limits?.max_context_window_tokens
+    ?? knownModelMetadata(model.id)?.capabilities.limits
+      .max_context_window_tokens
+  )
 }

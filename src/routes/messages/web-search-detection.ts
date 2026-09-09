@@ -31,7 +31,7 @@ export async function detectWebSearchIntent(
   // Path 1: typed tool detection (free)
   const hasWebSearchTypedTool =
     payload.tools?.some(
-      (tool) => isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name),
+      (tool) => isTypedTool(tool) && WEB_SEARCH_TOOL_NAMES.has(tool.name ?? ""),
     ) ?? false
 
   if (hasWebSearchTypedTool) {
@@ -100,7 +100,8 @@ export function stripWebSearchTypedTools(
   return {
     ...payload,
     tools: payload.tools?.filter(
-      (tool) => !isTypedTool(tool) || !WEB_SEARCH_TOOL_NAMES.has(tool.name),
+      (tool) =>
+        !isTypedTool(tool) || !WEB_SEARCH_TOOL_NAMES.has(tool.name ?? ""),
     ),
   }
 }

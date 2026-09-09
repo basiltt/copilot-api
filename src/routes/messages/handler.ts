@@ -15,9 +15,10 @@ import {
   sendAnthropicContextWindowError,
   sendAnthropicInvalidRequestError,
 } from "~/lib/error"
+import { knownModelMetadata, isFable51 } from "~/lib/known-models"
 import { resolveModelId } from "~/lib/model-resolver"
 import { checkBurstLimit, checkRateLimit } from "~/lib/rate-limit"
-import { isWebSearchEnabled, state } from "~/lib/state"
+import { state } from "~/lib/state"
 import {
   createChatCompletions,
   createResponsesCompletion,
@@ -29,10 +30,6 @@ import {
   getModelMaxOutput,
 } from "~/services/copilot/get-models"
 import { requiresResponsesApi } from "~/services/copilot/responses-translation"
-import {
-  prepareWebSearchPayload,
-  webSearchInterceptor,
-} from "~/services/web-search/interceptor"
 
 import {
   type AnthropicMessagesPayload,
@@ -54,7 +51,11 @@ import {
   translateToOpenAI,
 } from "./non-stream-translation"
 import {
-  findTruncatedToolCalls,
+  isServerWebSearch,
+  runServerWebSearch,
+  serverSearchLimit,
+} from "./server-web-search"
+import {
   flushDeferredFinish,
   isEmptyStreamResponse,
   translateChunkToAnthropicEvents,
@@ -65,10 +66,6 @@ import {
   type ToolNameMap,
 } from "./tool-name-mapping"
 import { EMPTY_VISIBLE_OUTPUT_TEXT, toAnthropicMessageId } from "./utils"
-import {
-  detectWebSearchIntent,
-  stripWebSearchTypedTools,
-} from "./web-search-detection"
 
 // Interval at which SSE ping events are sent to keep the downstream
 // connection alive while waiting for Copilot to start responding or
@@ -173,11 +170,17 @@ const EFFECTIVE_1M_LIMIT = 935_000
  * errors even when the upstream error doesn't contain token numbers.
  */
 function lookupModelLimit(modelId: string): number | undefined {
+  const known = knownModelMetadata(modelId)
+  if (known) {
+    const model = state.models?.data.find((entry) => entry.id === modelId)
+    return getModelContextWindow(model ?? known)
+  }
   if (MODELS_WITH_1M_CONTEXT.has(modelId)) return EFFECTIVE_1M_LIMIT
   const model = state.models?.data.find((m) => m.id === modelId)
   return model ? getModelContextWindow(model) : undefined
 }
 
+// eslint-disable-next-line complexity, max-lines-per-function -- Keep route precedence and shared error recovery explicit.
 export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
@@ -195,6 +198,17 @@ export async function handleCompletion(c: Context) {
   }
 
   await checkBurstLimit(state, anthropicPayload.model)
+
+  if (
+    isFable51(anthropicPayload.model)
+    && (anthropicPayload.tool_choice?.type === "any"
+      || anthropicPayload.tool_choice?.type === "tool")
+  ) {
+    return sendAnthropicInvalidRequestError(
+      c,
+      "Claude Fable 5.1 does not support forced tool use (tool_choice any/tool). Use auto or none; the proxy will not silently change the model or tool mode.",
+    )
+  }
 
   const invalidImage = findInvalidEmbeddedImage(anthropicPayload)
   if (invalidImage) {
@@ -217,6 +231,16 @@ export async function handleCompletion(c: Context) {
     await awaitApproval()
   }
 
+  const searchLimit = serverSearchLimit(anthropicPayload)
+  if (
+    searchLimit !== undefined
+    && anthropicPayload.tool_choice?.type === "none"
+  ) {
+    anthropicPayload.tools = anthropicPayload.tools?.filter(
+      (tool) => !isServerWebSearch(tool),
+    )
+  }
+
   // NOTE: We intentionally do NOT pre-flight reject requests based on local
   // token estimation.  Returning an Anthropic-formatted "invalid_request_error"
   // causes Claude Code to auto-compact and retry in a loop — each retry adds
@@ -233,6 +257,13 @@ export async function handleCompletion(c: Context) {
     return handleStructuredOutput(c, anthropicPayload)
   }
 
+  if (
+    searchLimit !== undefined
+    && anthropicPayload.tool_choice?.type !== "none"
+    && !looksLikeCompactionRequest(anthropicPayload)
+  ) {
+    return handleServerSearch(c, anthropicPayload, searchLimit)
+  }
   // For non-streaming requests just fetch and translate synchronously —
   // no SSE connection needed, so no ping mechanism required.
   if (!anthropicPayload.stream) {
@@ -334,6 +365,39 @@ function inflateEventInputTokens(
     && event.usage?.input_tokens !== undefined
   ) {
     event.usage.input_tokens += overhead
+  }
+}
+
+async function handleServerSearch(
+  c: Context,
+  payload: AnthropicMessagesPayload,
+  limit: number,
+) {
+  const run = () =>
+    runServerWebSearch(payload, limit, fetchNonStreamingAnthropicResponse)
+  if (payload.stream) {
+    return streamSSE(c, async (stream) => {
+      const stopKeepalive = startSSEKeepalive(stream)
+      try {
+        await emitAnthropicResponseAsSSE(stream, await run())
+      } catch (error) {
+        await emitStreamingError(stream, error, payload.model)
+      } finally {
+        stopKeepalive()
+      }
+    })
+  }
+  try {
+    return c.json(await run())
+  } catch (error) {
+    const contextWindowMessage = await extractContextWindowMessage(error)
+    if (error instanceof CompactionNeededError || contextWindowMessage) {
+      return sendAnthropicContextWindowError(c, contextWindowMessage ?? "", {
+        status: 400,
+        modelLimit: lookupModelLimit(payload.model),
+      })
+    }
+    throw error
   }
 }
 
@@ -1126,9 +1190,11 @@ function clampMaxTokens(
   selectedModel?: import("~/services/copilot/get-models").Model,
 ): void {
   const model =
-    selectedModel ?? state.models?.data.find((m) => m.id === payload.model)
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- some models lack capabilities at runtime
-  const modelMaxOutput = model?.capabilities?.limits?.max_output_tokens
+    selectedModel
+    ?? state.models?.data.find((m) => m.id === payload.model)
+    ?? knownModelMetadata(payload.model)
+
+  const modelMaxOutput = model ? getModelMaxOutput(model) : undefined
   if (
     modelMaxOutput
     && payload.max_tokens
@@ -1144,19 +1210,6 @@ function clampMaxTokens(
 async function fetchCopilotResponse(
   anthropicPayload: AnthropicMessagesPayload,
 ): ReturnType<typeof createChatCompletions> {
-  if (isWebSearchEnabled() && (await detectWebSearchIntent(anthropicPayload))) {
-    const cleanedPayload = stripWebSearchTypedTools(anthropicPayload)
-    const openAIPayload = prepareWebSearchPayload(
-      translateToOpenAI(cleanedPayload),
-    )
-    clampMaxTokens(openAIPayload)
-    consola.debug(
-      "Translated OpenAI request payload (web search):",
-      JSON.stringify(openAIPayload),
-    )
-    return webSearchInterceptor(openAIPayload)
-  }
-
   const openAIPayload = translateToOpenAI(anthropicPayload)
   consola.debug(
     "Translated OpenAI request payload:",
@@ -1544,6 +1597,15 @@ export async function handleIncompleteStream(
     return // Stream ended normally, nothing to do.
   }
 
+  if (Object.keys(state.toolCalls).length > 0) {
+    const error = translateErrorToAnthropicErrorEvent(
+      "The upstream stream ended before tool generation completed. No tool call was committed; retry the request.",
+    )
+    state.messageStopSent = true
+    await stream.writeSSE({ event: error.type, data: JSON.stringify(error) })
+    return
+  }
+
   // The upstream stream started but ended without a chunk containing
   // finish_reason — no message_delta / message_stop was ever sent.
   // Some models (notably Gemini) can terminate the stream abruptly after
@@ -1566,58 +1628,8 @@ export async function handleIncompleteStream(
     nextContentBlockIndex++
   }
 
-  // Check if any tool calls have truncated (invalid) JSON arguments.
-  // This happens when the output token limit was hit mid-tool-call — the
-  // accumulated argument fragments don't form valid JSON.  In this case,
-  // emit an explanatory text block and use "end_turn" instead of "tool_use"
-  // so Claude Code reads the feedback instead of executing a broken tool.
-  const hasToolCalls = Object.keys(state.toolCalls).length > 0
-  const truncated = hasToolCalls ? findTruncatedToolCalls(state) : []
-
-  if (!state.hasEmittedText && !hasToolCalls) {
+  if (!state.hasEmittedText) {
     await emitIncompleteVisibleFallback(stream, state, nextContentBlockIndex)
-  }
-
-  if (truncated.length > 0) {
-    const toolName = truncated[0].name
-    consola.debug(
-      `Truncated tool call "${toolName}" detected during stream recovery`,
-    )
-    const nextIndex = nextContentBlockIndex
-    await stream.writeSSE({
-      event: "content_block_start",
-      data: JSON.stringify({
-        type: "content_block_start",
-        index: nextIndex,
-        content_block: { type: "text", text: "" },
-      }),
-    })
-    await stream.writeSSE({
-      event: "content_block_delta",
-      data: JSON.stringify({
-        type: "content_block_delta",
-        index: nextIndex,
-        delta: {
-          type: "text_delta",
-          text:
-            `[Output truncated: the model's response was cut off while generating`
-            + ` tool call "${toolName}". The output exceeded the token limit.`
-            + ` Please retry with a smaller output, e.g. write the file in smaller chunks.]`,
-        },
-      }),
-    })
-    await stream.writeSSE({
-      event: "content_block_stop",
-      data: JSON.stringify({ type: "content_block_stop", index: nextIndex }),
-    })
-  }
-
-  // Use "end_turn" when tool calls are truncated to prevent Claude Code
-  // from trying to execute broken tool calls.  Use "tool_use" only when
-  // tool calls have valid (non-truncated) JSON arguments.
-  let stopReason: string = "end_turn"
-  if (hasToolCalls && truncated.length === 0) {
-    stopReason = "tool_use"
   }
 
   await stream.writeSSE({
@@ -1625,7 +1637,7 @@ export async function handleIncompleteStream(
     data: JSON.stringify({
       type: "message_delta",
       delta: {
-        stop_reason: stopReason,
+        stop_reason: "end_turn",
         stop_sequence: null,
       },
       usage: {
@@ -1716,7 +1728,12 @@ export function isEmptyNonStreamingResponse(
   // that at runtime (the bug this guard exists for), so widen the type to
   // include the nullish shapes we actually observe before comparing.
   const finishReason = choice.finish_reason as
-    "stop" | "length" | "tool_calls" | "content_filter" | null | undefined
+    | "stop"
+    | "length"
+    | "tool_calls"
+    | "content_filter"
+    | null
+    | undefined
   if (
     finishReason !== "stop"
     && finishReason !== null
@@ -1838,7 +1855,19 @@ async function emitNonStreamingAsSSE(
   { imageTokenOverhead = 0, toolNameMap }: EmitNonStreamingAsSSEOptions = {},
 ): Promise<void> {
   const anthropicResponse = translateToAnthropic(response, toolNameMap)
+  return emitAnthropicResponseAsSSE(
+    stream,
+    anthropicResponse,
+    imageTokenOverhead,
+  )
+}
 
+// eslint-disable-next-line max-lines-per-function -- One ordered emitter handles every Anthropic block without reordering.
+async function emitAnthropicResponseAsSSE(
+  stream: SSEStreamingApi,
+  anthropicResponse: AnthropicResponse,
+  imageTokenOverhead = 0,
+): Promise<void> {
   // 1. message_start (without content, stop_reason, stop_sequence)
   await stream.writeSSE({
     event: "message_start",
@@ -1876,7 +1905,7 @@ async function emitNonStreamingAsSSE(
         data: JSON.stringify({
           type: "content_block_start",
           index: blockIndex,
-          content_block: { type: "text", text: "" },
+          content_block: { ...block, text: "" },
         }),
       })
       await stream.writeSSE({
@@ -1897,21 +1926,29 @@ async function emitNonStreamingAsSSE(
             type: "tool_use",
             id: block.id,
             name: block.name,
+            ...(block.toolset_name ? { toolset_name: block.toolset_name } : {}),
             input: {},
           },
         }),
       })
       const inputJson = JSON.stringify(block.input)
-      if (inputJson !== "{}") {
-        await stream.writeSSE({
-          event: "content_block_delta",
-          data: JSON.stringify({
-            type: "content_block_delta",
-            index: blockIndex,
-            delta: { type: "input_json_delta", partial_json: inputJson },
-          }),
-        })
-      }
+      await stream.writeSSE({
+        event: "content_block_delta",
+        data: JSON.stringify({
+          type: "content_block_delta",
+          index: blockIndex,
+          delta: { type: "input_json_delta", partial_json: inputJson },
+        }),
+      })
+    } else {
+      await stream.writeSSE({
+        event: "content_block_start",
+        data: JSON.stringify({
+          type: "content_block_start",
+          index: blockIndex,
+          content_block: block,
+        }),
+      })
     }
 
     await stream.writeSSE({

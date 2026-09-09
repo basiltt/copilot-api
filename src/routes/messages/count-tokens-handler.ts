@@ -2,6 +2,7 @@ import type { Context } from "hono"
 
 import consola from "consola"
 
+import { knownModelMetadata } from "~/lib/known-models"
 import { resolveModelId } from "~/lib/model-resolver"
 import { state } from "~/lib/state"
 import { getTokenCount } from "~/lib/tokenizer"
@@ -111,9 +112,7 @@ export async function handleCountTokens(c: Context) {
     // session arrives with zero images (meaning compaction succeeded).
     const sessionId = getSessionId(anthropicPayload)
     if (hasStrippedImages(sessionId)) {
-      const compactionTarget =
-        MODELS_WITH_1M_CONTEXT.has(anthropicPayload.model) ? EFFECTIVE_1M_WINDOW
-        : CLAUDE_CODE_DEFAULT_WINDOW
+      const compactionTarget = compactionWindow(anthropicPayload.model)
       consola.debug(
         `[${sessionId}] Images were recently stripped — returning ${compactionTarget} tokens to trigger compaction`,
       )
@@ -124,9 +123,9 @@ export async function handleCountTokens(c: Context) {
 
     const openAIPayload = translateToOpenAI(anthropicPayload)
 
-    const selectedModel = state.models?.data.find(
-      (model) => model.id === anthropicPayload.model,
-    )
+    const selectedModel =
+      state.models?.data.find((model) => model.id === anthropicPayload.model)
+      ?? knownModelMetadata(anthropicPayload.model)
 
     if (!selectedModel) {
       const compactionTarget =
@@ -155,28 +154,10 @@ export async function handleCountTokens(c: Context) {
       }
     }
 
-    let finalTokenCount = tokenCount.input + tokenCount.output
-    if (MODELS_WITH_1M_CONTEXT.has(anthropicPayload.model)) {
-      // 1M context models: no scaling needed — the real limit (~935k) is far
-      // above Claude Code's default window so compaction fires naturally.
-    } else if (anthropicPayload.model.startsWith("claude")) {
-      // Legacy Claude models: scale 1.2× so compaction fires before the
-      // conservative 168k Copilot limit.
-      finalTokenCount = Math.round(finalTokenCount * 1.2)
-    } else if (anthropicPayload.model.startsWith("grok")) {
-      finalTokenCount = Math.round(finalTokenCount * 1.03)
-    } else {
-      // For non-Claude/Grok models (GPT, Gemini, etc.), dynamically scale
-      // token counts based on the model's actual prompt token limit.  Claude
-      // Code uses an internal "effective window" (typically ~200K) for compaction
-      // thresholds.  If the model's actual prompt limit is smaller, we scale
-      // up so Claude Code's proactive compaction fires before the model rejects.
-      //
-      // Example: GPT-5-mini has a 128K prompt limit, Claude Code assumes ~200K.
-      // Scale factor: 200_000 / 128_000 ≈ 1.56.  At 120K actual tokens,
-      // we report ~187K, which crosses Claude Code's ~190K threshold.
-      finalTokenCount = scaleTokensForModel(finalTokenCount, selectedModel)
-    }
+    const finalTokenCount = scaleEstimatedCount(
+      tokenCount.input + tokenCount.output,
+      selectedModel,
+    )
 
     consola.debug("Token count:", finalTokenCount)
 
@@ -185,6 +166,8 @@ export async function handleCountTokens(c: Context) {
     })
   } catch (error) {
     consola.error("Error counting tokens:", error)
+    // Schema/protocol failures must not masquerade as context exhaustion.
+    if (error instanceof Error && "response" in error) throw error
     // Return a high token count on error so Claude Code's context-window
     // compaction kicks in.  Returning 1 would make Claude Code think the
     // context is nearly empty, so it would never compact and the next
@@ -194,6 +177,23 @@ export async function handleCountTokens(c: Context) {
       input_tokens: 200_000,
     })
   }
+}
+
+function compactionWindow(modelId: string): number | undefined {
+  const known = knownModelMetadata(modelId)
+  const cached = state.models?.data.find((model) => model.id === modelId)
+  if (known) return getModelContextWindow(cached ?? known)
+  return MODELS_WITH_1M_CONTEXT.has(modelId) ? EFFECTIVE_1M_WINDOW : (
+      CLAUDE_CODE_DEFAULT_WINDOW
+    )
+}
+
+function scaleEstimatedCount(count: number, model: Model): number {
+  if (knownModelMetadata(model.id)) return scaleTokensForModel(count, model)
+  if (MODELS_WITH_1M_CONTEXT.has(model.id)) return count
+  if (model.id.startsWith("claude")) return Math.round(count * 1.2)
+  if (model.id.startsWith("grok")) return Math.round(count * 1.03)
+  return scaleTokensForModel(count, model)
 }
 
 /**

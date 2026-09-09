@@ -482,6 +482,7 @@ export interface ChatCompletionsPayload {
     | "required"
     | { type: "function"; function: { name: string } }
     | null
+  parallel_tool_calls?: boolean
   user?: string | null
   stream_options?: { include_usage: boolean } | null
   reasoning_effort?: string | null

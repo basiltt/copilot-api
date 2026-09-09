@@ -65,7 +65,8 @@ export interface AnthropicGenericSystemBlock {
 }
 
 export type AnthropicSystemBlock =
-  AnthropicTextBlock | AnthropicGenericSystemBlock
+  | AnthropicTextBlock
+  | AnthropicGenericSystemBlock
 
 export interface AnthropicImageBlock {
   type: "image"
@@ -99,11 +100,18 @@ export interface AnthropicDocumentBlock {
 export interface AnthropicToolReferenceBlock {
   type: "tool_reference"
   tool_name: string
+  toolset_name?: string
+}
+
+export interface AnthropicBrowserStateBlock {
+  type: "browser_state"
+  tabs: Array<{ tab_id: string; title: string; url: string; active: boolean }>
 }
 
 export interface AnthropicToolResultBlock {
   type: "tool_result"
   tool_use_id: string
+  toolset_name?: string
   content:
     | string
     | Array<
@@ -111,6 +119,7 @@ export interface AnthropicToolResultBlock {
         | AnthropicImageBlock
         | AnthropicDocumentBlock
         | AnthropicToolReferenceBlock
+        | AnthropicBrowserStateBlock
       >
   is_error?: boolean
 }
@@ -119,6 +128,7 @@ export interface AnthropicToolUseBlock {
   type: "tool_use"
   id: string
   name: string
+  toolset_name?: string
   input: Record<string, unknown>
   cache_control?: { type: "ephemeral"; ttl?: number }
   caller?: Record<string, unknown>
@@ -200,11 +210,13 @@ interface AnthropicCodeExecutionToolResultBlock extends ServerToolResultBase {
   type: "code_execution_tool_result"
 }
 
-interface AnthropicBashCodeExecutionToolResultBlock extends ServerToolResultBase {
+interface AnthropicBashCodeExecutionToolResultBlock
+  extends ServerToolResultBase {
   type: "bash_code_execution_tool_result"
 }
 
-interface AnthropicTextEditorCodeExecutionToolResultBlock extends ServerToolResultBase {
+interface AnthropicTextEditorCodeExecutionToolResultBlock
+  extends ServerToolResultBase {
   type: "text_editor_code_execution_tool_result"
 }
 
@@ -225,6 +237,7 @@ export type AnthropicUserContentBlock =
   | AnthropicImageBlock
   | AnthropicDocumentBlock
   | AnthropicToolReferenceBlock
+  | AnthropicBrowserStateBlock
   | AnthropicToolResultBlock
   | AnthropicSearchResultBlock
   | AnthropicContainerUploadBlock
@@ -266,10 +279,13 @@ export interface AnthropicSystemMessage {
 }
 
 export type AnthropicMessage =
-  AnthropicUserMessage | AnthropicAssistantMessage | AnthropicSystemMessage
+  | AnthropicUserMessage
+  | AnthropicAssistantMessage
+  | AnthropicSystemMessage
 
 // Custom tool (has input_schema) — what Claude Code and standard clients send
 export interface AnthropicCustomTool {
+  type?: "custom" | null
   name: string
   description?: string
   input_schema: Record<string, unknown>
@@ -277,7 +293,7 @@ export interface AnthropicCustomTool {
   cache_control?: { type: "ephemeral"; ttl?: number }
   defer_loading?: boolean
   input_examples?: Array<unknown>
-  eager_input_streaming?: boolean
+  eager_input_streaming?: boolean | null
   allowed_callers?: Array<string>
 }
 
@@ -285,7 +301,7 @@ export interface AnthropicCustomTool {
 // Examples: bash_20250124, text_editor_20250728, computer_20251124, web_search_20250305
 interface AnthropicTypedTool {
   type: string
-  name: string
+  name?: string
   [key: string]: unknown
 }
 
@@ -457,7 +473,11 @@ export interface AnthropicStreamState {
    * chunk arrives (or the stream ends).
    */
   deferredFinishReason?:
-    "stop" | "length" | "tool_calls" | "content_filter" | null
+    | "stop"
+    | "length"
+    | "tool_calls"
+    | "content_filter"
+    | null
 }
 
 /**
