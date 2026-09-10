@@ -21,6 +21,79 @@ import {
 const MAX_TRANSIENT_HTTP_RETRIES = 5
 const BASE_HTTP_RETRY_DELAY_MS = 750
 const RETRIABLE_UPSTREAM_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
+const finalUpstreamRequestShape = Symbol("finalUpstreamRequestShape")
+
+export interface FinalUpstreamRequestShape {
+  endpoint: "chat_completions" | "messages" | "responses"
+  tokenField:
+    | "max_tokens"
+    | "max_completion_tokens"
+    | "max_output_tokens"
+    | "absent"
+    | "multiple"
+  tokenValue: number | null
+  stream: boolean | null
+  oneShot: boolean
+  nativeRouting:
+    | "native_selected"
+    | "native_disabled"
+    | "model_not_advertised"
+    | "request_unsupported"
+    | "not_applicable"
+}
+
+interface RequestShapeOptions {
+  endpoint: FinalUpstreamRequestShape["endpoint"]
+  nativeRouting?: FinalUpstreamRequestShape["nativeRouting"]
+  oneShot: boolean
+}
+
+function describeFinalUpstreamRequest(
+  body: Record<string, unknown>,
+  options: RequestShapeOptions,
+): FinalUpstreamRequestShape {
+  const tokenFields = (
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const
+  ).filter((field) => Object.hasOwn(body, field))
+  let tokenField: FinalUpstreamRequestShape["tokenField"] = "multiple"
+  if (tokenFields.length === 0) tokenField = "absent"
+  if (tokenFields.length === 1) tokenField = tokenFields[0]
+  const tokenCandidate =
+    tokenFields.length === 1 ? body[tokenFields[0]] : undefined
+  const tokenValue =
+    typeof tokenCandidate === "number" && Number.isFinite(tokenCandidate) ?
+      tokenCandidate
+    : null
+
+  return {
+    endpoint: options.endpoint,
+    tokenField,
+    tokenValue,
+    stream: typeof body.stream === "boolean" ? body.stream : null,
+    oneShot: options.oneShot,
+    nativeRouting: options.nativeRouting ?? "not_applicable",
+  }
+}
+
+export function attachFinalUpstreamRequestShape<T extends object>(
+  value: T,
+  shape: FinalUpstreamRequestShape,
+): T {
+  Object.defineProperty(value, finalUpstreamRequestShape, {
+    value: shape,
+    enumerable: false,
+  })
+  return value
+}
+
+export function getFinalUpstreamRequestShape(
+  value: unknown,
+): FinalUpstreamRequestShape | undefined {
+  if (value === null || typeof value !== "object") return undefined
+  return (value as { [finalUpstreamRequestShape]?: FinalUpstreamRequestShape })[
+    finalUpstreamRequestShape
+  ]
+}
 
 function isRetriableUpstreamStatus(status: number): boolean {
   return RETRIABLE_UPSTREAM_STATUS_CODES.has(status)
@@ -130,14 +203,20 @@ function buildRequestHeaders(
   }
 }
 
+// eslint-disable-next-line max-lines-per-function -- Streaming and nonstreaming Responses share one request lifecycle and exact wire metadata.
 export const createResponsesCompletion = async (
   payload: ChatCompletionsPayload,
+  nativeRouting: FinalUpstreamRequestShape["nativeRouting"] = "not_applicable",
 ): Promise<
   ChatCompletionResponse | AsyncIterable<import("hono/streaming").SSEMessage>
 > => {
   const headers = buildRequestHeaders(payload)
 
   const responsesPayload = translateToResponsesPayload(payload)
+  const requestShape = describeFinalUpstreamRequest(
+    responsesPayload as unknown as Record<string, unknown>,
+    { endpoint: "responses", oneShot: false, nativeRouting },
+  )
 
   const inactivity = createInactivityAbort()
 
@@ -229,15 +308,18 @@ export const createResponsesCompletion = async (
       }
     }
 
-    return streamChunks()
+    return attachFinalUpstreamRequestShape(streamChunks(), requestShape)
   }
 
   try {
     const data: unknown = JSON.parse(
       await readResponseBody(response, inactivity.signal, inactivity.keepAlive),
     )
-    return translateFromResponsesResponse(
-      data as Parameters<typeof translateFromResponsesResponse>[0],
+    return attachFinalUpstreamRequestShape(
+      translateFromResponsesResponse(
+        data as Parameters<typeof translateFromResponsesResponse>[0],
+      ),
+      requestShape,
     )
   } finally {
     inactivity.clear()
@@ -246,12 +328,18 @@ export const createResponsesCompletion = async (
 
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
+  nativeRouting: FinalUpstreamRequestShape["nativeRouting"] = "not_applicable",
 ) => {
   const headers = buildRequestHeaders(payload)
 
   const inactivity = createInactivityAbort()
 
   const body = buildChatRequestBody(payload)
+  const requestShape = describeFinalUpstreamRequest(body, {
+    endpoint: "chat_completions",
+    oneShot: false,
+    nativeRouting,
+  })
 
   let response: Response | undefined
 
@@ -319,13 +407,20 @@ export const createChatCompletions = async (
       }
     }
 
-    return withInactivityReset()
+    return attachFinalUpstreamRequestShape(withInactivityReset(), requestShape)
   }
 
   try {
-    return JSON.parse(
-      await readResponseBody(response, inactivity.signal, inactivity.keepAlive),
-    ) as ChatCompletionResponse
+    return attachFinalUpstreamRequestShape(
+      JSON.parse(
+        await readResponseBody(
+          response,
+          inactivity.signal,
+          inactivity.keepAlive,
+        ),
+      ) as ChatCompletionResponse,
+      requestShape,
+    )
   } finally {
     inactivity.clear()
   }
@@ -352,9 +447,13 @@ function buildChatRequestBody(
 /** One non-streaming request, including body consumption, with no hidden retries. */
 export async function createOneShotCompletion(
   payload: ChatCompletionsPayload,
-  usesResponses: boolean,
-  signal: AbortSignal,
+  options: {
+    usesResponses: boolean
+    signal: AbortSignal
+    nativeRouting?: FinalUpstreamRequestShape["nativeRouting"]
+  },
 ): Promise<ChatCompletionResponse> {
+  const { usesResponses, signal, nativeRouting = "not_applicable" } = options
   const downstream = requestSignal()
   const combined = downstream ? AbortSignal.any([signal, downstream]) : signal
   combined.throwIfAborted()
@@ -363,6 +462,14 @@ export async function createOneShotCompletion(
     usesResponses ?
       translateToResponsesPayload(nonStreaming)
     : buildChatRequestBody(nonStreaming)
+  const requestShape = describeFinalUpstreamRequest(
+    body as Record<string, unknown>,
+    {
+      endpoint: usesResponses ? "responses" : "chat_completions",
+      oneShot: true,
+      nativeRouting,
+    },
+  )
   const response = await fetch(
     `${copilotBaseUrl(state)}/${usesResponses ? "responses" : "chat/completions"}`,
     {
@@ -424,12 +531,18 @@ export async function createOneShotCompletion(
     )
   }
   if (usesResponses) {
-    return translateFromResponsesResponse(
-      data as Parameters<typeof translateFromResponsesResponse>[0],
-      true,
+    return attachFinalUpstreamRequestShape(
+      translateFromResponsesResponse(
+        data as Parameters<typeof translateFromResponsesResponse>[0],
+        true,
+      ),
+      requestShape,
     )
   }
-  return data as ChatCompletionResponse
+  return attachFinalUpstreamRequestShape(
+    data as ChatCompletionResponse,
+    requestShape,
+  )
 }
 
 // Streaming types
@@ -447,6 +560,7 @@ export interface ChatCompletionChunk {
     total_tokens: number
     prompt_tokens_details?: {
       cached_tokens: number
+      cache_creation_tokens?: number
     }
     completion_tokens_details?: {
       accepted_prediction_tokens?: number
@@ -496,6 +610,7 @@ export interface ChatCompletionResponse {
     total_tokens: number
     prompt_tokens_details?: {
       cached_tokens: number
+      cache_creation_tokens?: number
     }
     completion_tokens_details?: {
       accepted_prediction_tokens?: number

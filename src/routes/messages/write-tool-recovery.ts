@@ -8,6 +8,7 @@ import type {
 
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
+import { hasNativeMessagesThinking } from "~/services/copilot/create-native-messages-completion"
 
 import {
   type AnthropicCustomTool,
@@ -303,6 +304,7 @@ function preservesCandidate(
   )
 }
 
+// eslint-disable-next-line max-lines-per-function -- One deadline and terminal outcome cover the complete atomic correction.
 async function correctWrite(
   context: CorrectionContext,
 ): Promise<AnthropicResponse> {
@@ -315,6 +317,12 @@ async function correctWrite(
     signal: downstream,
     complete,
   } = context
+  if (hasNativeMessagesThinking(response)) {
+    throw failedRecovery(
+      original,
+      "cannot safely combine corrected output with signed native thinking",
+    )
+  }
   downstream.throwIfAborted()
   const controller = new AbortController()
   const timeout = setTimeout(
@@ -336,6 +344,12 @@ async function correctWrite(
     const repaired = await complete(repairPayload, signal)
     received = true
     signal.throwIfAborted()
+    if (hasNativeMessagesThinking(repaired)) {
+      throw failedRecovery(
+        original,
+        "correction returned context-bound signed native thinking",
+      )
+    }
     const repairedCall = soleWriteCall(repaired, repairName)
     if (!repairedCall || repaired.model !== response.model) {
       throw failedRecovery(

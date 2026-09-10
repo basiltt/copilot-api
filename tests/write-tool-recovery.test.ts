@@ -415,6 +415,11 @@ describe("bounded Write missing-content recovery", () => {
     expect(captured).toContain('"requestedMaxTokens":256')
     expect(captured).toContain('"effectiveMaxTokens":256')
     expect(captured).toContain('"completionTokens":5')
+    expect(captured).toContain('"clientStream":false')
+    expect(captured).toContain('"catalogEndpointSupport":"chat_completions"')
+    expect(captured).toContain(
+      '"finalRequest":{"endpoint":"chat_completions","tokenField":"max_tokens","tokenValue":256,"stream":false,"oneShot":true,"nativeRouting":"native_disabled"}',
+    )
     expect(captured).not.toContain(privatePath)
   })
 
@@ -542,6 +547,8 @@ describe("bounded Write missing-content recovery", () => {
     expect(captured).toContain('"effectiveMaxTokens":null')
     expect(captured).toContain('"completionTokens":null')
     expect(captured).toContain('"reasoningTokens":null')
+    expect(captured).toContain('"tokenField":"absent"')
+    expect(captured).toContain('"tokenValue":null')
     expect(captured).not.toContain("PRIVATE_TOKEN_VALUE")
     expect(captured).not.toContain("PRIVATE_REASONING_VALUE")
     expect(captured).not.toContain("NaN")
@@ -814,6 +821,9 @@ describe("bounded Write missing-content recovery", () => {
 
     const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
     expect(captured).toContain('"completionTokens":256')
+    expect(captured).toContain('"clientStream":true')
+    expect(captured).toContain('"stream":true')
+    expect(captured).toContain('"oneShot":false')
     expect(captured).toContain('"reasoningTokens":4')
     expect(captured).not.toContain("src/generated.ts")
   })

@@ -9,6 +9,7 @@ import {
   type Tool,
   type ToolCall,
 } from "~/services/copilot/create-chat-completions"
+import { restoreNativeMessagesResponse } from "~/services/copilot/create-native-messages-completion"
 import { searchReplayText } from "~/services/web-search/replay"
 
 import {
@@ -890,7 +891,7 @@ function translateAnthropicToolChoiceToOpenAI(
 
 // Response translation
 
-// eslint-disable-next-line complexity
+// eslint-disable-next-line complexity, max-lines-per-function
 export function translateToAnthropic(
   response: ChatCompletionResponse,
   toolNameMap?: ToolNameMap,
@@ -949,19 +950,23 @@ export function translateToAnthropic(
     const visibleTextBlocks = allTextBlocks.filter(
       (block) => block.text.trim().length > 0,
     )
-    return {
-      id: toAnthropicMessageId(response.id),
-      type: "message",
-      role: "assistant",
-      model: response.model,
-      content:
-        visibleTextBlocks.length > 0 ?
-          visibleTextBlocks
-        : [{ type: "text", text: FILTERED_VISIBLE_OUTPUT_TEXT }],
-      stop_reason: "refusal",
-      stop_sequence: null,
-      usage: buildAnthropicUsage(response.usage),
-    }
+    return restoreNativeMessagesResponse(
+      {
+        id: toAnthropicMessageId(response.id),
+        type: "message",
+        role: "assistant",
+        model: response.model,
+        content:
+          visibleTextBlocks.length > 0 ?
+            visibleTextBlocks
+          : [{ type: "text", text: FILTERED_VISIBLE_OUTPUT_TEXT }],
+        stop_reason: "refusal",
+        stop_sequence: null,
+        usage: buildAnthropicUsage(response.usage),
+      },
+      response,
+      toolNameMap,
+    )
   }
 
   if (correctedStopReason === "length") {
@@ -975,16 +980,20 @@ export function translateToAnthropic(
     ) {
       content.push({ type: "text", text: OUTPUT_LIMIT_VISIBLE_TEXT })
     }
-    return {
-      id: toAnthropicMessageId(response.id),
-      type: "message",
-      role: "assistant",
-      model: response.model,
-      content,
-      stop_reason: "max_tokens",
-      stop_sequence: null,
-      usage: buildAnthropicUsage(response.usage),
-    }
+    return restoreNativeMessagesResponse(
+      {
+        id: toAnthropicMessageId(response.id),
+        type: "message",
+        role: "assistant",
+        model: response.model,
+        content,
+        stop_reason: "max_tokens",
+        stop_sequence: null,
+        usage: buildAnthropicUsage(response.usage),
+      },
+      response,
+      toolNameMap,
+    )
   }
 
   // Backstop: a completed non-streaming message must never carry
@@ -994,30 +1003,36 @@ export function translateToAnthropic(
   // finish_reason from models like Gemini) would otherwise map straight
   // through to null here. When tool-use blocks are present, default to
   // "tool_use" so the client still executes the tools; otherwise "end_turn".
-  return {
-    id: toAnthropicMessageId(response.id),
-    type: "message",
-    role: "assistant",
-    model: response.model,
-    content: [...allTextBlocks, ...allToolUseBlocks],
-    stop_reason:
-      mapOpenAIStopReasonToAnthropic(correctedStopReason)
-      ?? (allToolUseBlocks.length > 0 ? "tool_use" : "end_turn"),
-    stop_sequence: null,
-    usage: buildAnthropicUsage(response.usage),
-  }
+  return restoreNativeMessagesResponse(
+    {
+      id: toAnthropicMessageId(response.id),
+      type: "message",
+      role: "assistant",
+      model: response.model,
+      content: [...allTextBlocks, ...allToolUseBlocks],
+      stop_reason:
+        mapOpenAIStopReasonToAnthropic(correctedStopReason)
+        ?? (allToolUseBlocks.length > 0 ? "tool_use" : "end_turn"),
+      stop_sequence: null,
+      usage: buildAnthropicUsage(response.usage),
+    },
+    response,
+    toolNameMap,
+  )
 }
 
 function buildAnthropicUsage(usage: ChatCompletionResponse["usage"]) {
-  return {
+  const cacheCreation = usage?.prompt_tokens_details?.cache_creation_tokens
+  const cacheRead = usage?.prompt_tokens_details?.cached_tokens
+  const result: AnthropicResponse["usage"] = {
     input_tokens:
-      (usage?.prompt_tokens ?? 0)
-      - (usage?.prompt_tokens_details?.cached_tokens ?? 0),
+      (usage?.prompt_tokens ?? 0) - (cacheRead ?? 0) - (cacheCreation ?? 0),
     output_tokens: usage?.completion_tokens ?? 0,
-    ...(usage?.prompt_tokens_details?.cached_tokens !== undefined && {
-      cache_read_input_tokens: usage.prompt_tokens_details.cached_tokens,
-    }),
   }
+  if (cacheCreation !== undefined)
+    result.cache_creation_input_tokens = cacheCreation
+  if (cacheRead !== undefined) result.cache_read_input_tokens = cacheRead
+  return result
 }
 
 function getAnthropicTextBlocks(

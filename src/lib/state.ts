@@ -14,6 +14,7 @@ export interface State {
   structuredOutputRecovery?: boolean
   toolSearchRecovery?: boolean
   writeToolRecovery?: boolean
+  nativeMessages?: boolean
 
   // Rate limiting configuration
   rateLimitSeconds?: number
@@ -41,6 +42,7 @@ export const state: State = {
   structuredOutputRecovery: false,
   toolSearchRecovery: false,
   writeToolRecovery: false,
+  nativeMessages: false,
   burstRequestTimestamps: [],
   burstMinSpacingMs: 0,
   burstScope: "global",

@@ -27,12 +27,20 @@ import {
   createChatCompletions,
   createOneShotCompletion,
   createResponsesCompletion,
+  getFinalUpstreamRequestShape,
   type ChatCompletionChunk,
   type ChatCompletionResponse,
+  type FinalUpstreamRequestShape,
 } from "~/services/copilot/create-chat-completions"
+import {
+  createNativeMessagesCompletion,
+  getBufferedNativeResponse,
+  nativeMessagesCompatibility,
+} from "~/services/copilot/create-native-messages-completion"
 import {
   getModelContextWindow,
   getModelMaxOutput,
+  type Model,
 } from "~/services/copilot/get-models"
 import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 
@@ -423,7 +431,11 @@ async function handleServerSearch(
   const recovery = outputRecoveryOptions(payload, signal)
   const run = () =>
     runServerWebSearch(payload, limit, (request) =>
-      fetchNonStreamingAnthropicResponse(request, recovery),
+      fetchNonStreamingAnthropicResponse(
+        request,
+        recovery,
+        payload.stream === true,
+      ),
     )
   if (payload.stream) {
     return streamSSE(c, async (stream) => {
@@ -472,7 +484,11 @@ async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
   const recovery = outputRecoveryOptions(payload, signal)
   if (!recovery) throw new Error("Expected enabled output recovery")
   const run = () =>
-    fetchNonStreamingAnthropicResponse({ ...payload, stream: false }, recovery)
+    fetchNonStreamingAnthropicResponse(
+      { ...payload, stream: false },
+      recovery,
+      payload.stream === true,
+    )
   if (payload.stream) {
     return streamSSE(c, async (stream) => {
       const stopKeepalive = startSSEKeepalive(stream)
@@ -1072,6 +1088,7 @@ function canTryRemainingOutputRecovery(
 async function fetchNonStreamingAnthropicResponse(
   anthropicPayload: AnthropicMessagesPayload,
   outputRecovery?: NonStreamingRecoveryOptions,
+  clientStream = anthropicPayload.stream === true,
 ): Promise<AnthropicResponse> {
   let preparedPayload = anthropicPayload
   const initial = new AbortController()
@@ -1104,7 +1121,7 @@ async function fetchNonStreamingAnthropicResponse(
     throw new Error("Unexpected streaming response.")
   }
 
-  logTruncatedToolOutput(anthropicPayload, result.response)
+  logTruncatedToolOutput(anthropicPayload, result.response, clientStream)
 
   if (!outputRecovery) {
     consola.debug(
@@ -1501,6 +1518,7 @@ function finiteNumber(value: unknown): number | null {
 function logTruncatedToolOutput(
   payload: AnthropicMessagesPayload,
   response: ChatCompletionResponse,
+  clientStream = payload.stream === true,
 ): void {
   const truncatedToolCallCount = response.choices.reduce(
     (count, choice) =>
@@ -1510,23 +1528,84 @@ function logTruncatedToolOutput(
     0,
   )
   if (truncatedToolCallCount === 0) return
-  logTruncatedToolOutputDetails(payload, truncatedToolCallCount, response.usage)
+  logTruncatedToolOutputDetails(payload, {
+    toolCallCount: truncatedToolCallCount,
+    usage: response.usage,
+    requestShape: getFinalUpstreamRequestShape(response),
+    clientStream,
+  })
+}
+
+type CatalogEndpointSupport =
+  | "unspecified"
+  | "chat_completions"
+  | "messages"
+  | "responses"
+  | "chat_completions_and_messages"
+  | "chat_completions_and_responses"
+  | "messages_and_responses"
+  | "all"
+  | "other"
+
+function catalogEndpointSupport(modelId: string): CatalogEndpointSupport {
+  const endpoints = state.models?.data.find(
+    (model) => model.id === modelId,
+  )?.supported_endpoints
+  if (!Array.isArray(endpoints)) return "unspecified"
+  const chat = endpoints.includes("/chat/completions")
+  const messages = endpoints.includes("/v1/messages")
+  const responses = endpoints.includes("/responses")
+  if (chat && messages && responses) return "all"
+  if (chat && messages) return "chat_completions_and_messages"
+  if (chat && responses) return "chat_completions_and_responses"
+  if (messages && responses) return "messages_and_responses"
+  if (chat) return "chat_completions"
+  if (messages) return "messages"
+  if (responses) return "responses"
+  return "other"
+}
+
+interface TruncatedToolOutputDetails {
+  clientStream: boolean
+  requestShape?: FinalUpstreamRequestShape
+  toolCallCount: number
+  usage: CompletionUsage | undefined
 }
 
 function logTruncatedToolOutputDetails(
   payload: AnthropicMessagesPayload,
-  toolCallCount: number,
-  usage: CompletionUsage | undefined,
+  details: TruncatedToolOutputDetails,
 ): void {
   consola.warn("Upstream tool output reached token limit", {
     finishReason: "length",
-    toolCallCount,
+    toolCallCount: details.toolCallCount,
     ...outputBudget(payload),
-    completionTokens: finiteNumber(usage?.completion_tokens),
+    clientStream: details.clientStream,
+    catalogEndpointSupport: catalogEndpointSupport(payload.model),
+    finalRequest: details.requestShape ?? null,
+    completionTokens: finiteNumber(details.usage?.completion_tokens),
     reasoningTokens: finiteNumber(
-      usage?.completion_tokens_details?.reasoning_tokens,
+      details.usage?.completion_tokens_details?.reasoning_tokens,
     ),
   })
+}
+
+function fetchNativeMessagesResponse(
+  payload: AnthropicMessagesPayload,
+  selectedModel: Model | undefined,
+  outputSignal: AbortSignal | undefined,
+): ReturnType<typeof createChatCompletions> {
+  const modelMaxOutput =
+    selectedModel ? getModelMaxOutput(selectedModel) : undefined
+  const maxTokens =
+    typeof modelMaxOutput === "number" && payload.max_tokens > modelMaxOutput ?
+      modelMaxOutput
+    : payload.max_tokens
+  return createNativeMessagesCompletion(
+    { ...payload, max_tokens: maxTokens },
+    createToolNameMapFromAnthropicPayload(payload),
+    outputSignal,
+  ) as ReturnType<typeof createChatCompletions>
 }
 
 async function fetchCopilotResponse(
@@ -1534,6 +1613,21 @@ async function fetchCopilotResponse(
   outputSignal?: AbortSignal,
 ): ReturnType<typeof createChatCompletions> {
   throwIfRequestAborted()
+  const selectedModel = state.models?.data.find(
+    (model) => model.id === anthropicPayload.model,
+  )
+  const nativeRouting = nativeMessagesCompatibility(
+    anthropicPayload,
+    selectedModel?.supported_endpoints,
+  )
+  if (nativeRouting === "native_selected") {
+    return fetchNativeMessagesResponse(
+      anthropicPayload,
+      selectedModel,
+      outputSignal,
+    )
+  }
+
   const openAIPayload = translateToOpenAI(anthropicPayload)
   if (
     !outputSignal
@@ -1546,20 +1640,18 @@ async function fetchCopilotResponse(
     )
   }
 
-  const selectedModel = state.models?.data.find(
-    (m) => m.id === openAIPayload.model,
-  )
   clampMaxTokens(openAIPayload, selectedModel)
   applyLargeEditGuidance(
     openAIPayload,
     selectedModel ? getModelMaxOutput(selectedModel) : undefined,
   )
   if (outputSignal) {
-    return createOneShotCompletion(
-      openAIPayload,
-      selectedModel !== undefined && requiresResponsesApi(selectedModel),
-      outputSignal,
-    )
+    return createOneShotCompletion(openAIPayload, {
+      usesResponses:
+        selectedModel !== undefined && requiresResponsesApi(selectedModel),
+      signal: outputSignal,
+      nativeRouting,
+    })
   }
   consola.debug(
     `[routing] model=${openAIPayload.model} found=${selectedModel !== undefined} requiresResponses=${selectedModel !== undefined && requiresResponsesApi(selectedModel)} endpoints=${JSON.stringify(selectedModel?.supported_endpoints)}`,
@@ -1568,12 +1660,13 @@ async function fetchCopilotResponse(
     // createResponsesCompletion returns AsyncIterable<SSEMessage> for streaming,
     // which is structurally compatible with AsyncGenerator<ServerSentEventMessage>
     // at runtime — both support for-await-of. Cast to align with the return type.
-    return createResponsesCompletion(openAIPayload) as ReturnType<
-      typeof createChatCompletions
-    >
+    return createResponsesCompletion(
+      openAIPayload,
+      nativeRouting,
+    ) as ReturnType<typeof createChatCompletions>
   }
 
-  return createChatCompletions(openAIPayload)
+  return createChatCompletions(openAIPayload, nativeRouting)
 }
 
 /**
@@ -1752,6 +1845,15 @@ async function pipeStreamToClient(
       }
       if (rawEvent === undefined) break
 
+      const bufferedNative = getBufferedNativeResponse(rawEvent)
+      if (bufferedNative) {
+        logTruncatedToolOutput(requestPayload, bufferedNative)
+        if (isEmptyNonStreamingResponse(bufferedNative)) return false
+        const translated = translateToAnthropic(bufferedNative, toolNameMap)
+        await emitAnthropicResponseAsSSE(stream, translated, imageTokenOverhead)
+        return true
+      }
+
       if (logPayloads)
         consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
       if (rawEvent.data === "[DONE]") break
@@ -1812,11 +1914,12 @@ async function pipeStreamToClient(
     }
 
     if (truncatedToolCallCount > 0) {
-      logTruncatedToolOutputDetails(
-        requestPayload,
-        truncatedToolCallCount,
-        streamState.lastSeenUsage,
-      )
+      logTruncatedToolOutputDetails(requestPayload, {
+        toolCallCount: truncatedToolCallCount,
+        usage: streamState.lastSeenUsage,
+        requestShape: getFinalUpstreamRequestShape(response),
+        clientStream: true,
+      })
     }
 
     await handleIncompleteStream(stream, streamState)
@@ -2254,6 +2357,11 @@ async function emitAnthropicResponseAsSSE(
             cache_read_input_tokens:
               anthropicResponse.usage.cache_read_input_tokens,
           }),
+          ...(anthropicResponse.usage.cache_creation_input_tokens
+            !== undefined && {
+            cache_creation_input_tokens:
+              anthropicResponse.usage.cache_creation_input_tokens,
+          }),
         },
       },
     }),
@@ -2264,56 +2372,96 @@ async function emitAnthropicResponseAsSSE(
     const block = anthropicResponse.content[i]
     const blockIndex = i
 
-    if (block.type === "text") {
-      await stream.writeSSE({
-        event: "content_block_start",
-        data: JSON.stringify({
-          type: "content_block_start",
-          index: blockIndex,
-          content_block: { ...block, text: "" },
-        }),
-      })
-      await stream.writeSSE({
-        event: "content_block_delta",
-        data: JSON.stringify({
-          type: "content_block_delta",
-          index: blockIndex,
-          delta: { type: "text_delta", text: block.text },
-        }),
-      })
-    } else if (block.type === "tool_use") {
-      await stream.writeSSE({
-        event: "content_block_start",
-        data: JSON.stringify({
-          type: "content_block_start",
-          index: blockIndex,
-          content_block: {
-            type: "tool_use",
-            id: block.id,
-            name: block.name,
-            ...(block.toolset_name ? { toolset_name: block.toolset_name } : {}),
-            input: {},
-          },
-        }),
-      })
-      const inputJson = JSON.stringify(block.input)
-      await stream.writeSSE({
-        event: "content_block_delta",
-        data: JSON.stringify({
-          type: "content_block_delta",
-          index: blockIndex,
-          delta: { type: "input_json_delta", partial_json: inputJson },
-        }),
-      })
-    } else {
-      await stream.writeSSE({
-        event: "content_block_start",
-        data: JSON.stringify({
-          type: "content_block_start",
-          index: blockIndex,
-          content_block: block,
-        }),
-      })
+    switch (block.type) {
+      case "text": {
+        await stream.writeSSE({
+          event: "content_block_start",
+          data: JSON.stringify({
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { ...block, text: "" },
+          }),
+        })
+        await stream.writeSSE({
+          event: "content_block_delta",
+          data: JSON.stringify({
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "text_delta", text: block.text },
+          }),
+        })
+
+        break
+      }
+      case "tool_use": {
+        await stream.writeSSE({
+          event: "content_block_start",
+          data: JSON.stringify({
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: {
+              type: "tool_use",
+              id: block.id,
+              name: block.name,
+              ...(block.toolset_name ?
+                { toolset_name: block.toolset_name }
+              : {}),
+              input: {},
+            },
+          }),
+        })
+        const inputJson = JSON.stringify(block.input)
+        await stream.writeSSE({
+          event: "content_block_delta",
+          data: JSON.stringify({
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "input_json_delta", partial_json: inputJson },
+          }),
+        })
+
+        break
+      }
+      case "thinking": {
+        await stream.writeSSE({
+          event: "content_block_start",
+          data: JSON.stringify({
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "thinking", thinking: "" },
+          }),
+        })
+        await stream.writeSSE({
+          event: "content_block_delta",
+          data: JSON.stringify({
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "thinking_delta", thinking: block.thinking },
+          }),
+        })
+        if (block.signature) {
+          await stream.writeSSE({
+            event: "content_block_delta",
+            data: JSON.stringify({
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: { type: "signature_delta", signature: block.signature },
+            }),
+          })
+        }
+
+        break
+      }
+      default: {
+        await stream.writeSSE({
+          event: "content_block_start",
+          data: JSON.stringify({
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: block,
+          }),
+        })
+      }
     }
 
     await stream.writeSSE({

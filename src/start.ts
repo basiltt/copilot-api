@@ -152,6 +152,19 @@ export function configureToolSearchRecovery(): void {
   }
 }
 
+export function configureNativeMessages(): void {
+  const value = process.env.COPILOT_NATIVE_MESSAGES?.trim()
+  if (value !== undefined && value !== "0" && value !== "1") {
+    throw new Error("COPILOT_NATIVE_MESSAGES must be 0 or 1.")
+  }
+  state.nativeMessages = value === "1"
+  if (state.nativeMessages) {
+    consola.info(
+      "Catalog-gated native Anthropic Messages transport enabled; upstream SSE is buffered until validated message_stop.",
+    )
+  }
+}
+
 // eslint-disable-next-line max-lines-per-function -- Startup ordering coordinates authentication, configuration, and server lifetime.
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
@@ -195,6 +208,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   configureStructuredOutputRecovery()
   configureToolSearchRecovery()
   configureWriteToolRecovery()
+  configureNativeMessages()
 
   await ensurePaths()
   await cacheVSCodeVersion()

@@ -269,6 +269,9 @@ WEB_SEARCH_PROVIDER=copilot      # Native GitHub MCP search; requires advertised
 TAVILY_API_KEY=tvly-...          # Preferred: free at tavily.com (1,000 req/mo)
 BRAVE_API_KEY=BSA...             # Alternative: brave.com/search/api
 
+# Anthropic transport compatibility (optional, off by default)
+# COPILOT_NATIVE_MESSAGES=1      # Use /v1/messages only when the raw model catalog advertises it
+
 # Proxy (optional)
 HTTP_PROXY=http://proxy:8080
 HTTPS_PROXY=http://proxy:8080
@@ -631,6 +634,37 @@ The model's context-window size is not its per-turn output limit. Large writes
 may still need to be split across smaller tool calls even when the conversation
 fits within the context window. See Anthropic's
 [max-token stop-reason guidance](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#max-tokens).
+
+### Optional native Anthropic Messages transport
+
+`COPILOT_NATIVE_MESSAGES=1` enables the upstream `/v1/messages` transport for
+models whose raw Copilot catalog metadata explicitly advertises that endpoint.
+It is **off by default**; `0` disables it and any other value fails startup.
+The caller's explicit `max_tokens` remains subject to the same advertised model
+limit. Unsupported request constructs are routed to the existing compatible
+transport before any native request is made. Once a native request is issued,
+HTTP, policy, and protocol errors are returned without retrying through a
+different endpoint.
+Legacy conversation history containing unsigned thinking or other blocks that
+cannot be represented faithfully also stays on the compatible transport; the
+proxy does not forge or discard provider thinking signatures.
+
+The upstream native request uses SSE. The proxy buffers it under a bounded
+wire limit, validates the completed message and tool inputs, and stops reading
+as soon as the required `message_stop` event arrives. A streaming client
+receives keepalive pings while generation is in progress, then the validated
+content; enabling this flag does not provide incremental token streaming.
+Provider thinking signatures are preserved for untouched valid responses.
+Schema recovery fails explicitly if either the original or regenerated native
+turn contains signed thinking, because replaying a context-bound signature
+with changed tool arguments is not safe.
+
+The catalog's advertised output limit describes the accepted request contract,
+not proof that every model/endpoint combination will produce that many tokens.
+This option does not increase budgets, retry truncated output, or claim to
+remove an observed provider-side cutoff. `max_tokens` and context-window
+truncation remain honest `stop_reason: "max_tokens"` responses so the client
+can decide whether to split work or retry with a different explicit budget.
 
 ### Optional ToolSearch argument recovery
 

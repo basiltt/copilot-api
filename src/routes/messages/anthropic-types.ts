@@ -41,9 +41,9 @@ export interface AnthropicMessagesPayload {
   }
   speed?: "standard" | "fast"
   cache_control?: { type: "ephemeral"; ttl?: number }
-  container?: Record<string, unknown>
-  mcp_servers?: Array<Record<string, unknown>>
-  context_management?: Record<string, unknown>
+  container?: Record<string, unknown> | null
+  mcp_servers?: Array<Record<string, unknown>> | null
+  context_management?: Record<string, unknown> | null
   inference_geo?: string
 }
 
@@ -323,6 +323,7 @@ export interface AnthropicResponse {
   stop_reason:
     | "end_turn"
     | "max_tokens"
+    | "model_context_window_exceeded"
     | "stop_sequence"
     | "tool_use"
     | "pause_turn"

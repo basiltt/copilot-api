@@ -8,6 +8,7 @@ import type {
 
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
+import { hasNativeMessagesThinking } from "~/services/copilot/create-native-messages-completion"
 
 import {
   type AnthropicCustomTool,
@@ -337,6 +338,12 @@ async function regenerateToolSearch({
   signal: downstream,
   complete,
 }: RegenerationContext): Promise<AnthropicResponse> {
+  if (hasNativeMessagesThinking(response)) {
+    throw failedRecovery(
+      original,
+      "cannot safely combine regenerated output with signed native thinking",
+    )
+  }
   downstream.throwIfAborted()
   const startedAt = Date.now()
   const controller = new AbortController()
@@ -362,6 +369,12 @@ async function regenerateToolSearch({
     const repaired = await complete(repairPayload, signal)
     received = true
     signal.throwIfAborted()
+    if (hasNativeMessagesThinking(repaired)) {
+      throw failedRecovery(
+        original,
+        "regeneration returned context-bound signed native thinking",
+      )
+    }
     const repairedCalls = toolSearchCalls(repaired, repairName, false)
     if (
       !repairedCalls

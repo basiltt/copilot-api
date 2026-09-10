@@ -39,8 +39,12 @@ export async function fetchWithInactivity(
   inactivity: ReturnType<typeof createInactivityAbort>,
 ): Promise<Response> {
   try {
-    inactivity.signal.throwIfAborted()
-    return await fetch(url, { ...init, signal: inactivity.signal })
+    const signal =
+      init.signal ?
+        AbortSignal.any([inactivity.signal, init.signal])
+      : inactivity.signal
+    signal.throwIfAborted()
+    return await fetch(url, { ...init, signal })
   } catch (error) {
     inactivity.clear()
     throw error

@@ -7,6 +7,7 @@ import type {
 
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
+import { hasNativeMessagesThinking } from "~/services/copilot/create-native-messages-completion"
 
 import {
   type AnthropicMessagesPayload,
@@ -111,12 +112,22 @@ export function addRecoveryUsage(
   const cached =
     (first.prompt_tokens_details?.cached_tokens ?? 0)
     + (second.prompt_tokens_details?.cached_tokens ?? 0)
+  const cacheCreation =
+    (first.prompt_tokens_details?.cache_creation_tokens ?? 0)
+    + (second.prompt_tokens_details?.cache_creation_tokens ?? 0)
   return {
     prompt_tokens: first.prompt_tokens + second.prompt_tokens,
     completion_tokens: first.completion_tokens + second.completion_tokens,
     total_tokens: first.total_tokens + second.total_tokens,
     ...(first.prompt_tokens_details || second.prompt_tokens_details ?
-      { prompt_tokens_details: { cached_tokens: cached } }
+      {
+        prompt_tokens_details: {
+          cached_tokens: cached,
+          ...(cacheCreation > 0 ?
+            { cache_creation_tokens: cacheCreation }
+          : {}),
+        },
+      }
     : {}),
   }
 }
@@ -151,11 +162,18 @@ function regenerationPayload(
   }
 }
 
+// eslint-disable-next-line max-lines-per-function -- One deadline and terminal outcome cover the complete atomic regeneration.
 async function regenerate(
   context: RecoveryContext,
   original: ToolSchemaMismatchError,
 ): Promise<AnthropicResponse> {
   const { payload, response, map, signal: downstream, complete } = context
+  if (hasNativeMessagesThinking(response)) {
+    throw failedRecovery(
+      original,
+      "cannot safely combine regenerated output with signed native thinking",
+    )
+  }
   const name = toOpenAIToolName("StructuredOutput", map)
   const call = soleOutputCall(response, name)
   const tool = payload.tools?.find(
@@ -184,8 +202,14 @@ async function regenerate(
     const repairMap = createToolNameMapFromAnthropicPayload(repairPayload)
     const repairName = toOpenAIToolName("StructuredOutput", repairMap)
     const repaired = await complete(repairPayload, signal)
-    received = true
     signal.throwIfAborted()
+    if (hasNativeMessagesThinking(repaired)) {
+      throw failedRecovery(
+        original,
+        "regeneration returned context-bound signed native thinking",
+      )
+    }
+    received = true
     const repairedCall = soleOutputCall(repaired, repairName)
     if (!repairedCall || repaired.model !== response.model) {
       throw failedRecovery(
