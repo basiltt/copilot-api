@@ -327,6 +327,8 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(captured).toContain('"reason":"eligible"')
     expect(captured).toContain('"callCount":2')
     expect(captured).toContain('"toolSearchCallCount":2')
+    expect(captured).toContain("ToolSearch argument regeneration outcome")
+    expect(captured).toContain('"outcome":"validated"')
   })
 
   test("buffers parallel ToolSearch-only recovery into one SSE message", async () => {
@@ -737,6 +739,8 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(response.status).toBe(502)
     expect(await response.text()).toContain("no further automatic attempt")
     expect(fetchSpy).toHaveBeenCalledTimes(2)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"outcome":"shape_rejected"')
   })
 
   test("rejects duplicate original ToolSearch IDs with bounded metadata", async () => {
@@ -878,6 +882,14 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(response.status).toBe(502)
     expect(await response.text()).toContain("no further automatic attempt")
     expect(fetchSpy).toHaveBeenCalledTimes(2)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain(
+      `"outcome":"${
+        kind === "invalid supplied limit" || kind === "invalid again" ?
+          "schema_invalid"
+        : "shape_rejected"
+      }"`,
+    )
   })
 
   test("regeneration policy details retain status and private values never enter logs", async () => {
@@ -894,6 +906,7 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(await response.text()).toContain("Correction policy denied")
     const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
     expect(captured).toContain("ToolSearch schema mismatch")
+    expect(captured).toContain('"outcome":"policy_or_transport"')
     expect(captured).not.toContain(secret)
     expect(fetchSpy).toHaveBeenCalledTimes(2)
   })
@@ -972,6 +985,8 @@ describe("ToolSearch recovery deadline and isolation", () => {
       expect(repairSignal?.aborted).toBe(true)
       if (stage === "body") expect(bodyCanceled).toBe(true)
       expect(calls).toBe(2)
+      const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+      expect(captured).toContain('"outcome":"timed_out"')
     },
   )
 
@@ -1012,6 +1027,8 @@ describe("ToolSearch recovery deadline and isolation", () => {
     expect(repairSignal?.aborted).toBe(true)
     expect(bodyCanceled).toBe(true)
     expect(calls).toBe(2)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"outcome":"canceled"')
   })
 
   test("concurrent requests retain independent schemas and call IDs", async () => {

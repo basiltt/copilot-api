@@ -53,6 +53,14 @@ interface RegenerationContext extends RecoveryOptions {
 
 class ToolSearchRecoveryError extends HTTPError {}
 
+type RegenerationOutcome =
+  | "canceled"
+  | "policy_or_transport"
+  | "schema_invalid"
+  | "shape_rejected"
+  | "timed_out"
+  | "validated"
+
 function isUnscopedToolSearch(tool: AnthropicCustomTool): boolean {
   return tool.name === "ToolSearch" && !("toolset_name" in tool)
 }
@@ -307,6 +315,19 @@ function preservesCandidate(
   )
 }
 
+function logRegenerationOutcome(
+  outcome: RegenerationOutcome,
+  callCount: number,
+  startedAt: number,
+): void {
+  consola.info("ToolSearch argument regeneration outcome", {
+    outcome,
+    callCount,
+    elapsedMs: Math.max(0, Date.now() - startedAt),
+  })
+}
+
+// eslint-disable-next-line max-lines-per-function -- One deadline and terminal outcome must cover the complete atomic batch.
 async function regenerateToolSearch({
   payload,
   response,
@@ -317,6 +338,7 @@ async function regenerateToolSearch({
   complete,
 }: RegenerationContext): Promise<AnthropicResponse> {
   downstream.throwIfAborted()
+  const startedAt = Date.now()
   const controller = new AbortController()
   const timeout = setTimeout(
     () =>
@@ -362,7 +384,7 @@ async function regenerateToolSearch({
       }
     }
     signal.throwIfAborted()
-    return translateToAnthropic(
+    const translated = translateToAnthropic(
       {
         ...response,
         choices: [
@@ -384,19 +406,45 @@ async function regenerateToolSearch({
       },
       map,
     )
+    logRegenerationOutcome("validated", eligible.calls.length, startedAt)
+    return translated
   } catch (error) {
-    if (downstream.aborted) throw downstream.reason
-    if (controller.signal.aborted)
+    if (downstream.aborted) {
+      logRegenerationOutcome("canceled", eligible.calls.length, startedAt)
+      throw downstream.reason
+    }
+    if (controller.signal.aborted) {
+      logRegenerationOutcome("timed_out", eligible.calls.length, startedAt)
       throw failedRecovery(original, "timed out after 20 seconds")
-    if (error instanceof ToolSchemaMismatchError)
+    }
+    if (error instanceof ToolSchemaMismatchError) {
+      logRegenerationOutcome("schema_invalid", eligible.calls.length, startedAt)
       throw failedRecovery(original, "still failed the unchanged schema")
-    if (error instanceof HTTPError && !received) throw error
-    if (error instanceof ToolSearchRecoveryError) throw error
-    if (error instanceof HTTPError)
+    }
+    if (error instanceof HTTPError && !received) {
+      logRegenerationOutcome(
+        "policy_or_transport",
+        eligible.calls.length,
+        startedAt,
+      )
+      throw error
+    }
+    if (error instanceof ToolSearchRecoveryError) {
+      logRegenerationOutcome("shape_rejected", eligible.calls.length, startedAt)
+      throw error
+    }
+    if (error instanceof HTTPError) {
+      logRegenerationOutcome("shape_rejected", eligible.calls.length, startedAt)
       throw failedRecovery(
         original,
         "returned invalid arguments after regeneration",
       )
+    }
+    logRegenerationOutcome(
+      "policy_or_transport",
+      eligible.calls.length,
+      startedAt,
+    )
     throw failedRecovery(
       original,
       "failed before valid arguments were received",
