@@ -16,7 +16,11 @@ import {
 } from "~/lib/error"
 
 function makeContext(jsonFn = mock(), headerFn = mock()) {
-  return { json: jsonFn, header: headerFn } as unknown as Context
+  return {
+    json: jsonFn,
+    header: headerFn,
+    req: { raw: new Request("http://localhost") },
+  } as unknown as Context
 }
 
 function makeHTTPError(body: string, status: number): HTTPError {
