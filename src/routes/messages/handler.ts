@@ -76,6 +76,11 @@ import {
   createToolNameMapFromAnthropicPayload,
   type ToolNameMap,
 } from "./tool-name-mapping"
+import {
+  hasLogicalToolSearch,
+  translateWithToolSearchRecovery,
+  usesToolSearchRecovery,
+} from "./tool-search-recovery"
 import { EMPTY_VISIBLE_OUTPUT_TEXT, toAnthropicMessageId } from "./utils"
 import {
   hasLogicalWriteTool,
@@ -209,6 +214,7 @@ export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   if (
     !usesStructuredOutputRecovery(anthropicPayload)
+    && !hasLogicalToolSearch(anthropicPayload)
     && !hasLogicalWriteTool(anthropicPayload)
   ) {
     consola.debug(
@@ -296,6 +302,7 @@ export async function handleCompletion(c: Context) {
   }
   if (
     (usesStructuredOutputRecovery(anthropicPayload)
+      || usesToolSearchRecovery(anthropicPayload)
       || usesWriteToolRecovery(anthropicPayload))
     && !looksLikeCompactionRequest(anthropicPayload)
   ) {
@@ -452,6 +459,7 @@ async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
   const disconnect = new AbortController()
   const signal = AbortSignal.any([c.req.raw.signal, disconnect.signal])
   const structuredOutputAllowed = usesStructuredOutputRecovery(payload)
+  const toolSearchAllowed = usesToolSearchRecovery(payload)
   const writeAllowed = usesWriteToolRecovery(payload)
   const run = () =>
     fetchNonStreamingAnthropicResponse(
@@ -460,6 +468,7 @@ async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
         signal,
         complete: completeOutputTool,
         structuredOutputAllowed,
+        toolSearchAllowed,
         writeAllowed,
       },
     )
@@ -559,7 +568,10 @@ async function handleNonStreaming(
     )
   }
 
-  if (!hasLogicalWriteTool(anthropicPayload)) {
+  if (
+    !hasLogicalToolSearch(anthropicPayload)
+    && !hasLogicalWriteTool(anthropicPayload)
+  ) {
     consola.debug(
       "Non-streaming response from Copilot:",
       JSON.stringify(result.response).slice(-400),
@@ -611,7 +623,10 @@ async function handleNonStreaming(
     )
   }
 
-  if (!hasLogicalWriteTool(anthropicPayload)) {
+  if (
+    !hasLogicalToolSearch(anthropicPayload)
+    && !hasLogicalWriteTool(anthropicPayload)
+  ) {
     consola.debug(
       "Translated Anthropic response:",
       JSON.stringify(anthropicResponse),
@@ -1014,9 +1029,11 @@ interface NonStreamingRecoveryOptions {
   signal: AbortSignal
   complete: OutputCompletion
   structuredOutputAllowed: boolean
+  toolSearchAllowed: boolean
   writeAllowed: boolean
 }
 
+// eslint-disable-next-line max-lines-per-function -- Initial fetch and ordered recovery dispatch must share one prepared payload and usage adjustment.
 async function fetchNonStreamingAnthropicResponse(
   anthropicPayload: AnthropicMessagesPayload,
   outputRecovery?: NonStreamingRecoveryOptions,
@@ -1081,9 +1098,9 @@ async function fetchNonStreamingAnthropicResponse(
   let anthropicResponse: AnthropicResponse
   if (!outputRecovery) {
     anthropicResponse = translateToAnthropic(response, toolNameMap)
-  } else if (outputRecovery.writeAllowed) {
+  } else if (outputRecovery.toolSearchAllowed) {
     try {
-      anthropicResponse = await translateWithWriteRecovery(
+      anthropicResponse = await translateWithToolSearchRecovery(
         preparedPayload,
         response,
         { map: toolNameMap, ...outputRecovery },
@@ -1091,15 +1108,24 @@ async function fetchNonStreamingAnthropicResponse(
     } catch (error) {
       if (
         !(error instanceof ToolSchemaMismatchError)
-        || !outputRecovery.structuredOutputAllowed
+        || (!outputRecovery.writeAllowed
+          && !outputRecovery.structuredOutputAllowed)
       )
         throw error
-      anthropicResponse = await translateWithOutputRecovery(
-        preparedPayload,
+      anthropicResponse = await translateWithRemainingOutputRecovery({
+        map: toolNameMap,
+        outputRecovery,
+        payload: preparedPayload,
         response,
-        { map: toolNameMap, ...outputRecovery },
-      )
+      })
     }
+  } else if (outputRecovery.writeAllowed) {
+    anthropicResponse = await translateWithRemainingOutputRecovery({
+      map: toolNameMap,
+      outputRecovery,
+      payload: preparedPayload,
+      response,
+    })
   } else {
     anthropicResponse = await translateWithOutputRecovery(
       preparedPayload,
@@ -1120,6 +1146,41 @@ async function fetchNonStreamingAnthropicResponse(
     )
   }
   return anthropicResponse
+}
+
+async function translateWithRemainingOutputRecovery({
+  payload,
+  response,
+  map,
+  outputRecovery,
+}: {
+  payload: AnthropicMessagesPayload
+  response: ChatCompletionResponse
+  map: ToolNameMap
+  outputRecovery: NonStreamingRecoveryOptions
+}): Promise<AnthropicResponse> {
+  if (outputRecovery.writeAllowed) {
+    try {
+      return await translateWithWriteRecovery(payload, response, {
+        map,
+        ...outputRecovery,
+      })
+    } catch (error) {
+      if (
+        !(error instanceof ToolSchemaMismatchError)
+        || !outputRecovery.structuredOutputAllowed
+      )
+        throw error
+      return translateWithOutputRecovery(payload, response, {
+        map,
+        ...outputRecovery,
+      })
+    }
+  }
+  return translateWithOutputRecovery(payload, response, {
+    map,
+    ...outputRecovery,
+  })
 }
 
 async function fetchCompactionResponse(
@@ -1377,7 +1438,11 @@ async function fetchCopilotResponse(
 ): ReturnType<typeof createChatCompletions> {
   throwIfRequestAborted()
   const openAIPayload = translateToOpenAI(anthropicPayload)
-  if (!outputSignal && !hasLogicalWriteTool(anthropicPayload)) {
+  if (
+    !outputSignal
+    && !hasLogicalToolSearch(anthropicPayload)
+    && !hasLogicalWriteTool(anthropicPayload)
+  ) {
     consola.debug(
       "Translated OpenAI request payload:",
       JSON.stringify(openAIPayload),

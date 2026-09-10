@@ -612,6 +612,40 @@ mitigation for the standard missing-`content` case, not a guarantee to repair
 every `Write` failure or evidence about a historical payload whose exact
 arguments were not retained.
 
+### Optional ToolSearch argument recovery
+
+`TOOL_SEARCH_RECOVERY=1` enables one model-only argument regeneration for a
+complete, sole custom unscoped `ToolSearch` call whose arguments are a JSON
+object but fail the client's declared `input_schema`. It is **off by default**;
+`0` disables it and any other value fails startup. The client schema is
+authoritative and remains unchanged, including local references, unions, and
+constraints. Hosted tools such as `type: tool_search_tool_*` are different and
+are not enabled or emulated by this setting.
+
+Every property already supplied by the model must remain deeply identical. The
+same selected model receives the original conversation, the unchanged
+`ToolSearch` schema, and only that tool with `tool_choice: auto`; it may add
+only schema-supported arguments needed to express the original discovery
+intent. A valid regeneration retains the original call ID, preserves any
+original explanatory text, and sums both calls' usage. The proxy never executes
+`ToolSearch`, invents tool references or results, or calls a discovered tool.
+Malformed or truncated JSON, refusals, policy errors, mixed tool calls,
+previously acknowledged call IDs, changed existing values, and a second invalid
+result fail without another attempt.
+
+Eligible JSON and SSE requests are buffered through the one-shot output-tool
+transport so invalid discovery arguments are never partially emitted. While
+buffered, SSE connections receive keepalive events; the final response contains
+one normal message event sequence. This means the initial completion does not
+use the normal streaming transport or its transient HTTP retries. A valid
+`ToolSearch` call or a response without `ToolSearch` makes no additional model
+request. Regeneration permits at most one extra same-model call and 20 seconds,
+including response-body reading, and request cancellation propagates through
+both calls. Request and response payload values are omitted from debug logs on
+routes declaring logical `ToolSearch`. This is bounded compatibility for
+schema-invalid discovery calls, not a guarantee that every provider output can
+be repaired.
+
 ### Optional StructuredOutput recovery
 
 `STRUCTURED_OUTPUT_RECOVERY=1` (or `true`) enables one schema-aware regeneration

@@ -139,6 +139,19 @@ export function configureWriteToolRecovery(): void {
   }
 }
 
+export function configureToolSearchRecovery(): void {
+  const value = process.env.TOOL_SEARCH_RECOVERY?.trim()
+  if (value !== undefined && value !== "0" && value !== "1") {
+    throw new Error("TOOL_SEARCH_RECOVERY must be 0 or 1.")
+  }
+  state.toolSearchRecovery = value === "1"
+  if (state.toolSearchRecovery) {
+    consola.info(
+      "ToolSearch argument recovery enabled: one same-model regeneration, maximum 20s; the proxy does not execute tools.",
+    )
+  }
+}
+
 // eslint-disable-next-line max-lines-per-function -- Startup ordering coordinates authentication, configuration, and server lifetime.
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
@@ -180,6 +193,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
   configureSearchProvider()
   configureStructuredOutputRecovery()
+  configureToolSearchRecovery()
   configureWriteToolRecovery()
 
   await ensurePaths()

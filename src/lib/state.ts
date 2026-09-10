@@ -12,6 +12,7 @@ export interface State {
   rateLimitWait: boolean
   showToken: boolean
   structuredOutputRecovery?: boolean
+  toolSearchRecovery?: boolean
   writeToolRecovery?: boolean
 
   // Rate limiting configuration
@@ -38,6 +39,7 @@ export const state: State = {
   rateLimitWait: false,
   showToken: false,
   structuredOutputRecovery: false,
+  toolSearchRecovery: false,
   writeToolRecovery: false,
   burstRequestTimestamps: [],
   burstMinSpacingMs: 0,
