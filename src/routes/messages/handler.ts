@@ -417,15 +417,25 @@ async function handleServerSearch(
   payload: AnthropicMessagesPayload,
   limit: number,
 ) {
+  const disconnect = new AbortController()
+  const signal = AbortSignal.any([c.req.raw.signal, disconnect.signal])
+  const recovery = outputRecoveryOptions(payload, signal)
   const run = () =>
-    runServerWebSearch(payload, limit, fetchNonStreamingAnthropicResponse)
+    runServerWebSearch(payload, limit, (request) =>
+      fetchNonStreamingAnthropicResponse(request, recovery),
+    )
   if (payload.stream) {
     return streamSSE(c, async (stream) => {
       const stopKeepalive = startSSEKeepalive(stream)
+      stream.onAbort(() => {
+        stopKeepalive()
+        disconnect.abort(new Error("Client disconnected"))
+      })
       try {
         await emitAnthropicResponseAsSSE(stream, await run())
       } catch (error) {
-        await emitStreamingError(stream, error, payload.model)
+        if (!signal.aborted)
+          await emitStreamingError(stream, error, payload.model)
       } finally {
         stopKeepalive()
       }
@@ -458,20 +468,10 @@ const completeOutputTool: OutputCompletion = async (request, requestSignal) => {
 async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
   const disconnect = new AbortController()
   const signal = AbortSignal.any([c.req.raw.signal, disconnect.signal])
-  const structuredOutputAllowed = usesStructuredOutputRecovery(payload)
-  const toolSearchAllowed = usesToolSearchRecovery(payload)
-  const writeAllowed = usesWriteToolRecovery(payload)
+  const recovery = outputRecoveryOptions(payload, signal)
+  if (!recovery) throw new Error("Expected enabled output recovery")
   const run = () =>
-    fetchNonStreamingAnthropicResponse(
-      { ...payload, stream: false },
-      {
-        signal,
-        complete: completeOutputTool,
-        structuredOutputAllowed,
-        toolSearchAllowed,
-        writeAllowed,
-      },
-    )
+    fetchNonStreamingAnthropicResponse({ ...payload, stream: false }, recovery)
   if (payload.stream) {
     return streamSSE(c, async (stream) => {
       const stopKeepalive = startSSEKeepalive(stream)
@@ -1031,6 +1031,26 @@ interface NonStreamingRecoveryOptions {
   structuredOutputAllowed: boolean
   toolSearchAllowed: boolean
   writeAllowed: boolean
+}
+
+function outputRecoveryOptions(
+  payload: AnthropicMessagesPayload,
+  signal: AbortSignal,
+): NonStreamingRecoveryOptions | undefined {
+  const options = {
+    signal,
+    complete: completeOutputTool,
+    structuredOutputAllowed: usesStructuredOutputRecovery(payload),
+    toolSearchAllowed: usesToolSearchRecovery(payload),
+    writeAllowed: usesWriteToolRecovery(payload),
+  }
+  return (
+      options.structuredOutputAllowed
+        || options.toolSearchAllowed
+        || options.writeAllowed
+    ) ?
+      options
+    : undefined
 }
 
 // eslint-disable-next-line max-lines-per-function -- Initial fetch and ordered recovery dispatch must share one prepared payload and usage adjustment.

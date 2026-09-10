@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import consola from "consola"
 import { Hono } from "hono"
@@ -456,6 +457,136 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(output).toContain(String.raw`\"query\":\"select:WebFetch\"`)
     expect(fetchSpy).toHaveBeenCalledTimes(2)
     expect(bodies.every((body) => body.stream === false)).toBe(true)
+  })
+
+  test.each([
+    {
+      stream: false,
+      serverTool: {
+        type: "web_search_20250305",
+        name: "web_search",
+        max_uses: 1,
+      },
+    },
+    {
+      stream: true,
+      serverTool: {
+        type: "web_search_20260318",
+        name: "web_search",
+        max_uses: 1,
+        allowed_callers: ["direct"],
+      },
+    },
+  ])(
+    "repairs ToolSearch without executing declared server search (stream=$stream)",
+    async ({ stream, serverTool }) => {
+      state.webSearchProvider = "copilot"
+      const request = payload(stream)
+      request.tools?.push(serverTool)
+      queue(completion("{}"), repaired('{"query":"select:WebFetch"}'))
+
+      const response = await send(request)
+      const output = await response.text()
+      expect(response.status).toBe(200)
+      expect(output).toContain("ToolSearch")
+      expect(output).toContain("select:WebFetch")
+      expect(output).not.toContain("server_tool_use")
+      expect(output).not.toContain("web_search_tool_result")
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
+      expect(
+        bodies[0].tools?.some((tool) =>
+          tool.function.name.startsWith("__copilot_web_search"),
+        ),
+      ).toBe(true)
+      expect(bodies[1].tools?.map((tool) => tool.function.name)).toEqual([
+        "ToolSearch",
+      ])
+      expect(bodies.every((body) => body.stream === false)).toBe(true)
+    },
+  )
+
+  test("server-search buffering cannot enable Write recovery for an original stream", async () => {
+    const request = payload(true)
+    request.tools?.push(
+      {
+        name: "Write",
+        input_schema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+            content: { type: "string" },
+          },
+          required: ["file_path", "content"],
+        },
+      },
+      {
+        name: "StructuredOutput",
+        input_schema: {
+          type: "object",
+          properties: { answer: { type: "string" } },
+          required: ["answer"],
+        },
+      },
+      {
+        type: "web_search_20250305",
+        name: "web_search",
+        max_uses: 1,
+      },
+    )
+    state.webSearchProvider = "copilot"
+    state.writeToolRecovery = true
+    state.structuredOutputRecovery = true
+    queue(
+      completion('{"file_path":"generated.ts"}', {
+        name: "Write",
+      }),
+    )
+
+    const response = await send(request)
+    const output = await response.text()
+    expect(response.status).toBe(200)
+    expect(output).toContain('"type":"error"')
+    expect(output).not.toContain('"type":"tool_use"')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test("mixed actual server-search and ToolSearch calls remain strict", async () => {
+    state.webSearchProvider = "copilot"
+    const request = payload(false)
+    request.tools?.push({
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses: 1,
+    })
+    fetchSpy.mockImplementation(
+      Object.assign(
+        (_url: string | URL | Request, init?: RequestInit) => {
+          if (typeof init?.body !== "string") throw new Error("Missing body")
+          const body = JSON.parse(init.body) as ChatCompletionsPayload
+          bodies.push(body)
+          const serverSearch = body.tools?.find((tool) =>
+            tool.function.name.startsWith("__copilot_web_search"),
+          )
+          if (!serverSearch) throw new Error("Expected server search tool")
+          const result = completion("{}")
+          result.choices[0].message.tool_calls?.push({
+            id: "server_search_call",
+            type: "function",
+            function: {
+              name: serverSearch.function.name,
+              arguments: '{"query":"current news"}',
+            },
+          })
+          return Promise.resolve(Response.json(result))
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      ),
+    )
+
+    const response = await send(request)
+    expect(response.status).toBe(502)
+    expect(await response.text()).not.toContain("web_search_tool_result")
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 
   test.each([
