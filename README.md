@@ -615,23 +615,28 @@ arguments were not retained.
 ### Optional ToolSearch argument recovery
 
 `TOOL_SEARCH_RECOVERY=1` enables one model-only argument regeneration for a
-complete, sole custom unscoped `ToolSearch` call whose arguments are a JSON
-object but fail the client's declared `input_schema`. It is **off by default**;
-`0` disables it and any other value fails startup. The client schema is
-authoritative and remains unchanged, including local references, unions, and
-constraints. Hosted tools such as `type: tool_search_tool_*` are different and
-are not enabled or emulated by this setting.
+complete turn containing only custom unscoped `ToolSearch` calls, where at
+least one JSON-object argument fails the client's declared `input_schema`. One
+or more parallel discovery calls are repaired together in the same bounded
+model request; a turn mixing `ToolSearch` with any other actual tool call is
+not eligible. It is **off by default**; `0` disables it and any other value
+fails startup. The client schema is authoritative and remains unchanged,
+including local references, unions, and constraints. Hosted tools such as
+`type: tool_search_tool_*` are different and are not enabled or emulated by
+this setting.
 
 Every property already supplied by the model must remain deeply identical. The
 same selected model receives the original conversation, the unchanged
 `ToolSearch` schema, and only that tool with `tool_choice: auto`; it may add
 only schema-supported arguments needed to express the original discovery
 intent. A valid regeneration retains the original call ID, preserves any
-original explanatory text, and sums both calls' usage. The proxy never executes
-`ToolSearch`, invents tool references or results, or calls a discovered tool.
-Malformed or truncated JSON, refusals, policy errors, mixed tool calls,
-previously acknowledged call IDs, changed existing values, and a second invalid
-result fail without another attempt.
+original explanatory text, and sums both calls' usage. Parallel calls retain
+their original order and IDs, and each repaired argument object must preserve
+the corresponding original values. The proxy never executes `ToolSearch`,
+invents tool references or results, or calls a discovered tool. Malformed or
+truncated JSON, refusals, policy errors, mixed tool calls, duplicate or
+previously acknowledged call IDs, changed or reordered existing values, and a
+second invalid result fail without another attempt.
 
 Eligible JSON and SSE requests are buffered through the one-shot output-tool
 transport so invalid discovery arguments are never partially emitted. While

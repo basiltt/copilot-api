@@ -78,6 +78,7 @@ import {
 } from "./tool-name-mapping"
 import {
   hasLogicalToolSearch,
+  isToolSearchSchemaMismatch,
   translateWithToolSearchRecovery,
   usesToolSearchRecovery,
 } from "./tool-search-recovery"
@@ -1053,6 +1054,18 @@ function outputRecoveryOptions(
     : undefined
 }
 
+function canTryRemainingOutputRecovery(
+  error: unknown,
+  map: ToolNameMap,
+  options: NonStreamingRecoveryOptions,
+): error is ToolSchemaMismatchError {
+  return (
+    error instanceof ToolSchemaMismatchError
+    && !isToolSearchSchemaMismatch(error, map)
+    && (options.writeAllowed || options.structuredOutputAllowed)
+  )
+}
+
 // eslint-disable-next-line max-lines-per-function -- Initial fetch and ordered recovery dispatch must share one prepared payload and usage adjustment.
 async function fetchNonStreamingAnthropicResponse(
   anthropicPayload: AnthropicMessagesPayload,
@@ -1126,11 +1139,7 @@ async function fetchNonStreamingAnthropicResponse(
         { map: toolNameMap, ...outputRecovery },
       )
     } catch (error) {
-      if (
-        !(error instanceof ToolSchemaMismatchError)
-        || (!outputRecovery.writeAllowed
-          && !outputRecovery.structuredOutputAllowed)
-      )
+      if (!canTryRemainingOutputRecovery(error, toolNameMap, outputRecovery))
         throw error
       anthropicResponse = await translateWithRemainingOutputRecovery({
         map: toolNameMap,

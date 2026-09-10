@@ -271,6 +271,112 @@ describe("bounded ToolSearch argument recovery", () => {
     )
   })
 
+  test("repairs parallel ToolSearch-only calls in one bounded generation", async () => {
+    const initial = completion('{"max_results":3,"query":"select:WebFetch"}', {
+      content: "I will load both tool groups.",
+    })
+    initial.choices[0].message.tool_calls?.push({
+      id: "search_second",
+      type: "function",
+      function: {
+        name: "ToolSearch",
+        arguments: '{"max_results":5}',
+      },
+    })
+    const repair = repaired('{"max_results":3,"query":"select:WebFetch"}')
+    repair.choices[0].message.tool_calls?.push({
+      id: "repair_second",
+      type: "function",
+      function: {
+        name: "ToolSearch",
+        arguments: '{"max_results":5,"query":"select:WebSearch"}',
+      },
+    })
+    queue(initial, repair)
+
+    const response = await send()
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      stop_reason: "tool_use",
+      usage: {
+        input_tokens: 23,
+        output_tokens: 7,
+        cache_read_input_tokens: 4,
+      },
+      content: [
+        { type: "text", text: "I will load both tool groups." },
+        {
+          type: "tool_use",
+          id: "search_original",
+          name: "ToolSearch",
+          input: { max_results: 3, query: "select:WebFetch" },
+        },
+        {
+          type: "tool_use",
+          id: "search_second",
+          name: "ToolSearch",
+          input: { max_results: 5, query: "select:WebSearch" },
+        },
+      ],
+    })
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(bodies[1].tools?.map((tool) => tool.function.name)).toEqual([
+      "ToolSearch",
+    ])
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"reason":"eligible"')
+    expect(captured).toContain('"callCount":2')
+    expect(captured).toContain('"toolSearchCallCount":2')
+  })
+
+  test("buffers parallel ToolSearch-only recovery into one SSE message", async () => {
+    const initial = completion("{}")
+    initial.choices[0].message.tool_calls?.push({
+      id: "search_second",
+      type: "function",
+      function: { name: "ToolSearch", arguments: '{"max_results":5}' },
+    })
+    const repair = repaired('{"query":"select:WebFetch"}')
+    repair.choices[0].message.tool_calls?.push({
+      id: "repair_second",
+      type: "function",
+      function: {
+        name: "ToolSearch",
+        arguments: '{"max_results":5,"query":"select:WebSearch"}',
+      },
+    })
+    queue(initial, repair)
+
+    const response = await send(payload(true))
+    const output = await response.text()
+    expect(response.status).toBe(200)
+    expect(output.match(/event: message_start/g)).toHaveLength(1)
+    expect(output.match(/event: message_stop/g)).toHaveLength(1)
+    expect(output).toContain("search_original")
+    expect(output).toContain("search_second")
+    expect(output).toContain(String.raw`\"query\":\"select:WebFetch\"`)
+    expect(output).toContain(String.raw`\"query\":\"select:WebSearch\"`)
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  test("returns valid parallel ToolSearch calls without regeneration", async () => {
+    const result = completion('{"query":"select:WebFetch"}')
+    result.choices[0].message.tool_calls?.push({
+      id: "search_second",
+      type: "function",
+      function: {
+        name: "ToolSearch",
+        arguments: '{"query":"select:WebSearch","max_results":5}',
+      },
+    })
+    queue(result)
+
+    const response = await send()
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain("search_second")
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
   test("valid output uses one call and startup parsing is explicit", async () => {
     setRecoverySetting(undefined)
     configureToolSearchRecovery()
@@ -587,6 +693,68 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(response.status).toBe(502)
     expect(await response.text()).not.toContain("web_search_tool_result")
     expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain("ToolSearch recovery skipped")
+    expect(captured).toContain('"reason":"mixed_calls"')
+    expect(captured).toContain('"toolSearchCallCount":1')
+    expect(captured).toContain('"otherCallCount":1')
+    expect(captured).not.toContain("Write missing-content mismatch")
+  })
+
+  test.each([
+    "wrong count",
+    "duplicate IDs",
+    "reordered supplied values",
+    "extra other action",
+  ])("rejects parallel regeneration with %s", async (kind) => {
+    const initial = completion('{"max_results":3}')
+    initial.choices[0].message.tool_calls?.push({
+      id: "search_second",
+      type: "function",
+      function: { name: "ToolSearch", arguments: '{"max_results":5}' },
+    })
+    const repair = repaired(
+      kind === "reordered supplied values" ?
+        '{"max_results":5,"query":"select:WebFetch"}'
+      : '{"max_results":3,"query":"select:WebFetch"}',
+    )
+    if (kind !== "wrong count") {
+      repair.choices[0].message.tool_calls?.push({
+        id: kind === "duplicate IDs" ? "search_repair" : "repair_second",
+        type: "function",
+        function: {
+          name: kind === "extra other action" ? "WebFetch" : "ToolSearch",
+          arguments:
+            kind === "reordered supplied values" ?
+              '{"max_results":3,"query":"select:WebSearch"}'
+            : '{"max_results":5,"query":"select:WebSearch"}',
+        },
+      })
+    }
+    queue(initial, repair)
+
+    const response = await send()
+    expect(response.status).toBe(502)
+    expect(await response.text()).toContain("no further automatic attempt")
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  test("rejects duplicate original ToolSearch IDs with bounded metadata", async () => {
+    const initial = completion("{}")
+    initial.choices[0].message.tool_calls?.push({
+      id: "search_original",
+      type: "function",
+      function: { name: "ToolSearch", arguments: "{}" },
+    })
+    queue(initial)
+
+    const response = await send()
+    expect(response.status).toBe(502)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"reason":"duplicate_id"')
+    expect(captured).toContain('"duplicateId":true')
+    expect(captured).not.toContain("Find and load the matching tool.")
   })
 
   test.each([

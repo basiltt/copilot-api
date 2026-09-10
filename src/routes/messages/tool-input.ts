@@ -157,6 +157,7 @@ function validationDiagnostics(
 
 export class ToolSchemaMismatchError extends HTTPError {
   readonly diagnostics: Array<ToolValidationDiagnostic>
+  readonly toolName!: string
 
   constructor(name: string, errors: Array<ErrorObject> | null | undefined) {
     const diagnostics = validationDiagnostics(errors)
@@ -169,6 +170,10 @@ export class ToolSchemaMismatchError extends HTTPError {
     )
     super(error.message, error.response)
     this.diagnostics = diagnostics
+    Object.defineProperty(this, "toolName", {
+      enumerable: false,
+      value: name,
+    })
   }
 }
 
