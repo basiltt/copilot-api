@@ -124,6 +124,7 @@ interface ResponsesResponse {
   id: string
   model: string
   status?: string
+  incomplete_details?: { reason?: string }
   error?: unknown
   output: Array<ResponsesOutputItem>
   usage: {
@@ -1057,24 +1058,28 @@ function validateBufferedResponse(resp: ResponsesResponse): void {
   }
 }
 
+// eslint-disable-next-line complexity
 export function translateFromResponsesResponse(
   resp: ResponsesResponse,
   strictOutput = false,
 ): ChatCompletionResponse {
-  if (resp.status && resp.status !== "completed") {
+  if (resp.error !== undefined && resp.error !== null) {
+    throwResponseError({
+      type: `response.${resp.status ?? "failed"}`,
+      response: { ...resp },
+    })
+  }
+  const outputTruncated =
+    resp.status === "incomplete"
+    && resp.incomplete_details?.reason === "max_output_tokens"
+  if (resp.status && resp.status !== "completed" && !outputTruncated) {
     throwResponseError({
       type: `response.${resp.status}`,
       response: { ...resp },
     })
   }
   if (strictOutput) validateBufferedResponse(resp)
-  const refused =
-    strictOutput
-    && resp.output.some(
-      (item) =>
-        item.type === "message"
-        && item.content.some((part) => part.type === "refusal"),
-    )
+  const refused = hasResponseRefusal(resp)
   let textContent: string | null = null
   const toolCalls: Array<ToolCall> = []
 
@@ -1091,7 +1096,7 @@ export function translateFromResponsesResponse(
         textContent = texts.join("\n\n")
       }
     } else if (item.type === "function_call" && !refused) {
-      parseToolInput(item.arguments, item.name)
+      if (!outputTruncated) parseToolInput(item.arguments, item.name)
       toolCalls.push({
         id: item.call_id,
         type: "function",
@@ -1103,8 +1108,11 @@ export function translateFromResponsesResponse(
     }
   }
 
-  const normalFinishReason = toolCalls.length > 0 ? "tool_calls" : "stop"
-  const finishReason = refused ? "content_filter" : normalFinishReason
+  const finishReason = responseFinishReason(
+    refused,
+    outputTruncated,
+    toolCalls.length > 0,
+  )
 
   return {
     id: resp.id,
@@ -1117,6 +1125,7 @@ export function translateFromResponsesResponse(
         message: {
           role: "assistant",
           content: textContent,
+          ...(refused ? { refusal: textContent } : {}),
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         logprobs: null,
@@ -1132,6 +1141,24 @@ export function translateFromResponsesResponse(
       }),
     },
   }
+}
+
+function hasResponseRefusal(resp: ResponsesResponse): boolean {
+  return resp.output.some(
+    (item) =>
+      item.type === "message"
+      && item.content.some((part) => part.type === "refusal"),
+  )
+}
+
+function responseFinishReason(
+  refused: boolean,
+  outputTruncated: boolean,
+  hasToolCalls: boolean,
+): "content_filter" | "length" | "tool_calls" | "stop" {
+  if (refused) return "content_filter"
+  if (outputTruncated) return "length"
+  return hasToolCalls ? "tool_calls" : "stop"
 }
 
 // ─── Stream translation: Responses API SSE event → Chat Completion SSE chunk ─
@@ -1187,12 +1214,35 @@ export function translateFromResponsesStream(
 ): SSEMessage | Array<SSEMessage> | null {
   const { responseId, model, streamState } = options
   const type = event.type as string
-  if (
-    type === "error"
-    || type === "response.incomplete"
-    || type === "response.failed"
-  )
-    throwResponseError(event)
+  if (type === "error" || type === "response.failed") throwResponseError(event)
+
+  if (type === "response.incomplete") {
+    if (!isMaxOutputTokensIncomplete(event.response)) throwResponseError(event)
+    const response = event.response as Record<string, unknown>
+    const refusal = responseRefusalText(response.output)
+    if (refusal !== undefined) {
+      return handleResponsesRefusal(response, {
+        responseId,
+        model,
+        streamState,
+        refusal,
+      })
+    }
+    if (Array.isArray(response.output)) {
+      for (const [index, item] of response.output.entries()) {
+        handleOutputItemAdded(
+          { type: "response.output_item.done", output_index: index, item },
+          streamState,
+        )
+      }
+    }
+    return handleResponseCompleted(event, {
+      responseId,
+      model,
+      streamState,
+      finishReason: "length",
+    })
+  }
 
   if (type === "response.output_text.delta") {
     streamState.hasTextContent = true
@@ -1256,7 +1306,11 @@ export function translateFromResponsesStream(
         )
       }
     }
-    return handleResponseCompleted(event, { responseId, model, streamState })
+    return handleResponseCompleted(event, {
+      responseId,
+      model,
+      streamState,
+    })
   }
 
   return null
@@ -1268,7 +1322,10 @@ function throwResponseError(event: Record<string, unknown>): never {
     response && typeof response === "object" && !Array.isArray(response) ?
       (response as Record<string, unknown>)
     : event
-  const body = details.error ? { error: details.error } : { error: details }
+  const body =
+    details.error ?
+      { status: details.status, error: details.error }
+    : { error: details }
   const message = extractUpstreamErrorMessage(
     body,
     "Upstream response did not complete.",
@@ -1277,11 +1334,84 @@ function throwResponseError(event: Record<string, unknown>): never {
   throw new HTTPError(message, Response.json(body, { status: 502 }))
 }
 
+function isMaxOutputTokensIncomplete(response: unknown): boolean {
+  if (!response || typeof response !== "object" || Array.isArray(response))
+    return false
+  const record = response as Record<string, unknown>
+  if (
+    record.status !== "incomplete"
+    || (record.error !== undefined && record.error !== null)
+  ) {
+    return false
+  }
+  const details = record.incomplete_details
+  return (
+    details !== null
+    && typeof details === "object"
+    && !Array.isArray(details)
+    && (details as Record<string, unknown>).reason === "max_output_tokens"
+  )
+}
+
+function responseRefusalText(output: unknown): string | undefined {
+  if (!Array.isArray(output)) return undefined
+  for (const item of output) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue
+    const record = item as Record<string, unknown>
+    if (record.type !== "message" || !Array.isArray(record.content)) continue
+    for (const part of record.content) {
+      if (!part || typeof part !== "object" || Array.isArray(part)) continue
+      const content = part as Record<string, unknown>
+      if (content.type === "refusal" && typeof content.refusal === "string")
+        return content.refusal
+    }
+  }
+  return undefined
+}
+
+function handleResponsesRefusal(
+  response: Record<string, unknown>,
+  options: Pick<
+    TranslateStreamOptions,
+    "responseId" | "model" | "streamState"
+  > & { refusal: string },
+): Array<SSEMessage> {
+  const { responseId, model, streamState, refusal } = options
+  const usage = response.usage as Record<string, number> | undefined
+  const chunks: Array<SSEMessage> = []
+  if (refusal) chunks.push(makeTextDeltaChunk(responseId, model, refusal))
+  chunks.push(
+    makeFinishChunk({
+      id: responseId,
+      model,
+      finishReason: "content_filter",
+    }),
+  )
+  if (usage) {
+    chunks.push(
+      makeChunk(responseId, model, {
+        choices: [],
+        usage: {
+          prompt_tokens: usage.input_tokens || usage.prompt_tokens || 0,
+          completion_tokens:
+            usage.output_tokens || usage.completion_tokens || 0,
+          total_tokens: usage.total_tokens || 0,
+        },
+      }),
+    )
+  }
+  streamState.hasToolCalls = false
+  return chunks
+}
+
 function handleResponseCompleted(
   event: Record<string, unknown>,
-  options: Pick<TranslateStreamOptions, "responseId" | "model" | "streamState">,
+  options: Pick<
+    TranslateStreamOptions,
+    "responseId" | "model" | "streamState"
+  > & { finishReason?: "length" },
 ): Array<SSEMessage> {
-  const { responseId, model, streamState } = options
+  const { responseId, model, streamState, finishReason } = options
   const resp = event.response as Record<string, unknown> | undefined
   const usage = resp?.usage as Record<string, number> | undefined
   if (usage) {
@@ -1295,7 +1425,7 @@ function handleResponseCompleted(
   const chunks: Array<SSEMessage> = []
 
   for (const [index, call] of streamState.toolCalls.entries()) {
-    parseToolInput(call.arguments, call.name)
+    if (finishReason !== "length") parseToolInput(call.arguments, call.name)
     chunks.push(
       makeToolCallChunk(responseId, model, {
         index,
@@ -1309,7 +1439,8 @@ function handleResponseCompleted(
     makeFinishChunk({
       id: responseId,
       model,
-      finishReason: streamState.hasToolCalls ? "tool_calls" : "stop",
+      finishReason:
+        finishReason ?? (streamState.hasToolCalls ? "tool_calls" : "stop"),
     }),
   )
 

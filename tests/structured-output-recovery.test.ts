@@ -251,37 +251,45 @@ describe("bounded output-format recovery through Messages", () => {
     expect(configureStructuredOutputRecovery).toThrow("must be")
   })
 
-  test.each([
-    "executable",
-    "mixed",
-    "text",
-    "length",
-    "malformed",
-    "multiple choices",
-  ])("does not regenerate %s output", async (kind) => {
-    const request = payload()
+  test.each(["executable", "mixed", "text", "malformed", "multiple choices"])(
+    "does not regenerate %s output",
+    async (kind) => {
+      const request = payload()
+      const result = completion('{"answer":42}')
+      const choice = result.choices[0]
+      const call = choice.message.tool_calls?.[0]
+      if (!call) throw new Error("Expected tool")
+      if (kind === "executable") {
+        request.tools = [{ name: "Workflow", input_schema: schema }]
+        call.function.name = "Workflow"
+      }
+      if (kind === "mixed") {
+        choice.message.tool_calls?.push({
+          ...call,
+          id: "other_call",
+          function: { name: "Workflow", arguments: "{}" },
+        })
+      }
+      if (kind === "text") choice.message.content = "Some prose"
+      if (kind === "malformed") call.function.arguments = '{"answer":'
+      if (kind === "multiple choices")
+        result.choices.push({ ...choice, index: 1 })
+      queue(result)
+      expect((await send(request)).status).toBe(502)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test("initial length-truncated output bypasses recovery and reports max_tokens", async () => {
     const result = completion('{"answer":42}')
-    const choice = result.choices[0]
-    const call = choice.message.tool_calls?.[0]
-    if (!call) throw new Error("Expected tool")
-    if (kind === "executable") {
-      request.tools = [{ name: "Workflow", input_schema: schema }]
-      call.function.name = "Workflow"
-    }
-    if (kind === "mixed") {
-      choice.message.tool_calls?.push({
-        ...call,
-        id: "other_call",
-        function: { name: "Workflow", arguments: "{}" },
-      })
-    }
-    if (kind === "text") choice.message.content = "Some prose"
-    if (kind === "length") choice.finish_reason = "length"
-    if (kind === "malformed") call.function.arguments = '{"answer":'
-    if (kind === "multiple choices")
-      result.choices.push({ ...choice, index: 1 })
+    result.choices[0].finish_reason = "length"
     queue(result)
-    expect((await send(request)).status).toBe(502)
+
+    const response = await send()
+    expect(response.status).toBe(200)
+    const body = await response.text()
+    expect(body).toContain('"stop_reason":"max_tokens"')
+    expect(body).toContain('"type":"tool_use"')
     expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 

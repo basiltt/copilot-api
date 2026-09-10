@@ -449,8 +449,9 @@ export interface ChatCompletionChunk {
       cached_tokens: number
     }
     completion_tokens_details?: {
-      accepted_prediction_tokens: number
-      rejected_prediction_tokens: number
+      accepted_prediction_tokens?: number
+      rejected_prediction_tokens?: number
+      reasoning_tokens?: number
     }
   }
 }
@@ -495,6 +496,11 @@ export interface ChatCompletionResponse {
     total_tokens: number
     prompt_tokens_details?: {
       cached_tokens: number
+    }
+    completion_tokens_details?: {
+      accepted_prediction_tokens?: number
+      rejected_prediction_tokens?: number
+      reasoning_tokens?: number
     }
   }
 }

@@ -4,6 +4,7 @@ import {
   type AnthropicStreamEventData,
   type AnthropicStreamState,
 } from "./anthropic-types"
+import { OUTPUT_LIMIT_VISIBLE_TEXT } from "./output-limit"
 import { invalidToolInput, parseToolInput } from "./tool-input"
 import { toAnthropicToolIdentity } from "./tool-name-mapping"
 import {
@@ -347,19 +348,32 @@ export function translateChunkToAnthropicEvents(
       state.contentBlockIndex++
     }
 
-    events.push(...emitBufferedToolCalls(state, chunk.model))
+    const toolEvents = emitBufferedToolCalls(
+      state,
+      chunk.model,
+      choice.finish_reason !== "length",
+    )
+    events.push(...toolEvents)
+    const emittedToolUse = toolEvents.some(
+      (event) =>
+        event.type === "content_block_start"
+        && event.content_block.type === "tool_use",
+    )
+    const omittedTruncatedToolCalls =
+      choice.finish_reason === "length" && hasToolCalls && !emittedToolUse
 
     // A reasoning-only or policy-filtered completion is not a usable Claude
     // response.  Once thinking has streamed we cannot transparently retry (a
     // second message_start would violate the Anthropic SSE protocol), so close
     // the same message with explicit, visible text instead of a silent end_turn.
     const isFiltered = choice.finish_reason === "content_filter"
-    if (!state.hasEmittedText && (!hasToolCalls || isFiltered)) {
+    if (
+      omittedTruncatedToolCalls
+      || (!state.hasEmittedText && (!hasToolCalls || isFiltered))
+    ) {
       const fallbackText =
         (state.pendingLeadingText ?? "")
-        + (choice.finish_reason === "content_filter" ?
-          FILTERED_VISIBLE_OUTPUT_TEXT
-        : EMPTY_VISIBLE_OUTPUT_TEXT)
+        + visibleFallbackForFinish(choice.finish_reason)
       state.pendingLeadingText = undefined
       events.push(
         {
@@ -388,20 +402,28 @@ export function translateChunkToAnthropicEvents(
     function emitBufferedToolCalls(
       state: AnthropicStreamState,
       model: string,
+      validateSchema: boolean,
     ): Array<AnthropicStreamEventData> {
       const calls = Object.values(state.toolCalls)
-      for (const call of calls) {
-        if (!call.id || !call.name) {
-          throw invalidToolInput(
-            call.name || "unknown",
-            "missing tool identity",
+      try {
+        for (const call of calls) {
+          if (!call.id || !call.name) {
+            throw invalidToolInput(
+              call.name || "unknown",
+              "missing tool identity",
+            )
+          }
+          parseToolInput(
+            call.accumulatedArgs,
+            call.name,
+            validateSchema ?
+              state.toolNameMap?.inputSchemas?.[call.name]
+            : undefined,
           )
         }
-        parseToolInput(
-          call.accumulatedArgs,
-          call.name,
-          state.toolNameMap?.inputSchemas?.[call.name],
-        )
+      } catch (error) {
+        if (!validateSchema) return []
+        throw error
       }
       const events: Array<AnthropicStreamEventData> = []
       for (const call of calls) {
@@ -455,6 +477,14 @@ export function translateChunkToAnthropicEvents(
         state.contentBlockIndex++
       }
       return events
+    }
+
+    function visibleFallbackForFinish(
+      finishReason: "stop" | "length" | "tool_calls" | "content_filter",
+    ): string {
+      if (finishReason === "content_filter") return FILTERED_VISIBLE_OUTPUT_TEXT
+      if (finishReason === "length") return OUTPUT_LIMIT_VISIBLE_TEXT
+      return EMPTY_VISIBLE_OUTPUT_TEXT
     }
 
     // Some models (notably Gemini) intermittently return a non-tool_calls
@@ -577,10 +607,7 @@ export function isEmptyStreamResponse(chunk: ChatCompletionChunk): boolean {
 }
 
 /**
- * Emits guard events when a tool call is truncated by the output token limit.
- * Closes the open tool block, emits an explanatory text block, and terminates
- * with stop_reason "end_turn" so Claude Code reads the feedback instead of
- * trying to execute a broken tool call.
+ * Converts a streaming failure into an Anthropic error event.
  */
 export function translateErrorToAnthropicErrorEvent(
   message: string = "An unexpected error occurred during streaming.",

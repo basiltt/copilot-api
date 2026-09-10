@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
 import {
   type ChatCompletionResponse,
@@ -32,6 +33,11 @@ import {
   isThinkingRequested,
 } from "./anthropic-types"
 import { clientTools } from "./client-tools"
+import {
+  OUTPUT_LIMIT_VISIBLE_TEXT,
+  selectOutputStopReason,
+  truncatedToolUseBlocks,
+} from "./output-limit"
 import {
   logWriteToolSchemaMismatch,
   parseToolInput,
@@ -884,6 +890,7 @@ function translateAnthropicToolChoiceToOpenAI(
 
 // Response translation
 
+// eslint-disable-next-line complexity
 export function translateToAnthropic(
   response: ChatCompletionResponse,
   toolNameMap?: ToolNameMap,
@@ -891,28 +898,31 @@ export function translateToAnthropic(
   // Merge content from all choices
   const allTextBlocks: Array<AnthropicTextBlock> = []
   const allToolUseBlocks: Array<AnthropicToolUseBlock> = []
+  let omittedTruncatedToolCalls = false
   let stopReason: "stop" | "length" | "tool_calls" | "content_filter" | null =
     null // default
   stopReason = response.choices[0]?.finish_reason ?? stopReason
 
   // Process all choices to extract text and tool use blocks
   for (const choice of response.choices) {
-    const textBlocks = getAnthropicTextBlocks(choice.message.content)
-    const toolUseBlocks = getAnthropicToolUseBlocks(
-      choice.finish_reason === "content_filter" ?
-        undefined
-      : choice.message.tool_calls,
-      toolNameMap,
-      choice.finish_reason,
+    const refused = typeof choice.message.refusal === "string"
+    const textBlocks = getAnthropicTextBlocks(
+      refused ? (choice.message.refusal ?? null) : choice.message.content,
     )
+    const effectiveFinishReason =
+      refused ? "content_filter" : choice.finish_reason
+    const toolUseBlocks = getChoiceToolUseBlocks(choice, toolNameMap, refused)
+    if (
+      effectiveFinishReason === "length"
+      && Boolean(choice.message.tool_calls?.length)
+      && toolUseBlocks.length === 0
+    ) {
+      omittedTruncatedToolCalls = true
+    }
 
     allTextBlocks.push(...textBlocks)
     allToolUseBlocks.push(...toolUseBlocks)
-
-    // Use the finish_reason from the first choice, or prioritize tool_calls
-    if (choice.finish_reason === "tool_calls" || stopReason === "stop") {
-      stopReason = choice.finish_reason
-    }
+    stopReason = selectOutputStopReason(stopReason, effectiveFinishReason)
   }
 
   // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
@@ -949,6 +959,29 @@ export function translateToAnthropic(
           visibleTextBlocks
         : [{ type: "text", text: FILTERED_VISIBLE_OUTPUT_TEXT }],
       stop_reason: "refusal",
+      stop_sequence: null,
+      usage: buildAnthropicUsage(response.usage),
+    }
+  }
+
+  if (correctedStopReason === "length") {
+    const visibleTextBlocks = allTextBlocks.filter(
+      (block) => block.text.trim().length > 0,
+    )
+    const content = [...allTextBlocks, ...allToolUseBlocks]
+    if (
+      omittedTruncatedToolCalls
+      || (visibleTextBlocks.length === 0 && allToolUseBlocks.length === 0)
+    ) {
+      content.push({ type: "text", text: OUTPUT_LIMIT_VISIBLE_TEXT })
+    }
+    return {
+      id: toAnthropicMessageId(response.id),
+      type: "message",
+      role: "assistant",
+      model: response.model,
+      content,
+      stop_reason: "max_tokens",
       stop_sequence: null,
       usage: buildAnthropicUsage(response.usage),
     }
@@ -1044,4 +1077,19 @@ function getAnthropicToolUseBlocks(
       throw error
     }
   })
+}
+
+function getChoiceToolUseBlocks(
+  choice: ChatCompletionResponse["choices"][number],
+  toolNameMap?: ToolNameMap,
+  refused = false,
+): Array<AnthropicToolUseBlock> {
+  if (refused || choice.finish_reason === "content_filter") return []
+  if (choice.finish_reason === "length")
+    return truncatedToolUseBlocks(choice.message.tool_calls, toolNameMap)
+  return getAnthropicToolUseBlocks(
+    choice.message.tool_calls,
+    toolNameMap,
+    choice.finish_reason,
+  )
 }

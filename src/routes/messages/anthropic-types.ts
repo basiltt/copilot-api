@@ -466,6 +466,7 @@ export interface AnthropicStreamState {
     prompt_tokens: number
     completion_tokens: number
     prompt_tokens_details?: { cached_tokens: number }
+    completion_tokens_details?: { reasoning_tokens?: number }
   }
   /**
    * Deferred finish_reason — set when we see `finish_reason` but want to

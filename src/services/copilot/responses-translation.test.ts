@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
+import { HTTPError } from "~/lib/error"
+
 import type { ChatCompletionsPayload } from "./create-chat-completions"
 import type { Model } from "./get-models"
 
@@ -363,6 +365,111 @@ describe("translateFromResponsesResponse", () => {
     const result = translateFromResponsesResponse(responsesReply)
     expect(result.choices[0].finish_reason).toBe("stop")
   })
+
+  test("maps explicit max_output_tokens incompletion to length with partial tool input", () => {
+    const responsesReply = {
+      id: "resp_incomplete",
+      model: "gpt-5.4",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [
+        {
+          type: "function_call" as const,
+          call_id: "call_partial",
+          name: "Write",
+          arguments: '{"file_path":"src/generated.ts"}',
+        },
+      ],
+      usage: { input_tokens: 12, output_tokens: 64, total_tokens: 76 },
+    }
+
+    const result = translateFromResponsesResponse(responsesReply)
+    expect(result.choices[0].finish_reason).toBe("length")
+    expect(result.choices[0].message.tool_calls?.[0]).toEqual({
+      id: "call_partial",
+      type: "function",
+      function: {
+        name: "Write",
+        arguments: '{"file_path":"src/generated.ts"}',
+      },
+    })
+  })
+
+  test("keeps non-output-limit incomplete responses as upstream errors", () => {
+    const responsesReply = {
+      id: "resp_incomplete",
+      model: "gpt-5.4",
+      status: "incomplete",
+      incomplete_details: { reason: "content_filter" },
+      output: [],
+      usage: { input_tokens: 12, output_tokens: 0, total_tokens: 12 },
+    }
+
+    expect(() => translateFromResponsesResponse(responsesReply)).toThrow(
+      "Upstream response did not complete",
+    )
+  })
+
+  test("explicit response errors take priority over max_output_tokens", async () => {
+    const responsesReply = {
+      id: "resp_failed",
+      model: "gpt-5.4",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      error: { code: "policy_denied", message: "Policy denied" },
+      output: [
+        {
+          type: "function_call" as const,
+          call_id: "call_partial",
+          name: "Write",
+          arguments: '{"file_path":"src/generated.ts"}',
+        },
+      ],
+      usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+    }
+
+    try {
+      translateFromResponsesResponse(responsesReply)
+      throw new Error("Expected response error")
+    } catch (error) {
+      expect(error).toBeInstanceOf(HTTPError)
+      const httpError = error as HTTPError
+      expect(httpError.message).toBe("Policy denied")
+      expect(httpError.response.status).toBe(502)
+      expect(await httpError.response.json()).toEqual({
+        status: "incomplete",
+        error: { code: "policy_denied", message: "Policy denied" },
+      })
+    }
+  })
+
+  test("refusal takes priority over max_output_tokens incompletion", () => {
+    const responsesReply = {
+      id: "resp_refusal",
+      model: "gpt-5.4",
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [
+        {
+          type: "message" as const,
+          role: "assistant" as const,
+          content: [{ type: "refusal", refusal: "Declined" }],
+        },
+        {
+          type: "function_call" as const,
+          call_id: "call_partial",
+          name: "Write",
+          arguments: '{"file_path":"src/generated.ts"}',
+        },
+      ],
+      usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+    }
+
+    const result = translateFromResponsesResponse(responsesReply)
+    expect(result.choices[0].finish_reason).toBe("content_filter")
+    expect(result.choices[0].message.refusal).toBe("Declined")
+    expect(result.choices[0].message.tool_calls).toBeUndefined()
+  })
 })
 
 // ─── translateFromResponsesStream ─────────────────────────────────────────
@@ -450,6 +557,86 @@ describe("translateFromResponsesStream", () => {
       choices: Array<{ delta: Record<string, unknown>; finish_reason: string }>
     }
     expect(parsed.choices[0].finish_reason).toBe("tool_calls")
+  })
+
+  test("response.incomplete max_output_tokens emits partial tool args with length", () => {
+    const state = createResponsesStreamState()
+    const event = {
+      type: "response.incomplete",
+      response: {
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        output: [
+          {
+            type: "function_call",
+            call_id: "call_partial",
+            name: "Write",
+            arguments: '{"file_path":"src/generated.ts"}',
+          },
+        ],
+        usage: { input_tokens: 12, output_tokens: 64, total_tokens: 76 },
+      },
+    }
+
+    const chunks = translateFromResponsesStream(event, {
+      responseId: "resp_incomplete",
+      model: "gpt-5.4",
+      streamState: state,
+    })
+    expect(Array.isArray(chunks)).toBe(true)
+    const parsed = (chunks as Array<{ data: string }>).map(
+      (chunk) =>
+        JSON.parse(chunk.data) as {
+          choices: Array<{
+            delta: {
+              tool_calls?: Array<{
+                function: { arguments: string }
+              }>
+            }
+            finish_reason: string | null
+          }>
+        },
+    )
+    expect(parsed[0].choices[0].delta.tool_calls?.[0].function.arguments).toBe(
+      '{"file_path":"src/generated.ts"}',
+    )
+    expect(parsed[1].choices[0].finish_reason).toBe("length")
+  })
+
+  test("response.incomplete refusal takes priority over partial tools", () => {
+    const state = createResponsesStreamState()
+    const event = {
+      type: "response.incomplete",
+      response: {
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "refusal", refusal: "Declined" }],
+          },
+          {
+            type: "function_call",
+            call_id: "call_partial",
+            name: "Write",
+            arguments: '{"file_path":"src/generated.ts"}',
+          },
+        ],
+        usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+      },
+    }
+
+    const chunks = translateFromResponsesStream(event, {
+      responseId: "resp_refusal",
+      model: "gpt-5.4",
+      streamState: state,
+    }) as Array<{ data: string }>
+    const serialized = chunks.map((chunk) => chunk.data).join("\n")
+    expect(serialized).toContain("Declined")
+    expect(serialized).toContain('"finish_reason":"content_filter"')
+    expect(serialized).not.toContain("tool_calls")
+    expect(serialized).not.toContain('"finish_reason":"length"')
   })
 
   test("response.output_text.done returns null (finish emitted on response.completed)", () => {

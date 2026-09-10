@@ -14,11 +14,7 @@ import {
   isTypedTool,
 } from "./anthropic-types"
 import { translateToAnthropic } from "./non-stream-translation"
-import {
-  invalidToolInput,
-  parseToolInput,
-  ToolSchemaMismatchError,
-} from "./tool-input"
+import { parseToolInput, ToolSchemaMismatchError } from "./tool-input"
 import {
   createToolNameMapFromAnthropicPayload,
   type ToolNameMap,
@@ -256,7 +252,6 @@ export async function translateWithOutputRecovery(
 ): Promise<AnthropicResponse> {
   const { map, signal } = options
   signal.throwIfAborted()
-  const name = toOpenAIToolName("StructuredOutput", map)
   if (
     response.choices.some(
       (choice) =>
@@ -278,20 +273,6 @@ export async function translateWithOutputRecovery(
         })),
       },
       map,
-    )
-  }
-  if (
-    response.choices.some(
-      (choice) =>
-        choice.finish_reason === "length"
-        && choice.message.tool_calls?.some(
-          (call) => call.function.name === name,
-        ),
-    )
-  ) {
-    throw invalidToolInput(
-      name,
-      "generation was truncated; regeneration is not permitted",
     )
   }
   try {

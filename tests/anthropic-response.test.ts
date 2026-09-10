@@ -370,6 +370,24 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
   // depends on correctedStopReason === "length"); it must NOT be masked as
   // tool_use by the coercion.
   test("tool calls with finish_reason length are not masked as tool_use", () => {
+    const toolNameMap = createToolNameMapFromAnthropicPayload({
+      model: "claude-sonnet-4",
+      max_tokens: 2048,
+      messages: [{ role: "user", content: "Write a file" }],
+      tools: [
+        {
+          name: "Write",
+          input_schema: {
+            type: "object",
+            properties: {
+              file_path: { type: "string" },
+              content: { type: "string" },
+            },
+            required: ["file_path", "content"],
+          },
+        },
+      ],
+    })
     const openAIResponse: ChatCompletionResponse = {
       id: "chatcmpl-tool-length",
       object: "chat.completion",
@@ -386,9 +404,8 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
                 id: "call_y",
                 type: "function",
                 function: {
-                  name: "get_current_weather",
-                  // Complete JSON → not truncated → passes through as a tool call
-                  arguments: '{"location":"Boston, MA"}',
+                  name: "Write",
+                  arguments: '{"file_path":"src/generated.ts"}',
                 },
               },
             ],
@@ -400,8 +417,134 @@ describe("OpenAI to Anthropic Non-Streaming Response Translation", () => {
       usage: { prompt_tokens: 30, completion_tokens: 2048, total_tokens: 2078 },
     }
 
-    const anthropicResponse = translateToAnthropic(openAIResponse)
+    const anthropicResponse = translateToAnthropic(openAIResponse, toolNameMap)
     expect(anthropicResponse.stop_reason).toBe("max_tokens")
+    expect(anthropicResponse.content).toEqual([
+      {
+        type: "tool_use",
+        id: "call_y",
+        name: "Write",
+        input: { file_path: "src/generated.ts" },
+      },
+    ])
+  })
+
+  test("malformed length-truncated tool input is omitted behind a max_tokens notice", () => {
+    const response: ChatCompletionResponse = {
+      id: "chatcmpl-malformed-length",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_z",
+                type: "function",
+                function: {
+                  name: "Write",
+                  arguments: '{"file_path":"src/generated.ts"',
+                },
+              },
+            ],
+          },
+          finish_reason: "length",
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 30, completion_tokens: 2048, total_tokens: 2078 },
+    }
+
+    const anthropicResponse = translateToAnthropic(response)
+    expect(anthropicResponse.stop_reason).toBe("max_tokens")
+    expect(anthropicResponse.content).toHaveLength(1)
+    expect(anthropicResponse.content[0]?.type).toBe("text")
+    expect(JSON.stringify(anthropicResponse.content)).not.toContain("tool_use")
+  })
+
+  test("malformed truncated tool input preserves prose and appends the notice", () => {
+    const response: ChatCompletionResponse = {
+      id: "chatcmpl-malformed-length-prose",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "I started the requested work.",
+            tool_calls: [
+              {
+                id: "call_z",
+                type: "function",
+                function: {
+                  name: "Write",
+                  arguments: '{"file_path":"src/generated.ts"',
+                },
+              },
+            ],
+          },
+          finish_reason: "length",
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 30, completion_tokens: 2048, total_tokens: 2078 },
+    }
+
+    const anthropicResponse = translateToAnthropic(response)
+    expect(anthropicResponse.stop_reason).toBe("max_tokens")
+    expect(anthropicResponse.content).toHaveLength(2)
+    expect(anthropicResponse.content[0]).toEqual({
+      type: "text",
+      text: "I started the requested work.",
+    })
+    const notice = anthropicResponse.content[1]
+    expect(notice.type).toBe("text")
+    if (notice.type === "text")
+      expect(notice.text).toContain("output token limit")
+  })
+
+  test("refusal takes priority over length-truncated tool input", () => {
+    const response: ChatCompletionResponse = {
+      id: "chatcmpl-refusal-length",
+      object: "chat.completion",
+      created: 1677652288,
+      model: "claude-sonnet-4",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            refusal: "Declined",
+            tool_calls: [
+              {
+                id: "call_filtered",
+                type: "function",
+                function: {
+                  name: "Write",
+                  arguments: '{"file_path":"src/generated.ts"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "length",
+          logprobs: null,
+        },
+      ],
+      usage: { prompt_tokens: 30, completion_tokens: 2, total_tokens: 32 },
+    }
+
+    const anthropicResponse = translateToAnthropic(response)
+    expect(anthropicResponse.stop_reason).toBe("refusal")
+    expect(anthropicResponse.content).toEqual([
+      { type: "text", text: "Declined" },
+    ])
   })
 
   test("whitespace-only content with finish_reason stop is treated as empty", () => {
@@ -1527,6 +1670,68 @@ describe("Streaming filtered-response safeguards", () => {
 
     expect(fallbackIndex).toBeGreaterThanOrEqual(0)
     expect(refusalIndex).toBeGreaterThan(fallbackIndex)
+  })
+
+  describe("Streaming output-limit safeguards", () => {
+    test("malformed truncated tool input preserves prose and appends notice", () => {
+      const state = freshStreamState()
+      const translated = [
+        ...translateChunkToAnthropicEvents(
+          {
+            id: "truncated-tool-prose",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "claude-sonnet-4",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  content: "I started the requested work.",
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_partial",
+                      type: "function",
+                      function: {
+                        name: "Write",
+                        arguments: '{"file_path":"src/generated.ts"',
+                      },
+                    },
+                  ],
+                },
+                finish_reason: null,
+                logprobs: null,
+              },
+            ],
+          },
+          state,
+        ),
+        ...translateChunkToAnthropicEvents(
+          {
+            id: "truncated-tool-prose",
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "claude-sonnet-4",
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: "length",
+                logprobs: null,
+              },
+            ],
+          },
+          state,
+        ),
+        ...flushDeferredFinish(state),
+      ]
+      const serialized = JSON.stringify(translated)
+
+      expect(serialized).toContain("I started the requested work.")
+      expect(serialized).toContain("output token limit")
+      expect(serialized).not.toContain('"type":"tool_use"')
+      expect(serialized).toContain('"stop_reason":"max_tokens"')
+    })
   })
 
   test("content_filter terminates a partial tool call as an error", () => {

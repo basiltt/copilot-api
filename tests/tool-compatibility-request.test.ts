@@ -746,8 +746,8 @@ describe("tool compatibility through Messages HTTP route", () => {
     }
   })
 
-  test.each(["", "{}", '{"script":'])(
-    "streaming malformed args %s never commits an executable tool",
+  test.each(["", '{"script":'])(
+    "streaming malformed length args %s emit max_tokens without a tool",
     async (args) => {
       mockUpstream(
         chatStream([
@@ -766,11 +766,36 @@ describe("tool compatibility through Messages HTTP route", () => {
         ]),
       )
       const text = await (await send(request(true))).text()
-      expect(text).toContain("event: error")
+      expect(text).not.toContain("event: error")
       expect(text).not.toContain('"type":"tool_use"')
-      expect(text).not.toContain("event: message_stop")
+      expect(text).toContain('"stop_reason":"max_tokens"')
+      expect(text).toContain("event: message_stop")
     },
   )
+
+  test("streaming schema-incomplete JSON object remains a max_tokens partial tool", async () => {
+    mockUpstream(
+      chatStream([
+        {
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_0",
+                function: { name: "Workflow", arguments: "{}" },
+              },
+            ],
+          },
+        },
+        { finish_reason: "length" },
+      ]),
+    )
+    const text = await (await send(request(true))).text()
+    expect(text).not.toContain("event: error")
+    expect(text).toContain('"type":"tool_use"')
+    expect(text).toContain('"partial_json":"{}"')
+    expect(text).toContain('"stop_reason":"max_tokens"')
+  })
 
   test("premature EOF does not commit even syntactically complete tool arguments", async () => {
     mockUpstream(

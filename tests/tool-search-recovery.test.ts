@@ -765,7 +765,6 @@ describe("bounded ToolSearch argument recovery", () => {
     "disabled",
     "typed hosted tool",
     "malformed",
-    "length",
     "mixed calls",
     "acknowledged call",
   ])("does not regenerate ineligible %s output", async (kind) => {
@@ -785,7 +784,6 @@ describe("bounded ToolSearch argument recovery", () => {
       if (!call) throw new Error("Expected ToolSearch call")
       call.function.arguments = "{"
     }
-    if (kind === "length") result.choices[0].finish_reason = "length"
     if (kind === "mixed calls") {
       result.choices[0].message.tool_calls?.push({
         id: "other_call",
@@ -822,6 +820,19 @@ describe("bounded ToolSearch argument recovery", () => {
     const response = await send(request)
     expect(response.status).toBe(kind === "typed hosted tool" ? 400 : 502)
     expect(fetchSpy).toHaveBeenCalledTimes(kind === "typed hosted tool" ? 0 : 1)
+  })
+
+  test("length-truncated ToolSearch bypasses recovery and reports max_tokens", async () => {
+    const result = completion("{}")
+    result.choices[0].finish_reason = "length"
+    queue(result)
+
+    const response = await send()
+    expect(response.status).toBe(200)
+    const body = await response.text()
+    expect(body).toContain('"stop_reason":"max_tokens"')
+    expect(body).toContain('"type":"tool_use"')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 
   test("refusal and upstream policy errors never regenerate or emit tools", async () => {

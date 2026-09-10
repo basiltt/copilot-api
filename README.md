@@ -612,6 +612,26 @@ mitigation for the standard missing-`content` case, not a guarantee to repair
 every `Write` failure or evidence about a historical payload whose exact
 arguments were not retained.
 
+### Tool calls stopped by the output limit
+
+An upstream `finish_reason: "length"` is returned as Anthropic
+`stop_reason: "max_tokens"`, including when generation stopped partway through
+a tool call. This is a successful truncation signal, not a server error or an
+eligible `Write`, `ToolSearch`, or `StructuredOutput` recovery. When the partial
+arguments are already a JSON object, the response preserves the original tool
+ID, name, and partial input without validating it as a completed executable
+call. Anthropic clients can recognize the final incomplete `tool_use` block
+together with `max_tokens`, raise `max_tokens` within the model's advertised
+output limit, and retry; the proxy does not retry, increase the caller's budget,
+or execute the tool. If the partial arguments cannot be represented as a JSON
+object, the tool block is omitted and a fixed output-limit notice is returned
+with `max_tokens` instead of fabricating arguments.
+
+The model's context-window size is not its per-turn output limit. Large writes
+may still need to be split across smaller tool calls even when the conversation
+fits within the context window. See Anthropic's
+[max-token stop-reason guidance](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#max-tokens).
+
 ### Optional ToolSearch argument recovery
 
 `TOOL_SEARCH_RECOVERY=1` enables one model-only argument regeneration for a

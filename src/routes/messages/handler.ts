@@ -569,6 +569,8 @@ async function handleNonStreaming(
     )
   }
 
+  logTruncatedToolOutput(anthropicPayload, result.response)
+
   if (
     !hasLogicalToolSearch(anthropicPayload)
     && !hasLogicalWriteTool(anthropicPayload)
@@ -1102,6 +1104,8 @@ async function fetchNonStreamingAnthropicResponse(
     throw new Error("Unexpected streaming response.")
   }
 
+  logTruncatedToolOutput(anthropicPayload, result.response)
+
   if (!outputRecovery) {
     consola.debug(
       "Non-streaming response from Copilot:",
@@ -1405,6 +1409,7 @@ async function handleStreaming(
       thinkingEnabled,
       imageTokenOverhead,
       toolNameMap,
+      requestPayload: anthropicPayload,
     })
 
     // When the model returns an empty response (reasoning completed but no
@@ -1459,6 +1464,69 @@ function clampMaxTokens(
     )
     payload.max_tokens = modelMaxOutput
   }
+}
+
+type CompletionUsage = {
+  completion_tokens: number
+  completion_tokens_details?: { reasoning_tokens?: number }
+}
+
+function outputBudget(payload: AnthropicMessagesPayload): {
+  requestedMaxTokens: number | null
+  effectiveMaxTokens: number | null
+  modelMaxOutputTokens: number | null
+} {
+  const model =
+    state.models?.data.find((candidate) => candidate.id === payload.model)
+    ?? knownModelMetadata(payload.model)
+  const requestedMaxTokens = finiteNumber(payload.max_tokens)
+  const modelMaxOutputTokens = finiteNumber(
+    model ? getModelMaxOutput(model) : undefined,
+  )
+  let effectiveMaxTokens = requestedMaxTokens
+  if (requestedMaxTokens !== null && modelMaxOutputTokens !== null) {
+    effectiveMaxTokens = Math.min(requestedMaxTokens, modelMaxOutputTokens)
+  }
+  return {
+    requestedMaxTokens,
+    effectiveMaxTokens,
+    modelMaxOutputTokens,
+  }
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+function logTruncatedToolOutput(
+  payload: AnthropicMessagesPayload,
+  response: ChatCompletionResponse,
+): void {
+  const truncatedToolCallCount = response.choices.reduce(
+    (count, choice) =>
+      choice.finish_reason === "length" ?
+        count + (choice.message.tool_calls?.length ?? 0)
+      : count,
+    0,
+  )
+  if (truncatedToolCallCount === 0) return
+  logTruncatedToolOutputDetails(payload, truncatedToolCallCount, response.usage)
+}
+
+function logTruncatedToolOutputDetails(
+  payload: AnthropicMessagesPayload,
+  toolCallCount: number,
+  usage: CompletionUsage | undefined,
+): void {
+  consola.warn("Upstream tool output reached token limit", {
+    finishReason: "length",
+    toolCallCount,
+    ...outputBudget(payload),
+    completionTokens: finiteNumber(usage?.completion_tokens),
+    reasoningTokens: finiteNumber(
+      usage?.completion_tokens_details?.reasoning_tokens,
+    ),
+  })
 }
 
 async function fetchCopilotResponse(
@@ -1557,6 +1625,7 @@ async function retryEmptyResponse(
       thinkingEnabled: ctx.thinkingEnabled,
       imageTokenOverhead: ctx.imageTokenOverhead,
       toolNameMap: ctx.toolNameMap,
+      requestPayload: anthropicPayload,
     })
     if (retryHadContent) return
   }
@@ -1635,7 +1704,7 @@ function createAnthropicStreamState(
   }
 }
 
-// eslint-disable-next-line complexity
+// eslint-disable-next-line complexity, max-lines-per-function
 async function pipeStreamToClient(
   stream: SSEStreamingApi,
   response: AsyncGenerator<ServerSentEventMessage, void, unknown>,
@@ -1643,16 +1712,26 @@ async function pipeStreamToClient(
     thinkingEnabled: boolean
     imageTokenOverhead?: number
     toolNameMap?: ToolNameMap
+    requestPayload: AnthropicMessagesPayload
   },
 ): Promise<boolean> {
-  const { thinkingEnabled, imageTokenOverhead = 0, toolNameMap } = options
+  const {
+    thinkingEnabled,
+    imageTokenOverhead = 0,
+    toolNameMap,
+    requestPayload,
+  } = options
   const streamState = createAnthropicStreamState(thinkingEnabled, toolNameMap)
+  const logPayloads =
+    !hasLogicalToolSearch(requestPayload)
+    && !hasLogicalWriteTool(requestPayload)
 
   // Keep pinging for the full lifetime of the upstream stream. A single ping
   // does not protect waits longer than a reverse proxy's idle timeout.
   const stopKeepalive = startSSEKeepalive(stream)
   let upstreamStarted = false
   let upstreamTimedOut = false
+  let truncatedToolCallCount = 0
 
   try {
     // Instead of `for await (const rawEvent of response)` which blocks
@@ -1673,7 +1752,8 @@ async function pipeStreamToClient(
       }
       if (rawEvent === undefined) break
 
-      consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
+      if (logPayloads)
+        consola.debug("Copilot raw stream event:", JSON.stringify(rawEvent))
       if (rawEvent.data === "[DONE]") break
       if (!rawEvent.data) continue
 
@@ -1694,13 +1774,17 @@ async function pipeStreamToClient(
       }
 
       const events = translateChunkToAnthropicEvents(chunk, streamState)
+      if (chunk.choices[0]?.finish_reason === "length") {
+        truncatedToolCallCount = Object.keys(streamState.toolCalls).length
+      }
 
       for (const event of events) {
         // Inflate input_tokens to account for images stripped before sending.
         if (imageTokenOverhead > 0) {
           inflateEventInputTokens(event, imageTokenOverhead)
         }
-        consola.debug("Translated Anthropic event:", JSON.stringify(event))
+        if (logPayloads)
+          consola.debug("Translated Anthropic event:", JSON.stringify(event))
         await stream.writeSSE({
           event: event.type,
           data: JSON.stringify(event),
@@ -1725,6 +1809,14 @@ async function pipeStreamToClient(
     // the deferred finish with whatever usage we have (possibly 0).
     if (streamState.deferredFinishReason !== undefined) {
       await emitDeferredFinish(stream, streamState, imageTokenOverhead)
+    }
+
+    if (truncatedToolCallCount > 0) {
+      logTruncatedToolOutputDetails(
+        requestPayload,
+        truncatedToolCallCount,
+        streamState.lastSeenUsage,
+      )
     }
 
     await handleIncompleteStream(stream, streamState)

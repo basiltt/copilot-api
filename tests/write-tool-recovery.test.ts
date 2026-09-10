@@ -291,10 +291,8 @@ describe("bounded Write missing-content recovery", () => {
     "unknown extra",
     "mixed calls",
     "assistant prose",
-    "length",
     "malformed",
     "acknowledged ID",
-    // eslint-disable-next-line complexity -- One table keeps all no-recovery gates on the same request fixture.
   ])("does not correct ineligible %s output", async (kind) => {
     let request = payload()
     const result = completion('{"file_path":"src/generated.ts"}')
@@ -344,7 +342,6 @@ describe("bounded Write missing-content recovery", () => {
       })
     if (kind === "assistant prose")
       result.choices[0].message.content = "I will write the file."
-    if (kind === "length") result.choices[0].finish_reason = "length"
     if (kind === "malformed") call.function.arguments = '{"file_path":'
     if (kind === "acknowledged ID") {
       request.messages = [
@@ -376,6 +373,178 @@ describe("bounded Write missing-content recovery", () => {
     const response = await send(request)
     expect(response.status).toBe(502)
     expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test("length-truncated Write preserves partial input and reports max_tokens without recovery", async () => {
+    const privatePath = "src/generated.ts"
+    queue(
+      completion(JSON.stringify({ file_path: privatePath }), {
+        content: "I started preparing the file.",
+        finishReason: "length",
+      }),
+    )
+
+    const response = await send()
+    expect(response.status).toBe(200)
+    const result = (await response.json()) as {
+      stop_reason: string
+      content: Array<{ type: string; text?: string }>
+    }
+    expect(result).toMatchObject({
+      stop_reason: "max_tokens",
+      usage: {
+        input_tokens: 17,
+        output_tokens: 5,
+        cache_read_input_tokens: 3,
+      },
+      content: [
+        { type: "text", text: "I started preparing the file." },
+        {
+          type: "tool_use",
+          id: "original_call",
+          name: "Write",
+          input: { file_path: privatePath },
+        },
+      ],
+    })
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain("Upstream tool output reached token limit")
+    expect(captured).toContain('"finishReason":"length"')
+    expect(captured).toContain('"requestedMaxTokens":256')
+    expect(captured).toContain('"effectiveMaxTokens":256')
+    expect(captured).toContain('"completionTokens":5')
+    expect(captured).not.toContain(privatePath)
+  })
+
+  test("client can retry a max_tokens partial Write before executing the valid completion", async () => {
+    const filePath = "src/generated.ts"
+    const fullInput = {
+      file_path: filePath,
+      content: "export const ready = true\n",
+    }
+    queue(
+      completion(JSON.stringify({ file_path: filePath }), {
+        finishReason: "length",
+      }),
+      completion(JSON.stringify(fullInput)),
+    )
+
+    const firstRequest = payload()
+    firstRequest.max_tokens = 64
+    const firstResponse = await send(firstRequest)
+    const first = (await firstResponse.json()) as {
+      stop_reason: string
+      content: Array<{
+        type: string
+        id?: string
+        name?: string
+        input?: Record<string, unknown>
+      }>
+    }
+    let executions = 0
+    if (first.stop_reason === "tool_use") executions++
+
+    expect(firstResponse.status).toBe(200)
+    expect(first.stop_reason).toBe("max_tokens")
+    expect(first.content.at(-1)).toEqual({
+      type: "tool_use",
+      id: "original_call",
+      name: "Write",
+      input: { file_path: filePath },
+    })
+    expect(executions).toBe(0)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+
+    const retryRequest = payload()
+    retryRequest.max_tokens = 1024
+    const retryResponse = await send(retryRequest)
+    const retry = (await retryResponse.json()) as {
+      stop_reason: string
+      content: Array<{ type: string; input?: Record<string, unknown> }>
+    }
+    if (retry.stop_reason === "tool_use") {
+      const tool = retry.content.find((block) => block.type === "tool_use")
+      if (tool?.input?.file_path === filePath && tool.input.content)
+        executions++
+    }
+
+    expect(retryResponse.status).toBe(200)
+    expect(retry.stop_reason).toBe("tool_use")
+    expect(retry.content.at(-1)?.input).toEqual(fullInput)
+    expect(executions).toBe(1)
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(bodies.map((body) => body.max_tokens)).toEqual([64, 1024])
+  })
+
+  test("even schema-valid Write input remains incomplete when finish reason is length", async () => {
+    queue(
+      completion(
+        '{"file_path":"src/generated.ts","content":"export const ready = true"}',
+        { finishReason: "length" },
+      ),
+    )
+
+    const response = await send()
+    const body = await response.text()
+    expect(response.status).toBe(200)
+    expect(body).toContain('"stop_reason":"max_tokens"')
+    expect(body).toContain('"type":"tool_use"')
+    expect(body).not.toContain('"stop_reason":"tool_use"')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test("malformed length-truncated Write emits a fixed max_tokens notice", async () => {
+    queue(
+      completion('{"file_path":"src/generated.ts"', {
+        finishReason: "length",
+      }),
+    )
+
+    const response = await send()
+    expect(response.status).toBe(200)
+    const result = (await response.json()) as {
+      stop_reason: string
+      content: Array<{ type: string; text?: string }>
+    }
+    expect(result.stop_reason).toBe("max_tokens")
+    expect(result.content).toHaveLength(1)
+    expect(result.content[0]).toMatchObject({ type: "text" })
+    expect(result.content[0].text).toContain("output token limit")
+    expect(JSON.stringify(result.content)).not.toContain('"type":"tool_use"')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test("truncation telemetry turns missing and nonnumeric values into null", async () => {
+    const result = completion('{"file_path":"src/generated.ts"}', {
+      finishReason: "length",
+    })
+    result.usage = {
+      ...(result.usage ?? {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      }),
+      completion_tokens: "PRIVATE_TOKEN_VALUE" as unknown as number,
+      completion_tokens_details: {
+        reasoning_tokens: "PRIVATE_REASONING_VALUE" as unknown as number,
+      },
+    }
+    queue(result)
+    const request = { ...payload() } as Partial<AnthropicMessagesPayload>
+    delete request.max_tokens
+
+    const response = await send(request as AnthropicMessagesPayload)
+    expect(response.status).toBe(200)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"requestedMaxTokens":null')
+    expect(captured).toContain('"effectiveMaxTokens":null')
+    expect(captured).toContain('"completionTokens":null')
+    expect(captured).toContain('"reasoningTokens":null')
+    expect(captured).not.toContain("PRIVATE_TOKEN_VALUE")
+    expect(captured).not.toContain("PRIVATE_REASONING_VALUE")
+    expect(captured).not.toContain("NaN")
   })
 
   test("initial refusal and policy failure do not enter correction", async () => {
@@ -561,6 +730,92 @@ describe("bounded Write missing-content recovery", () => {
     expect(output).toContain('"type":"error"')
     expect(output).not.toContain('"type":"tool_use"')
     expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test("streaming length-truncated Write preserves partial input and terminates with max_tokens", async () => {
+    const request = payload(true)
+    const chunks = [
+      {
+        id: "stream_length",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "claude-fable-5.1",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content: "I started preparing the file.",
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "stream_call",
+                  type: "function",
+                  function: {
+                    name: "Write",
+                    arguments: '{"file_path":"src/generated.ts"}',
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "stream_length",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "claude-fable-5.1",
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: "length",
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "stream_length",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "claude-fable-5.1",
+        choices: [],
+        usage: {
+          prompt_tokens: 20,
+          completion_tokens: 256,
+          total_tokens: 276,
+          completion_tokens_details: { reasoning_tokens: 4 },
+        },
+      },
+    ]
+    const raw =
+      chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")
+      + "data: [DONE]\n\n"
+    queue(
+      new Response(raw, {
+        headers: { "content-type": "text/event-stream" },
+      }),
+    )
+
+    const response = await send(request)
+    const output = await response.text()
+    expect(response.status).toBe(200)
+    expect(output).not.toContain('"type":"error"')
+    expect(output).toContain('"type":"tool_use"')
+    expect(output).toContain('"id":"stream_call"')
+    expect(output).toContain(
+      String.raw`"partial_json":"{\"file_path\":\"src/generated.ts\"}"`,
+    )
+    expect(output).toContain('"stop_reason":"max_tokens"')
+    expect(output).not.toContain('"stop_reason":"end_turn"')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"completionTokens":256')
+    expect(captured).toContain('"reasoningTokens":4')
+    expect(captured).not.toContain("src/generated.ts")
   })
 
   test("StructuredOutput buffering cannot enable Write recovery for an original stream", async () => {
