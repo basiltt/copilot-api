@@ -31,9 +31,60 @@ interface MutableChoice {
   tools: Map<number, MutableToolCall>
 }
 
-function invalidStream(message: string): HTTPError {
+export type ChatCompletionStreamFailureReason =
+  | "ambiguous_tool_name"
+  | "changed_response_identity"
+  | "changed_system_fingerprint"
+  | "changed_tool_call_identity"
+  | "changed_tool_name"
+  | "data_after_terminal"
+  | "incomplete_response"
+  | "incomplete_tool_identity"
+  | "invalid_assistant_role"
+  | "invalid_choice"
+  | "invalid_choice_delta"
+  | "invalid_choices"
+  | "invalid_chunk_object"
+  | "invalid_completion_usage"
+  | "invalid_delta"
+  | "invalid_finish_reason"
+  | "invalid_integer"
+  | "invalid_prompt_usage"
+  | "invalid_reasoning_delta"
+  | "invalid_response_created"
+  | "invalid_response_id"
+  | "invalid_response_model"
+  | "invalid_tool_call"
+  | "invalid_tool_call_deltas"
+  | "invalid_tool_function"
+  | "invalid_usage"
+  | "malformed_json"
+  | "missing_done"
+  | "missing_terminal_choice"
+  | "non_object_event"
+  | "unsupported_tool_call_type"
+  | "wire_limit"
+
+export class ChatCompletionStreamProtocolError extends HTTPError {
+  readonly reason: ChatCompletionStreamFailureReason
+
+  constructor(
+    reason: ChatCompletionStreamFailureReason,
+    message: string,
+    response: Response,
+  ) {
+    super(message, response)
+    this.reason = reason
+  }
+}
+
+function invalidStream(
+  message: string,
+  reason: ChatCompletionStreamFailureReason,
+): HTTPError {
   const publicMessage = `Upstream streamed completion ${message}.`
-  return new HTTPError(
+  return new ChatCompletionStreamProtocolError(
+    reason,
     "Invalid Copilot streamed completion",
     Response.json(
       {
@@ -69,7 +120,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function nonnegativeInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0)
-    throw invalidStream(`contained an invalid ${label}`)
+    throw invalidStream(`contained an invalid ${label}`, "invalid_integer")
   return value as number
 }
 
@@ -85,7 +136,8 @@ function optionalTokenCount(
 function parseUsage(
   value: unknown,
 ): NonNullable<ChatCompletionResponse["usage"]> {
-  if (!isRecord(value)) throw invalidStream("contained invalid usage metadata")
+  if (!isRecord(value))
+    throw invalidStream("contained invalid usage metadata", "invalid_usage")
   const promptTokens = nonnegativeInteger(
     value.prompt_tokens,
     "prompt token count",
@@ -106,7 +158,10 @@ function parseUsage(
     && value.prompt_tokens_details !== null
   ) {
     if (!isRecord(value.prompt_tokens_details))
-      throw invalidStream("contained invalid prompt usage details")
+      throw invalidStream(
+        "contained invalid prompt usage details",
+        "invalid_prompt_usage",
+      )
     const cachedTokens = optionalTokenCount(
       value.prompt_tokens_details,
       "cached_tokens",
@@ -131,7 +186,10 @@ function parseUsage(
     && value.completion_tokens_details !== null
   ) {
     if (!isRecord(value.completion_tokens_details))
-      throw invalidStream("contained invalid completion usage details")
+      throw invalidStream(
+        "contained invalid completion usage details",
+        "invalid_completion_usage",
+      )
     const acceptedPredictionTokens = optionalTokenCount(
       value.completion_tokens_details,
       "accepted_prediction_tokens",
@@ -180,7 +238,7 @@ function appendOptionalString(
   const value = delta[key]
   if (value === undefined || value === null) return
   if (typeof value !== "string")
-    throw invalidStream(`contained an invalid ${key} delta`)
+    throw invalidStream(`contained an invalid ${key} delta`, "invalid_delta")
   append(value)
 }
 
@@ -190,17 +248,26 @@ function collectToolCalls(
 ): void {
   if (value === undefined || value === null) return
   if (!Array.isArray(value))
-    throw invalidStream("contained invalid tool-call deltas")
+    throw invalidStream(
+      "contained invalid tool-call deltas",
+      "invalid_tool_call_deltas",
+    )
   for (const entry of value) {
     if (!isRecord(entry))
-      throw invalidStream("contained an invalid tool-call delta")
+      throw invalidStream(
+        "contained an invalid tool-call delta",
+        "invalid_tool_call",
+      )
     const index = nonnegativeInteger(entry.index, "tool-call index")
     if (
       entry.type !== undefined
       && entry.type !== null
       && entry.type !== "function"
     )
-      throw invalidStream("contained an unsupported tool-call type")
+      throw invalidStream(
+        "contained an unsupported tool-call type",
+        "unsupported_tool_call_type",
+      )
     const tool = tools.get(index) ?? {
       idFragments: [],
       nameFragments: [],
@@ -211,7 +278,10 @@ function collectToolCalls(
     })
     if (entry.function !== undefined && entry.function !== null) {
       if (!isRecord(entry.function))
-        throw invalidStream("contained an invalid tool function delta")
+        throw invalidStream(
+          "contained an invalid tool function delta",
+          "invalid_tool_function",
+        )
       appendOptionalString(entry.function, "name", (fragment) => {
         tool.nameFragments.push(fragment)
       })
@@ -232,17 +302,24 @@ function finishReason(value: unknown): FinishReason | undefined {
     || value === "content_filter"
   )
     return value
-  throw invalidStream("contained an invalid finish reason")
+  throw invalidStream(
+    "contained an invalid finish reason",
+    "invalid_finish_reason",
+  )
 }
 
 function collectChoice(
   value: unknown,
   choices: Map<number, MutableChoice>,
 ): void {
-  if (!isRecord(value)) throw invalidStream("contained an invalid choice")
+  if (!isRecord(value))
+    throw invalidStream("contained an invalid choice", "invalid_choice")
   const index = nonnegativeInteger(value.index, "choice index")
   if (!isRecord(value.delta))
-    throw invalidStream("contained an invalid choice delta")
+    throw invalidStream(
+      "contained an invalid choice delta",
+      "invalid_choice_delta",
+    )
   const choice: MutableChoice = choices.get(index) ?? {
     content: "",
     reasoningContent: "",
@@ -253,13 +330,19 @@ function collectChoice(
     tools: new Map<number, MutableToolCall>(),
   }
   if (choice.finishReason !== undefined)
-    throw invalidStream("contained data after a terminal choice")
+    throw invalidStream(
+      "contained data after a terminal choice",
+      "data_after_terminal",
+    )
   if (
     value.delta.role !== undefined
     && value.delta.role !== null
     && value.delta.role !== "assistant"
   )
-    throw invalidStream("contained an invalid assistant role")
+    throw invalidStream(
+      "contained an invalid assistant role",
+      "invalid_assistant_role",
+    )
   appendOptionalString(value.delta, "content", (fragment) => {
     choice.sawContent = true
     choice.content += fragment
@@ -267,7 +350,10 @@ function collectChoice(
   const reasoning = value.delta.reasoning_content ?? value.delta.reasoning_text
   if (reasoning !== undefined && reasoning !== null) {
     if (typeof reasoning !== "string")
-      throw invalidStream("contained an invalid reasoning delta")
+      throw invalidStream(
+        "contained an invalid reasoning delta",
+        "invalid_reasoning_delta",
+      )
     choice.sawReasoning = true
     choice.reasoningContent += reasoning
   }
@@ -286,7 +372,10 @@ function resolveToolId(fragments: Array<string>): string | undefined {
   if (values.length === 0) return undefined
   const id = values[0]
   if (values.some((value) => value !== id))
-    throw invalidStream("changed a tool-call identity")
+    throw invalidStream(
+      "changed a tool-call identity",
+      "changed_tool_call_identity",
+    )
   return id
 }
 
@@ -325,9 +414,12 @@ function resolveToolName(
     )
     if (candidates.length === 1) return candidates[0].candidate
     if (candidates.length > 1)
-      throw invalidStream("contained an ambiguous tool name")
+      throw invalidStream(
+        "contained an ambiguous tool name",
+        "ambiguous_tool_name",
+      )
     if (reachable.some(({ positions }) => positions.size > 0)) return undefined
-    throw invalidStream("changed a tool name")
+    throw invalidStream("changed a tool name", "changed_tool_name")
   }
   let name = ""
   for (const fragment of values) {
@@ -356,7 +448,10 @@ function finalizedToolCalls(
         omitted++
         continue
       }
-      throw invalidStream("ended with incomplete tool identity")
+      throw invalidStream(
+        "ended with incomplete tool identity",
+        "incomplete_tool_identity",
+      )
     }
     result.push({
       id,
@@ -402,29 +497,48 @@ export async function collectChatCompletionStream(
       try {
         chunk = JSON.parse(event.data) as unknown
       } catch {
-        throw invalidStream("contained malformed JSON")
+        throw invalidStream("contained malformed JSON", "malformed_json")
       }
-      if (!isRecord(chunk)) throw invalidStream("contained a non-object event")
+      if (!isRecord(chunk))
+        throw invalidStream("contained a non-object event", "non_object_event")
       if ("error" in chunk && chunk.error) throw streamedError(chunk.error)
       if (
         chunk.object !== undefined
         && chunk.object !== "chat.completion.chunk"
       )
-        throw invalidStream("contained an invalid chunk object")
+        throw invalidStream(
+          "contained an invalid chunk object",
+          "invalid_chunk_object",
+        )
       if (typeof chunk.id !== "string" || !chunk.id)
-        throw invalidStream("contained an invalid response id")
+        throw invalidStream(
+          "contained an invalid response id",
+          "invalid_response_id",
+        )
       if (typeof chunk.model !== "string" || !chunk.model)
-        throw invalidStream("contained an invalid response model")
+        throw invalidStream(
+          "contained an invalid response model",
+          "invalid_response_model",
+        )
       if (typeof chunk.created !== "number" || !Number.isFinite(chunk.created))
-        throw invalidStream("contained an invalid response created timestamp")
+        throw invalidStream(
+          "contained an invalid response created timestamp",
+          "invalid_response_created",
+        )
       if (!Array.isArray(chunk.choices))
-        throw invalidStream("contained an invalid choices envelope")
+        throw invalidStream(
+          "contained an invalid choices envelope",
+          "invalid_choices",
+        )
       if (
         (id !== undefined && id !== chunk.id)
         || (model !== undefined && model !== chunk.model)
         || (created !== undefined && created !== chunk.created)
       )
-        throw invalidStream("changed response identity")
+        throw invalidStream(
+          "changed response identity",
+          "changed_response_identity",
+        )
       id = chunk.id
       model = chunk.model
       created = chunk.created
@@ -437,7 +551,10 @@ export async function collectChatCompletionStream(
           || (systemFingerprint !== undefined
             && systemFingerprint !== chunk.system_fingerprint)
         )
-          throw invalidStream("changed the system fingerprint")
+          throw invalidStream(
+            "changed the system fingerprint",
+            "changed_system_fingerprint",
+          )
         systemFingerprint = chunk.system_fingerprint
       }
       if (chunk.usage !== undefined && chunk.usage !== null)
@@ -446,14 +563,18 @@ export async function collectChatCompletionStream(
     }
   } catch (error) {
     if (error instanceof UpstreamEventStreamLimitError)
-      throw invalidStream("exceeded the buffered wire limit")
+      throw invalidStream("exceeded the buffered wire limit", "wire_limit")
     throw error
   }
 
   signal.throwIfAborted()
-  if (!done) throw invalidStream("ended before the [DONE] marker")
+  if (!done)
+    throw invalidStream("ended before the [DONE] marker", "missing_done")
   if (!id || !model || created === undefined || choices.size === 0)
-    throw invalidStream("ended without a complete response")
+    throw invalidStream(
+      "ended without a complete response",
+      "incomplete_response",
+    )
 
   return {
     id,
@@ -464,7 +585,10 @@ export async function collectChatCompletionStream(
       .sort(([left], [right]) => left - right)
       .map(([index, choice]) => {
         if (choice.finishReason === undefined)
-          throw invalidStream("ended before a terminal choice")
+          throw invalidStream(
+            "ended before a terminal choice",
+            "missing_terminal_choice",
+          )
         const finalized = finalizedToolCalls(choice, options.allowedToolNames)
         const message: ChatCompletionResponse["choices"][number]["message"] = {
           role: "assistant",

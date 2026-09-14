@@ -23,6 +23,7 @@ import {
   throwIfRequestAborted,
 } from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
+import { ChatCompletionStreamProtocolError } from "~/services/copilot/collect-chat-completion-stream"
 import {
   createChatCompletions,
   createOneShotCompletion,
@@ -2321,54 +2322,23 @@ function transportFailureReason(error: Error): string {
   return "failure"
 }
 
-function bufferedFailureMetadata(
-  error: unknown,
-  publicMessage: string,
-): {
+function bufferedFailureMetadata(error: unknown): {
   kind: "protocol" | "transport" | "upstream_http" | "unexpected"
   reason: string
   logicalStatus: number | null
 } {
   if (error instanceof HTTPError) {
     const logicalStatus = error.response.status
-    if (error.message === "Invalid Copilot streamed completion") {
-      const reasons = new Map([
-        [
-          "Upstream streamed completion contained an invalid chunk object.",
-          "invalid_chunk_object",
-        ],
-        [
-          "Upstream streamed completion contained an invalid response id.",
-          "invalid_response_id",
-        ],
-        [
-          "Upstream streamed completion contained an invalid response model.",
-          "invalid_response_model",
-        ],
-        [
-          "Upstream streamed completion contained an invalid response created timestamp.",
-          "invalid_response_created",
-        ],
-        [
-          "Upstream streamed completion contained an invalid choices envelope.",
-          "invalid_choices",
-        ],
-        [
-          "Upstream streamed completion contained malformed JSON.",
-          "malformed_json",
-        ],
-        [
-          "Upstream streamed completion exceeded the buffered wire limit.",
-          "wire_limit",
-        ],
-        [
-          "Upstream streamed completion ended before the [DONE] marker.",
-          "missing_done",
-        ],
-      ])
+    if (error instanceof ChatCompletionStreamProtocolError)
       return {
         kind: "protocol",
-        reason: reasons.get(publicMessage) ?? "invalid_stream",
+        reason: error.reason,
+        logicalStatus,
+      }
+    if (error.message === "Invalid Copilot streamed completion") {
+      return {
+        kind: "protocol",
+        reason: "invalid_stream",
         logicalStatus,
       }
     }
@@ -2410,7 +2380,7 @@ async function emitStreamingError(
   if (options.warnBufferedFailure)
     consola.warn(
       "Buffered Anthropic stream failed",
-      bufferedFailureMetadata(error, errorMessage),
+      bufferedFailureMetadata(error),
     )
 
   const contextWindowError = isContextWindowError(errorMessage)
