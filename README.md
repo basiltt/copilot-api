@@ -651,8 +651,11 @@ proxy does not forge or discard provider thinking signatures.
 When an output-limit warning follows this pre-request fallback, diagnostics
 include only a bounded, fixed-enum set of native rejection reasons. They never
 include prompts, tool names, schemas, signatures, arguments, file paths, or
-other request values. These reasons identify compatibility gates; they do not
-prove that switching transports would change the provider's output capacity.
+other request values. Unsupported message roles are classified only as fixed
+categories (`system`, `developer`, `tool`, absent, non-object, or other), never
+by logging the supplied role. These reasons identify compatibility gates; they
+do not prove that switching transports would change the provider's output
+capacity.
 
 The upstream native request uses SSE. The proxy buffers it under a bounded
 wire limit, validates the completed message and tool inputs, and stops reading

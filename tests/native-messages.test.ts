@@ -544,7 +544,7 @@ describe("native Messages routing and body", () => {
       "output_format",
       "effort_unsupported",
       "system_block_unsupported",
-      "message_role_unsupported",
+      "message_role_system",
       "user_block_unsupported",
       "tool_result_content_missing",
       "tool_result_content_unsupported",
@@ -557,6 +557,36 @@ describe("native Messages routing and body", () => {
     ])
     expect(JSON.stringify(reasons)).not.toContain(privateSentinel)
     expect(nativeMessagesCompatibility(unsafe, ["/v1/messages"])).toBe(
+      "request_unsupported",
+    )
+  })
+
+  test("classifies unsupported message roles without retaining their values", () => {
+    const privateRole = "private-role-never-log"
+    const request = {
+      ...payload(),
+      messages: [
+        null,
+        { content: "missing role" },
+        { role: "system", content: "system instruction" },
+        { role: "developer", content: "developer instruction" },
+        { role: "tool", content: "tool result" },
+        { role: privateRole, content: "unknown role" },
+        { role: 42, content: "invalid role" },
+      ],
+    } as unknown as AnthropicMessagesPayload
+
+    const reasons = nativeMessagesRejectionReasons(request)
+    expect(reasons).toEqual([
+      "message_nonobject",
+      "message_role_absent",
+      "message_role_system",
+      "message_role_developer",
+      "message_role_tool",
+      "message_role_other",
+    ])
+    expect(JSON.stringify(reasons)).not.toContain(privateRole)
+    expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
       "request_unsupported",
     )
   })
@@ -652,6 +682,31 @@ describe("native Messages routing and body", () => {
     expect(captured).toContain('"nativeRouting":"request_unsupported"')
     expect(captured).toContain('"nativeRejectionReasons":["typed_tools"]')
     expect(captured).not.toContain(privatePath)
+  })
+
+  test("system-role fallback preserves order and reports only its fixed subtype", async () => {
+    const privateInstruction = "private-system-instruction"
+    const request = payload()
+    request.messages = [
+      { role: "user", content: "Before." },
+      { role: "system", content: privateInstruction },
+      { role: "user", content: "After." },
+    ]
+    queue(truncatedWriteCompletion("private/role-fixture.ts"))
+
+    const response = await send(request)
+    expect(response.status).toBe(200)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(bodies[0].messages).toEqual([
+      { role: "user", content: "Before." },
+      { role: "system", content: privateInstruction },
+      { role: "user", content: "After." },
+    ])
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain(
+      '"nativeRejectionReasons":["message_role_system"]',
+    )
+    expect(captured).not.toContain(privateInstruction)
   })
 
   test("uses refined Workflow schema and rejects unrepresentable history", () => {

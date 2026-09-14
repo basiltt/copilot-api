@@ -130,6 +130,17 @@ function unsupportedBlockReason(
     : "assistant_block_unsupported"
 }
 
+function unsupportedMessageRoleReason(
+  candidate: Record<string, unknown>,
+): NativeMessagesRejectionReason {
+  if (!Object.hasOwn(candidate, "role") || candidate.role === undefined)
+    return "message_role_absent"
+  if (candidate.role === "system") return "message_role_system"
+  if (candidate.role === "developer") return "message_role_developer"
+  if (candidate.role === "tool") return "message_role_tool"
+  return "message_role_other"
+}
+
 function addKnownNativeBlockRejections(
   candidate: Record<string, unknown>,
   reasons: Set<NativeMessagesRejectionReason>,
@@ -200,14 +211,14 @@ function nativeMessageContentRejections(
   }
   for (const candidateMessage of payload.messages as Array<unknown>) {
     if (!isRecord(candidateMessage)) {
-      reasons.add("message_role_unsupported")
+      reasons.add("message_nonobject")
       continue
     }
     if (
       candidateMessage.role !== "user"
       && candidateMessage.role !== "assistant"
     ) {
-      reasons.add("message_role_unsupported")
+      reasons.add(unsupportedMessageRoleReason(candidateMessage))
       continue
     }
     if (typeof candidateMessage.content === "string") continue
