@@ -290,28 +290,23 @@ function resolveToolId(fragments: Array<string>): string | undefined {
   return id
 }
 
-function matchesToolNameSequence(
+function reachableToolNamePositions(
   fragments: Array<string>,
   candidate: string,
-): boolean {
-  let assembled = ""
+): ReadonlySet<number> {
+  let positions = new Set([0])
   for (const fragment of fragments) {
-    if (fragment === candidate) {
-      assembled = candidate
-      continue
+    const next = new Set<number>()
+    for (const position of positions) {
+      if (candidate.startsWith(fragment, position))
+        next.add(position + fragment.length)
+      if (fragment.length >= position && candidate.startsWith(fragment))
+        next.add(fragment.length)
     }
-    if (assembled === candidate) return false
-    if (candidate.startsWith(assembled + fragment)) {
-      assembled += fragment
-      continue
-    }
-    if (fragment.startsWith(assembled) && candidate.startsWith(fragment)) {
-      assembled = fragment
-      continue
-    }
-    return false
+    positions = next
+    if (positions.size === 0) break
   }
-  return assembled === candidate
+  return positions
 }
 
 function resolveToolName(
@@ -321,12 +316,17 @@ function resolveToolName(
   const values = fragments.filter(Boolean)
   if (values.length === 0) return undefined
   if (allowedToolNames) {
-    const candidates = [...allowedToolNames].filter((candidate) =>
-      matchesToolNameSequence(values, candidate),
+    const reachable = [...allowedToolNames].map((candidate) => ({
+      candidate,
+      positions: reachableToolNamePositions(values, candidate),
+    }))
+    const candidates = reachable.filter(({ candidate, positions }) =>
+      positions.has(candidate.length),
     )
-    if (candidates.length === 1) return candidates[0]
+    if (candidates.length === 1) return candidates[0].candidate
     if (candidates.length > 1)
       throw invalidStream("contained an ambiguous tool name")
+    if (reachable.some(({ positions }) => positions.size > 0)) return undefined
     throw invalidStream("changed a tool name")
   }
   let name = ""

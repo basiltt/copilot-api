@@ -399,6 +399,28 @@ describe("bounded output-format recovery through Messages", () => {
     expect(captured).toContain('"toolCallCount":1')
   })
 
+  test("streamed truncation with prose and partial declared name keeps omission notice", async () => {
+    const truncated = completion('{"answer":"partial"')
+    truncated.choices[0].finish_reason = "length"
+    truncated.choices[0].message.content = "Partial explanation."
+    const call = truncated.choices[0].message.tool_calls?.[0]
+    if (!call) throw new Error("Expected tool")
+    call.function.name = "StructuredOut"
+    queue(chatCompletionSSE(truncated))
+
+    const response = await send(payload(true))
+    const output = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(output).toContain("Partial explanation.")
+    expect(output).toContain(OUTPUT_LIMIT_VISIBLE_TEXT)
+    expect(output).not.toContain('"type":"tool_use"')
+    expect(output).not.toContain("StructuredOut")
+    expect(output).not.toContain('{"answer"')
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"toolCallCount":1')
+  })
+
   test("recovery is disabled by default, with explicit startup parsing", async () => {
     delete process.env.STRUCTURED_OUTPUT_RECOVERY
     configureStructuredOutputRecovery()

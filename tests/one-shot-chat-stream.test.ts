@@ -506,6 +506,88 @@ describe("one-shot Chat SSE collection", () => {
     expect(error).toBeInstanceOf(HTTPError)
   })
 
+  test("rejects ambiguity across cumulative and delta name interpretations", async () => {
+    const error = await rejected(
+      collectChatCompletionStream(
+        response([
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "opaque-id",
+                    function: { name: "A", arguments: "{" },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ]),
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: { name: "A", arguments: "" },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ]),
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: { name: "AA", arguments: "}" },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ]),
+        ]),
+        new AbortController().signal,
+        { allowedToolNames: new Set(["AAA", "AAAA"]) },
+      ),
+    )
+    expect(error).toBeInstanceOf(HTTPError)
+  })
+
+  test("rejects a partially received declared name after completed output", async () => {
+    const error = await rejected(
+      collectChatCompletionStream(
+        response([
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_x",
+                    function: { name: "Wri", arguments: "{}" },
+                  },
+                ],
+              },
+              finish_reason: "stop",
+            },
+          ]),
+        ]),
+        new AbortController().signal,
+        { allowedToolNames: new Set(["Write"]) },
+      ),
+    )
+    expect(error).toBeInstanceOf(HTTPError)
+  })
+
   test("does not hide identity conflicts behind length truncation", async () => {
     const error = await rejected(
       collectChatCompletionStream(
