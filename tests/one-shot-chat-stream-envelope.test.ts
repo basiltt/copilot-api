@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test"
 
 import { HTTPError } from "~/lib/error"
-import { collectChatCompletionStream } from "~/services/copilot/collect-chat-completion-stream"
+import {
+  ChatCompletionStreamProtocolError,
+  collectChatCompletionStream,
+} from "~/services/copilot/collect-chat-completion-stream"
 
 function event(data: unknown): string {
   return `data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`
@@ -124,4 +127,23 @@ describe("one-shot Chat SSE envelopes", () => {
       expect(await error.response.clone().text()).toContain(current.message)
     }
   })
+
+  for (const [key, value, reason] of [
+    ["id", "PRIVATE_ID_VALUE", "changed_response_id"],
+    ["model", "PRIVATE_MODEL_VALUE", "changed_response_model"],
+    ["created", 43, "changed_response_created"],
+  ] as const) {
+    test(`classifies changed response ${key} without exposing its value`, async () => {
+      const error = await rejected(
+        collectChatCompletionStream(
+          response([chunk([]), { ...chunk([]), [key]: value }]),
+          new AbortController().signal,
+        ),
+      )
+
+      expect(error).toBeInstanceOf(ChatCompletionStreamProtocolError)
+      expect((error as ChatCompletionStreamProtocolError).reason).toBe(reason)
+      expect(await error.response.clone().text()).not.toContain(String(value))
+    })
+  }
 })

@@ -33,7 +33,9 @@ interface MutableChoice {
 
 export type ChatCompletionStreamFailureReason =
   | "ambiguous_tool_name"
-  | "changed_response_identity"
+  | "changed_response_created"
+  | "changed_response_id"
+  | "changed_response_model"
   | "changed_system_fingerprint"
   | "changed_tool_call_identity"
   | "changed_tool_name"
@@ -530,14 +532,17 @@ export async function collectChatCompletionStream(
           "contained an invalid choices envelope",
           "invalid_choices",
         )
-      if (
-        (id !== undefined && id !== chunk.id)
-        || (model !== undefined && model !== chunk.model)
-        || (created !== undefined && created !== chunk.created)
-      )
+      if (id !== undefined && id !== chunk.id)
+        throw invalidStream("changed response identity", "changed_response_id")
+      if (model !== undefined && model !== chunk.model)
         throw invalidStream(
           "changed response identity",
-          "changed_response_identity",
+          "changed_response_model",
+        )
+      if (created !== undefined && created !== chunk.created)
+        throw invalidStream(
+          "changed response identity",
+          "changed_response_created",
         )
       id = chunk.id
       model = chunk.model
