@@ -22,6 +22,8 @@ import {
 } from "~/routes/messages/tool-search-recovery"
 import { configureToolSearchRecovery } from "~/start"
 
+import { chatCompletionSSE } from "./helpers/chat-completion-sse"
+
 const app = new Hono().route("/v1/messages", messageRoutes)
 const originalState = { ...state }
 const originalEnv = process.env.TOOL_SEARCH_RECOVERY
@@ -32,7 +34,7 @@ let timerSpy:
   | undefined
 let logs: Array<ReturnType<typeof spyOn<typeof consola, "debug">>> = []
 let bodies: Array<ChatCompletionsPayload> = []
-let replies: Array<() => Response> = []
+let replies: Array<(stream: boolean) => Response> = []
 
 const schema = {
   type: "object",
@@ -132,10 +134,11 @@ function repaired(raw: string): ChatCompletionResponse {
 }
 
 function queue(...responses: Array<ChatCompletionResponse | Response>) {
-  replies = responses.map(
-    (response) => () =>
-      response instanceof Response ? response : Response.json(response),
-  )
+  replies = responses.map((response) => {
+    if (response instanceof Response) return () => response
+    return (stream) =>
+      stream ? chatCompletionSSE(response) : Response.json(response)
+  })
 }
 
 function send(body = payload(), signal?: AbortSignal) {
@@ -169,6 +172,7 @@ beforeEach(() => {
   const model = knownModelMetadata("claude-fable-5.1")
   if (!model) throw new Error("Expected model")
   model.supported_endpoints = ["/chat/completions"]
+  model.capabilities.supports.streaming = true
   state.models = { object: "list", data: [model] }
   logs = (["debug", "warn", "error", "info"] as const).map((method) =>
     spyOn(consola, method).mockImplementation(
@@ -180,10 +184,11 @@ beforeEach(() => {
       (_url: string | URL | Request, init?: RequestInit) => {
         if (typeof init?.body !== "string")
           throw new Error("Expected JSON request body")
-        bodies.push(JSON.parse(init.body) as ChatCompletionsPayload)
+        const body = JSON.parse(init.body) as ChatCompletionsPayload
+        bodies.push(body)
         const next = replies.shift()
         if (!next) throw new Error("Unexpected extra upstream request")
-        return Promise.resolve(next())
+        return Promise.resolve(next(body.stream === true))
       },
       { preconnect: globalThis.fetch.preconnect },
     ),
@@ -564,7 +569,7 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(output).toContain('"name":"ToolSearch"')
     expect(output).toContain(String.raw`\"query\":\"select:WebFetch\"`)
     expect(fetchSpy).toHaveBeenCalledTimes(2)
-    expect(bodies.every((body) => body.stream === false)).toBe(true)
+    expect(bodies.every((body) => body.stream === true)).toBe(true)
   })
 
   test.each([
@@ -609,7 +614,7 @@ describe("bounded ToolSearch argument recovery", () => {
       expect(bodies[1].tools?.map((tool) => tool.function.name)).toEqual([
         "ToolSearch",
       ])
-      expect(bodies.every((body) => body.stream === false)).toBe(true)
+      expect(bodies.every((body) => body.stream === stream)).toBe(true)
     },
   )
 
@@ -656,6 +661,8 @@ describe("bounded ToolSearch argument recovery", () => {
     expect(output).toContain('"type":"error"')
     expect(output).not.toContain('"type":"tool_use"')
     expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(bodies[0].stream).toBe(true)
+    expect(bodies[0].stream_options).toEqual({ include_usage: true })
   })
 
   test("mixed actual server-search and ToolSearch calls remain strict", async () => {

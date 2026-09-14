@@ -11,6 +11,7 @@ import {
   responseEvents,
 } from "~/lib/upstream-lifecycle"
 
+import { collectChatCompletionStream } from "./collect-chat-completion-stream"
 import {
   translateToResponsesPayload,
   translateFromResponsesResponse,
@@ -499,14 +500,34 @@ function describeOneShotRequest(
   })
 }
 
+function declaredToolNames(body: { tools?: unknown }): ReadonlySet<string> {
+  const names = new Set<string>()
+  if (!Array.isArray(body.tools)) return names
+  for (const tool of body.tools as Array<unknown>) {
+    if (
+      tool
+      && typeof tool === "object"
+      && "function" in tool
+      && tool.function
+      && typeof tool.function === "object"
+      && "name" in tool.function
+      && typeof tool.function.name === "string"
+    )
+      names.add(tool.function.name)
+  }
+  return names
+}
+
 interface OneShotCompletionOptions {
   usesResponses: boolean
   signal: AbortSignal
+  streamUpstream?: boolean
   nativeRejectionReasons?: Array<NativeMessagesRejectionReason>
   nativeRouting?: FinalUpstreamRequestShape["nativeRouting"]
 }
 
-/** One non-streaming request, including body consumption, with no hidden retries. */
+/** One bounded request, including body consumption, with no hidden retries. */
+// eslint-disable-next-line max-lines-per-function, complexity -- JSON and SSE one-shot bodies share one request and metadata boundary.
 export async function createOneShotCompletion(
   payload: ChatCompletionsPayload,
   options: OneShotCompletionOptions,
@@ -514,17 +535,24 @@ export async function createOneShotCompletion(
   const {
     usesResponses,
     signal,
+    streamUpstream = false,
     nativeRejectionReasons,
     nativeRouting = "not_applicable",
   } = options
   const downstream = requestSignal()
   const combined = downstream ? AbortSignal.any([signal, downstream]) : signal
   combined.throwIfAborted()
-  const nonStreaming = { ...payload, stream: false, stream_options: undefined }
+  if (usesResponses && streamUpstream)
+    throw new Error("Streamed one-shot completion requires Chat Completions")
+  const oneShotPayload = {
+    ...payload,
+    stream: streamUpstream,
+    stream_options: streamUpstream ? { include_usage: true } : undefined,
+  }
   const body =
     usesResponses ?
-      translateToResponsesPayload(nonStreaming)
-    : buildChatRequestBody(nonStreaming)
+      translateToResponsesPayload(oneShotPayload)
+    : buildChatRequestBody(oneShotPayload)
   const requestShape = describeOneShotRequest(body as Record<string, unknown>, {
     usesResponses,
     nativeRouting,
@@ -541,6 +569,15 @@ export async function createOneShotCompletion(
       timeout: false,
     },
   )
+  if (streamUpstream) {
+    if (!response.ok) throw new HTTPError("Copilot completion failed", response)
+    return attachFinalUpstreamRequestShape(
+      await collectChatCompletionStream(response, combined, {
+        allowedToolNames: declaredToolNames(body),
+      }),
+      requestShape,
+    )
+  }
   const text = await readResponseBody(response, combined)
   if (!response.ok) {
     throw new HTTPError(
@@ -619,7 +656,7 @@ export interface ChatCompletionChunk {
     completion_tokens: number
     total_tokens: number
     prompt_tokens_details?: {
-      cached_tokens: number
+      cached_tokens?: number
       cache_creation_tokens?: number
     }
     completion_tokens_details?: {
@@ -669,7 +706,7 @@ export interface ChatCompletionResponse {
     completion_tokens: number
     total_tokens: number
     prompt_tokens_details?: {
-      cached_tokens: number
+      cached_tokens?: number
       cache_creation_tokens?: number
     }
     completion_tokens_details?: {
@@ -684,6 +721,8 @@ interface ResponseMessage {
   role: "assistant"
   content: string | null
   refusal?: string | null
+  reasoning_content?: string | null
+  reasoning_text?: string | null
   tool_calls?: Array<ToolCall>
 }
 

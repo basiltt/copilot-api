@@ -41,6 +41,38 @@ function completionResponse(): Response {
   })
 }
 
+function completionStreamResponse(): Response {
+  const envelope = {
+    id: "chat_wire",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "claude-sonnet-5",
+  }
+  const chunks = [
+    {
+      ...envelope,
+      choices: [
+        {
+          index: 0,
+          delta: { role: "assistant", content: "done" },
+          finish_reason: "stop",
+          logprobs: null,
+        },
+      ],
+    },
+    {
+      ...envelope,
+      choices: [],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ]
+  return new Response(
+    chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")
+      + "data: [DONE]\n\n",
+    { headers: { "content-type": "text/event-stream" } },
+  )
+}
+
 beforeEach(() => {
   Object.assign(state, {
     accountType: "individual",
@@ -57,11 +89,7 @@ beforeEach(() => {
       bodies.push(JSON.parse(init.body) as Record<string, unknown>)
       const request = bodies.at(-1)
       if (request?.stream === true) {
-        return Promise.resolve(
-          new Response("data: [DONE]\n\n", {
-            headers: { "content-type": "text/event-stream" },
-          }),
-        )
+        return Promise.resolve(completionStreamResponse())
       }
       return Promise.resolve(completionResponse())
     },
@@ -134,6 +162,29 @@ describe("Sonnet output budget final wire shape", () => {
       tokenField: "max_tokens",
       tokenValue: 64_000,
       stream: false,
+      oneShot: true,
+      nativeRouting: "not_applicable",
+    })
+  })
+
+  test("streamed one-shot preserves the budget and aggregates one SSE request", async () => {
+    const response = await createOneShotCompletion(payload(false), {
+      usesResponses: false,
+      signal: new AbortController().signal,
+      streamUpstream: true,
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(urls[0]).toEndWith("/chat/completions")
+    expectSonnetChatWire(bodies[0], true)
+    expect(bodies[0].stream_options).toEqual({ include_usage: true })
+    expect(response.choices[0].message.content).toBe("done")
+    expect(response.usage?.completion_tokens).toBe(1)
+    expect(getFinalUpstreamRequestShape(response)).toEqual({
+      endpoint: "chat_completions",
+      tokenField: "max_tokens",
+      tokenValue: 64_000,
+      stream: true,
       oneShot: true,
       nativeRouting: "not_applicable",
     })

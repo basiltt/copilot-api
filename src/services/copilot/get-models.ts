@@ -28,6 +28,7 @@ interface ModelLimits {
 interface ModelSupports {
   tool_calls?: boolean
   parallel_tool_calls?: boolean
+  streaming?: boolean
   dimensions?: boolean
   reasoning_effort?: Array<string>
 }

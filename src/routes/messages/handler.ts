@@ -428,7 +428,11 @@ async function handleServerSearch(
 ) {
   const disconnect = new AbortController()
   const signal = AbortSignal.any([c.req.raw.signal, disconnect.signal])
-  const recovery = outputRecoveryOptions(payload, signal)
+  const recovery = outputRecoveryOptions(
+    payload,
+    signal,
+    payload.stream === true,
+  )
   const run = () =>
     runServerWebSearch(payload, limit, (request) =>
       fetchNonStreamingAnthropicResponse(
@@ -468,10 +472,15 @@ async function handleServerSearch(
   }
 }
 
-const completeOutputTool: OutputCompletion = async (request, requestSignal) => {
+async function completeOutputTool(
+  request: AnthropicMessagesPayload,
+  requestSignal: AbortSignal,
+  streamUpstream: boolean,
+): Promise<ChatCompletionResponse> {
   const response = await fetchCopilotResponse(
     { ...request, stream: false },
     requestSignal,
+    streamUpstream,
   )
   if (!isNonStreaming(response))
     throw new Error("Expected buffered output response")
@@ -481,7 +490,11 @@ const completeOutputTool: OutputCompletion = async (request, requestSignal) => {
 async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
   const disconnect = new AbortController()
   const signal = AbortSignal.any([c.req.raw.signal, disconnect.signal])
-  const recovery = outputRecoveryOptions(payload, signal)
+  const recovery = outputRecoveryOptions(
+    payload,
+    signal,
+    payload.stream === true,
+  )
   if (!recovery) throw new Error("Expected enabled output recovery")
   const run = () =>
     fetchNonStreamingAnthropicResponse(
@@ -1055,10 +1068,12 @@ interface NonStreamingRecoveryOptions {
 function outputRecoveryOptions(
   payload: AnthropicMessagesPayload,
   signal: AbortSignal,
+  streamUpstream = false,
 ): NonStreamingRecoveryOptions | undefined {
   const options = {
     signal,
-    complete: completeOutputTool,
+    complete: (request: AnthropicMessagesPayload, requestSignal: AbortSignal) =>
+      completeOutputTool(request, requestSignal, streamUpstream),
     structuredOutputAllowed: usesStructuredOutputRecovery(payload),
     toolSearchAllowed: usesToolSearchRecovery(payload),
     writeAllowed: usesWriteToolRecovery(payload),
@@ -1485,17 +1500,21 @@ function clampMaxTokens(
 
 type CompletionUsage = {
   completion_tokens: number
+  prompt_tokens: number
+  prompt_tokens_details?: { cached_tokens?: number }
   completion_tokens_details?: { reasoning_tokens?: number }
 }
 
 function outputBudget(payload: AnthropicMessagesPayload): {
+  catalogMaxContextTokens: number | null
   requestedMaxTokens: number | null
   effectiveMaxTokens: number | null
   modelMaxOutputTokens: number | null
 } {
-  const model =
-    state.models?.data.find((candidate) => candidate.id === payload.model)
-    ?? knownModelMetadata(payload.model)
+  const catalogModel = state.models?.data.find(
+    (candidate) => candidate.id === payload.model,
+  )
+  const model = catalogModel ?? knownModelMetadata(payload.model)
   const requestedMaxTokens = finiteNumber(payload.max_tokens)
   const modelMaxOutputTokens = finiteNumber(
     model ? getModelMaxOutput(model) : undefined,
@@ -1505,6 +1524,9 @@ function outputBudget(payload: AnthropicMessagesPayload): {
     effectiveMaxTokens = Math.min(requestedMaxTokens, modelMaxOutputTokens)
   }
   return {
+    catalogMaxContextTokens: finiteNumber(
+      catalogModel?.capabilities.limits.max_context_window_tokens,
+    ),
     requestedMaxTokens,
     effectiveMaxTokens,
     modelMaxOutputTokens,
@@ -1583,6 +1605,10 @@ function logTruncatedToolOutputDetails(
     clientStream: details.clientStream,
     catalogEndpointSupport: catalogEndpointSupport(payload.model),
     finalRequest: details.requestShape ?? null,
+    promptTokens: finiteNumber(details.usage?.prompt_tokens),
+    cachedPromptTokens: finiteNumber(
+      details.usage?.prompt_tokens_details?.cached_tokens,
+    ),
     completionTokens: finiteNumber(details.usage?.completion_tokens),
     reasoningTokens: finiteNumber(
       details.usage?.completion_tokens_details?.reasoning_tokens,
@@ -1608,9 +1634,24 @@ function fetchNativeMessagesResponse(
   ) as ReturnType<typeof createChatCompletions>
 }
 
+function canStreamOneShotChat(
+  selectedModel: Model | undefined,
+  usesResponses: boolean,
+  requested: boolean,
+): boolean {
+  return (
+    requested
+    && !usesResponses
+    && selectedModel?.vendor.toLowerCase() === "anthropic"
+    && selectedModel.capabilities.supports.streaming === true
+    && selectedModel.supported_endpoints?.includes("/chat/completions") === true
+  )
+}
+
 async function fetchCopilotResponse(
   anthropicPayload: AnthropicMessagesPayload,
   outputSignal?: AbortSignal,
+  streamOneShotUpstream = false,
 ): ReturnType<typeof createChatCompletions> {
   throwIfRequestAborted()
   const selectedModel = state.models?.data.find(
@@ -1651,10 +1692,16 @@ async function fetchCopilotResponse(
     selectedModel ? getModelMaxOutput(selectedModel) : undefined,
   )
   if (outputSignal) {
+    const usesResponses =
+      selectedModel !== undefined && requiresResponsesApi(selectedModel)
     return createOneShotCompletion(openAIPayload, {
-      usesResponses:
-        selectedModel !== undefined && requiresResponsesApi(selectedModel),
+      usesResponses,
       signal: outputSignal,
+      streamUpstream: canStreamOneShotChat(
+        selectedModel,
+        usesResponses,
+        streamOneShotUpstream,
+      ),
       nativeRouting,
       nativeRejectionReasons,
     })

@@ -22,6 +22,8 @@ import {
 } from "~/routes/messages/write-tool-recovery"
 import { configureWriteToolRecovery } from "~/start"
 
+import { chatCompletionSSE } from "./helpers/chat-completion-sse"
+
 const app = new Hono().route("/v1/messages", messageRoutes)
 const originalState = { ...state }
 const originalEnv = process.env.WRITE_TOOL_RECOVERY
@@ -32,7 +34,7 @@ let timerSpy:
   | undefined
 let logs: Array<ReturnType<typeof spyOn<typeof consola, "debug">>> = []
 let bodies: Array<ChatCompletionsPayload> = []
-let replies: Array<() => Response> = []
+let replies: Array<(stream: boolean) => Response> = []
 
 const schema = {
   type: "object",
@@ -122,10 +124,11 @@ function repaired(raw: string): ChatCompletionResponse {
 }
 
 function queue(...responses: Array<ChatCompletionResponse | Response>) {
-  replies = responses.map(
-    (response) => () =>
-      response instanceof Response ? response : Response.json(response),
-  )
+  replies = responses.map((response) => {
+    if (response instanceof Response) return () => response
+    return (stream) =>
+      stream ? chatCompletionSSE(response) : Response.json(response)
+  })
 }
 
 function send(body = payload(), signal?: AbortSignal) {
@@ -158,6 +161,7 @@ beforeEach(() => {
   const model = knownModelMetadata("claude-fable-5.1")
   if (!model) throw new Error("Expected model")
   model.supported_endpoints = ["/chat/completions"]
+  model.capabilities.supports.streaming = true
   state.models = { object: "list", data: [model] }
   logs = (["debug", "warn", "error", "info"] as const).map((method) =>
     spyOn(consola, method).mockImplementation(
@@ -169,10 +173,11 @@ beforeEach(() => {
       (_url: string | URL | Request, init?: RequestInit) => {
         if (typeof init?.body !== "string")
           throw new Error("Expected JSON request body")
-        bodies.push(JSON.parse(init.body) as ChatCompletionsPayload)
+        const body = JSON.parse(init.body) as ChatCompletionsPayload
+        bodies.push(body)
         const next = replies.shift()
         if (!next) throw new Error("Unexpected extra upstream request")
-        return Promise.resolve(next())
+        return Promise.resolve(next(body.stream === true))
       },
       { preconnect: globalThis.fetch.preconnect },
     ),
@@ -414,6 +419,9 @@ describe("bounded Write missing-content recovery", () => {
     expect(captured).toContain('"finishReason":"length"')
     expect(captured).toContain('"requestedMaxTokens":256')
     expect(captured).toContain('"effectiveMaxTokens":256')
+    expect(captured).toContain('"catalogMaxContextTokens":1000000')
+    expect(captured).toContain('"promptTokens":20')
+    expect(captured).toContain('"cachedPromptTokens":3')
     expect(captured).toContain('"completionTokens":5')
     expect(captured).toContain('"clientStream":false')
     expect(captured).toContain('"catalogEndpointSupport":"chat_completions"')
@@ -741,6 +749,9 @@ describe("bounded Write missing-content recovery", () => {
 
   test("streaming length-truncated Write preserves partial input and terminates with max_tokens", async () => {
     const request = payload(true)
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Expected model")
+    delete model.capabilities.limits.max_context_window_tokens
     const chunks = [
       {
         id: "stream_length",
@@ -821,6 +832,9 @@ describe("bounded Write missing-content recovery", () => {
 
     const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
     expect(captured).toContain('"completionTokens":256')
+    expect(captured).toContain('"catalogMaxContextTokens":null')
+    expect(captured).toContain('"promptTokens":20')
+    expect(captured).toContain('"cachedPromptTokens":null')
     expect(captured).toContain('"clientStream":true')
     expect(captured).toContain('"stream":true')
     expect(captured).toContain('"oneShot":false')

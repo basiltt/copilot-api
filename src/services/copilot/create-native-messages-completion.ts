@@ -24,6 +24,7 @@ import {
   createInactivityAbort,
   fetchWithInactivity,
   responseEvents,
+  UpstreamEventStreamLimitError,
 } from "~/lib/upstream-lifecycle"
 import {
   toAnthropicToolIdentity,
@@ -864,23 +865,24 @@ async function nativeFetch(
     // emit many small deltas, so this is a wire ceiling rather than a
     // bytes-per-token estimate.
     const maxBytes = 32 * 1024 * 1024
-    const encoder = new TextEncoder()
-    let receivedBytes = 0
-    for await (const event of responseEvents(response, combined)) {
-      inactivity.keepAlive()
-      if (!event.data || event.data === "[DONE]") continue
-      receivedBytes += encoder.encode(event.data).byteLength
-      if (receivedBytes > maxBytes)
-        invalidNativeResponse("Native Messages stream exceeded its size limit")
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(event.data)
-      } catch {
-        invalidNativeResponse("Native Messages stream contained invalid JSON")
+    try {
+      for await (const event of responseEvents(response, combined, maxBytes)) {
+        inactivity.keepAlive()
+        if (!event.data || event.data === "[DONE]") continue
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(event.data)
+        } catch {
+          invalidNativeResponse("Native Messages stream contained invalid JSON")
+        }
+        if (!isRecord(parsed))
+          invalidNativeResponse("Native Messages stream event was invalid")
+        if (collector.accept(parsed)) break
       }
-      if (!isRecord(parsed))
-        invalidNativeResponse("Native Messages stream event was invalid")
-      if (collector.accept(parsed)) break
+    } catch (error) {
+      if (error instanceof UpstreamEventStreamLimitError)
+        invalidNativeResponse("Native Messages stream exceeded its size limit")
+      throw error
     }
     const collected = collector.finish()
     return adaptNativeResponse(

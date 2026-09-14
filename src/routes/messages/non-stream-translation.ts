@@ -897,6 +897,7 @@ export function translateToAnthropic(
   toolNameMap?: ToolNameMap,
 ): AnthropicResponse {
   // Merge content from all choices
+  const allThinkingBlocks: Array<AnthropicThinkingBlock> = []
   const allTextBlocks: Array<AnthropicTextBlock> = []
   const allToolUseBlocks: Array<AnthropicToolUseBlock> = []
   let omittedTruncatedToolCalls = false
@@ -907,6 +908,11 @@ export function translateToAnthropic(
   // Process all choices to extract text and tool use blocks
   for (const choice of response.choices) {
     const refused = typeof choice.message.refusal === "string"
+    const reasoning =
+      choice.message.reasoning_content ?? choice.message.reasoning_text
+    if (!refused && typeof reasoning === "string" && reasoning.length > 0) {
+      allThinkingBlocks.push({ type: "thinking", thinking: reasoning })
+    }
     const textBlocks = getAnthropicTextBlocks(
       refused ? (choice.message.refusal ?? null) : choice.message.content,
     )
@@ -925,8 +931,6 @@ export function translateToAnthropic(
     allToolUseBlocks.push(...toolUseBlocks)
     stopReason = selectOutputStopReason(stopReason, effectiveFinishReason)
   }
-
-  // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
 
   // Some models (notably Gemini) intermittently return a non-tool_calls
   // finish_reason ("stop", or even null — a degenerate shape) even when they
@@ -973,7 +977,11 @@ export function translateToAnthropic(
     const visibleTextBlocks = allTextBlocks.filter(
       (block) => block.text.trim().length > 0,
     )
-    const content = [...allTextBlocks, ...allToolUseBlocks]
+    const content = [
+      ...allThinkingBlocks,
+      ...allTextBlocks,
+      ...allToolUseBlocks,
+    ]
     if (
       omittedTruncatedToolCalls
       || (visibleTextBlocks.length === 0 && allToolUseBlocks.length === 0)
@@ -1009,7 +1017,7 @@ export function translateToAnthropic(
       type: "message",
       role: "assistant",
       model: response.model,
-      content: [...allTextBlocks, ...allToolUseBlocks],
+      content: [...allThinkingBlocks, ...allTextBlocks, ...allToolUseBlocks],
       stop_reason:
         mapOpenAIStopReasonToAnthropic(correctedStopReason)
         ?? (allToolUseBlocks.length > 0 ? "tool_use" : "end_turn"),

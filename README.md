@@ -634,6 +634,21 @@ The model's context-window size is not its per-turn output limit. Large writes
 may still need to be split across smaller tool calls even when the conversation
 fits within the context window. See Anthropic's
 [max-token stop-reason guidance](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#max-tokens).
+The bounded warning for a truncated tool turn includes only numeric-or-null
+prompt, cached-prompt, completion, reasoning, advertised output-limit, and raw
+catalog context-limit metadata. Missing catalog or usage fields remain `null`;
+the proxy does not infer remaining capacity from these values.
+
+When an originally streaming request enters the buffered output-tool path, the
+dedicated one-shot transport requests upstream Chat SSE only if the selected
+raw catalog entry identifies an Anthropic model and explicitly advertises both
+Chat Completions and streaming support. The proxy bounds raw upstream bytes,
+assembles one complete response, validates it, and only then emits the buffered
+downstream SSE sequence with keepalive pings while waiting. Other models,
+nonstreaming callers, and catalog entries without that explicit capability stay
+on the existing JSON one-shot path. This path still makes one HTTP attempt,
+does not use ordinary transient retries, does not increase token budgets, and
+does not establish that streaming changes any provider-side output cutoff.
 
 ### Optional native Anthropic Messages transport
 
@@ -705,8 +720,10 @@ second invalid result fail without another attempt.
 Eligible JSON and SSE requests are buffered through the one-shot output-tool
 transport so invalid discovery arguments are never partially emitted. While
 buffered, SSE connections receive keepalive events; the final response contains
-one normal message event sequence. This means the initial completion does not
-use the normal streaming transport or its transient HTTP retries. A valid
+one normal message event sequence. Eligible catalog-confirmed Anthropic Chat
+requests use the bounded upstream SSE assembly described above; other buffered
+requests use JSON. Neither path uses the normal transport's transient HTTP
+retries. A valid
 `ToolSearch` call or a response without `ToolSearch` makes no additional model
 request. Regeneration permits at most one extra same-model call and 20 seconds,
 including response-body reading, and request cancellation propagates through
@@ -738,9 +755,11 @@ Nothing is executed; no fields are coerced, invented, deleted, or defaulted.
 Only a valid same-identity result is committed, retaining the original call ID
 and summing usage from both generations.
 
-Eligible requests are buffered upstream as nonstreaming responses before emitting
-JSON or downstream SSE tool blocks. SSE keepalive pings continue while waiting;
-no partial tool block or success terminal is emitted before validation. The
+Eligible requests are completed and validated before emitting JSON or downstream
+SSE tool blocks. An originally streaming, catalog-confirmed Anthropic Chat
+request uses bounded upstream SSE assembly; other buffered requests use JSON.
+SSE keepalive pings continue while waiting; no partial tool block or success
+terminal is emitted before validation. The
 initial buffered request has a five-minute overall deadline; existing image
 preparation still applies. Regeneration permits **at most one additional model
 call and 20 seconds of additional wall time**, including response-body reading.

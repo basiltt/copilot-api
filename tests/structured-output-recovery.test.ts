@@ -1,3 +1,4 @@
+/* eslint-disable max-lines */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import consola from "consola"
 import { Hono } from "hono"
@@ -22,6 +23,8 @@ import {
 } from "~/routes/messages/tool-name-mapping"
 import { configureStructuredOutputRecovery } from "~/start"
 
+import { chatCompletionSSE } from "./helpers/chat-completion-sse"
+
 const app = new Hono().route("/v1/messages", messageRoutes)
 const originalState = { ...state }
 const originalEnv = process.env.STRUCTURED_OUTPUT_RECOVERY
@@ -32,7 +35,7 @@ let timerSpy:
   | undefined
 let logs: Array<ReturnType<typeof spyOn<typeof consola, "debug">>> = []
 let bodies: Array<ChatCompletionsPayload> = []
-let replies: Array<() => Response> = []
+let replies: Array<(stream: boolean) => Response> = []
 const schema = {
   type: "object",
   properties: { answer: { type: "string" } },
@@ -88,10 +91,11 @@ function completion(
 }
 
 function queue(...responses: Array<ChatCompletionResponse | Response>) {
-  replies = responses.map(
-    (response) => () =>
-      response instanceof Response ? response : Response.json(response),
-  )
+  replies = responses.map((response) => {
+    if (response instanceof Response) return () => response
+    return (stream) =>
+      stream ? chatCompletionSSE(response) : Response.json(response)
+  })
 }
 
 function send(body = payload(), signal?: AbortSignal) {
@@ -123,6 +127,7 @@ beforeEach(() => {
   const model = knownModelMetadata("claude-fable-5.1")
   if (!model) throw new Error("Expected model")
   model.supported_endpoints = ["/chat/completions"]
+  model.capabilities.supports.streaming = true
   state.models = { object: "list", data: [model] }
   logs = (["debug", "warn", "error", "info"] as const).map((method) =>
     spyOn(consola, method).mockImplementation(
@@ -134,10 +139,11 @@ beforeEach(() => {
       (_url: string | URL | Request, init?: RequestInit) => {
         if (typeof init?.body !== "string")
           throw new Error("Expected JSON request body")
-        bodies.push(JSON.parse(init.body) as ChatCompletionsPayload)
+        const body = JSON.parse(init.body) as ChatCompletionsPayload
+        bodies.push(body)
         const next = replies.shift()
         if (!next) throw new Error("Unexpected extra upstream request")
-        return Promise.resolve(next())
+        return Promise.resolve(next(body.stream === true))
       },
       { preconnect: globalThis.fetch.preconnect },
     ),
@@ -193,7 +199,7 @@ describe("bounded output-format recovery through Messages", () => {
       expect(JSON.stringify(bodies[1].messages)).toContain(
         "Report the answer as ready.",
       )
-      expect(bodies.every((body) => body.stream === false)).toBe(true)
+      expect(bodies.every((body) => body.stream === stream)).toBe(true)
       if (stream) {
         const output = events(raw)
         expect(
@@ -234,6 +240,103 @@ describe("bounded output-format recovery through Messages", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(1)
     },
   )
+
+  test("original streamed late-system request keeps exact Chat order and uses one upstream SSE call", async () => {
+    const request = payload(true)
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Expected model")
+    model.id = "claude-sonnet-5"
+    model.name = "claude-sonnet-5"
+    model.capabilities.family = "claude-sonnet-5"
+    model.capabilities.limits.max_output_tokens = 64_000
+    request.model = "claude-sonnet-5"
+    request.max_tokens = 64_000
+    request.messages = [
+      { role: "user", content: "first" },
+      { role: "system", content: "later instruction" },
+      { role: "user", content: "last" },
+    ]
+    const queued = completion()
+    queued.model = "claude-sonnet-5"
+    queue(queued)
+
+    const response = await send(request)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain("original_call")
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const target = fetchSpy.mock.calls[0][0]
+    const url = target instanceof Request ? target.url : target.toString()
+    expect(url).toEndWith("/chat/completions")
+    expect(bodies[0]).toMatchObject({
+      model: "claude-sonnet-5",
+      max_tokens: 64_000,
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [
+        { role: "user", content: "first" },
+        { role: "system", content: "later instruction" },
+        { role: "user", content: "last" },
+      ],
+    })
+  })
+
+  test.each([
+    { capability: "missing", vendor: "Anthropic" },
+    { capability: "false", vendor: "Anthropic" },
+    { capability: "true", vendor: "Other" },
+  ])(
+    "keeps buffered JSON when streaming=$capability and vendor=$vendor",
+    async ({ capability, vendor }) => {
+      const model = state.models?.data[0]
+      if (!model) throw new Error("Expected model")
+      model.vendor = vendor
+      if (capability === "missing") delete model.capabilities.supports.streaming
+      else model.capabilities.supports.streaming = capability === "true"
+      queue(completion())
+
+      const response = await send(payload(true))
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toContain("original_call")
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+      expect(bodies[0].stream).toBe(false)
+      expect(bodies[0].stream_options).toBeUndefined()
+    },
+  )
+
+  test("nonstream client stays upstream nonstream with streaming capability", async () => {
+    queue(completion())
+
+    const response = await send(payload(false))
+
+    expect(response.status).toBe(200)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(bodies[0].stream).toBe(false)
+    expect(bodies[0].stream_options).toBeUndefined()
+  })
+
+  test("buffered streamed truncation reports actual one-shot wire and usage metadata", async () => {
+    const truncated = completion('{"answer":"partial"}')
+    truncated.choices[0].finish_reason = "length"
+    queue(truncated)
+
+    const response = await send(payload(true))
+    const output = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(output).toContain('"stop_reason":"max_tokens"')
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"clientStream":true')
+    expect(captured).toContain(
+      '"finalRequest":{"endpoint":"chat_completions","tokenField":"max_tokens","tokenValue":256,"stream":true,"oneShot":true,"nativeRouting":"native_disabled"}',
+    )
+    expect(captured).toContain('"catalogMaxContextTokens":1000000')
+    expect(captured).toContain('"promptTokens":20')
+    expect(captured).toContain('"cachedPromptTokens":3')
+    expect(captured).toContain('"completionTokens":5')
+  })
 
   test("recovery is disabled by default, with explicit startup parsing", async () => {
     delete process.env.STRUCTURED_OUTPUT_RECOVERY
@@ -578,8 +681,17 @@ describe("hard recovery deadline and disconnect cancellation", () => {
         Object.assign(
           (_url: string | URL | Request, init?: RequestInit) => {
             calls++
-            if (calls === 1)
-              return Promise.resolve(Response.json(completion('{"answer":42}')))
+            if (calls === 1) {
+              if (typeof init?.body !== "string")
+                throw new Error("Expected JSON request body")
+              const body = JSON.parse(init.body) as ChatCompletionsPayload
+              const initial = completion('{"answer":42}')
+              return Promise.resolve(
+                body.stream ?
+                  chatCompletionSSE(initial)
+                : Response.json(initial),
+              )
+            }
             repairSignal = init?.signal ?? undefined
             if (!repairSignal) throw new Error("Missing request abort signal")
             started?.()
@@ -638,8 +750,17 @@ describe("hard recovery deadline and disconnect cancellation", () => {
         Object.assign(
           (_url: string | URL | Request, init?: RequestInit) => {
             calls++
-            if (calls === 1)
-              return Promise.resolve(Response.json(completion('{"answer":42}')))
+            if (calls === 1) {
+              if (typeof init?.body !== "string")
+                throw new Error("Expected JSON request body")
+              const body = JSON.parse(init.body) as ChatCompletionsPayload
+              const initial = completion('{"answer":42}')
+              return Promise.resolve(
+                body.stream ?
+                  chatCompletionSSE(initial)
+                : Response.json(initial),
+              )
+            }
             repairSignal = init?.signal ?? undefined
             return Promise.resolve(
               new Response(

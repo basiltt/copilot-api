@@ -82,11 +82,16 @@ export async function readResponseBody(
     reader.releaseLock()
   }
 }
-export async function* responseEvents(response: Response, signal: AbortSignal) {
+export async function* responseEvents(
+  response: Response,
+  signal: AbortSignal,
+  maxBytes?: number,
+) {
   if (signal.aborted) await response.body?.cancel()
   signal.throwIfAborted()
   if (!response.body) throw new Error("Upstream event stream has no body")
   const reader = response.body.getReader()
+  let receivedBytes = 0
   // Cancel the transport reader itself, even while the SSE parser is suspended.
   const cancel = () => {
     void reader.cancel().catch(() => undefined)
@@ -98,6 +103,9 @@ export async function* responseEvents(response: Response, signal: AbortSignal) {
       if (chunk.done) {
         controller.close()
       } else if (chunk.value instanceof Uint8Array) {
+        receivedBytes += chunk.value.byteLength
+        if (maxBytes !== undefined && receivedBytes > maxBytes)
+          throw new UpstreamEventStreamLimitError()
         controller.enqueue(chunk.value)
       } else {
         throw new TypeError("Upstream event stream contained a non-byte chunk")
@@ -115,5 +123,12 @@ export async function* responseEvents(response: Response, signal: AbortSignal) {
     signal.removeEventListener("abort", cancel)
     cancel()
     reader.releaseLock()
+  }
+}
+
+export class UpstreamEventStreamLimitError extends Error {
+  constructor() {
+    super("Upstream event stream exceeded its size limit")
+    this.name = "UpstreamEventStreamLimitError"
   }
 }
