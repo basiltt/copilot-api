@@ -33,7 +33,6 @@ interface MutableChoice {
 
 export type ChatCompletionStreamFailureReason =
   | "ambiguous_tool_name"
-  | "changed_response_created"
   | "changed_response_id"
   | "changed_response_model"
   | "changed_system_fingerprint"
@@ -539,14 +538,9 @@ export async function collectChatCompletionStream(
           "changed response identity",
           "changed_response_model",
         )
-      if (created !== undefined && created !== chunk.created)
-        throw invalidStream(
-          "changed response identity",
-          "changed_response_created",
-        )
       id = chunk.id
       model = chunk.model
-      created = chunk.created
+      created ??= chunk.created
       if (
         chunk.system_fingerprint !== undefined
         && chunk.system_fingerprint !== null

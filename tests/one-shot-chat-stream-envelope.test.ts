@@ -84,7 +84,61 @@ describe("one-shot Chat SSE envelopes", () => {
     })
   })
 
-  test("requires complete immutable identity and validates optional object", async () => {
+  test("accepts changing valid timestamps and retains the first value", async () => {
+    const usage = {
+      prompt_tokens: 8,
+      completion_tokens: 3,
+      total_tokens: 11,
+    }
+    const completion = await collectChatCompletionStream(
+      response([
+        chunk([
+          {
+            index: 0,
+            delta: { role: "assistant", content: "first" },
+          },
+        ]),
+        {
+          ...chunk([
+            {
+              index: 0,
+              delta: { content: " second" },
+            },
+          ]),
+          created: 43,
+        },
+        {
+          ...chunk(
+            [
+              {
+                index: 0,
+                delta: { content: null },
+                finish_reason: "length",
+              },
+            ],
+            usage,
+          ),
+          created: 43,
+        },
+      ]),
+      new AbortController().signal,
+    )
+
+    expect(completion).toMatchObject({
+      id: "chat_stream",
+      model: "claude-sonnet-5",
+      created: 42,
+      choices: [
+        {
+          message: { role: "assistant", content: "first second" },
+          finish_reason: "length",
+        },
+      ],
+      usage,
+    })
+  })
+
+  test("requires complete identity and validates per-chunk metadata", async () => {
     const cases: Array<{ events: Array<unknown>; message: string }> = [
       {
         events: [{ choices: [] }],
@@ -111,6 +165,16 @@ describe("one-shot Chat SSE envelopes", () => {
         message: "contained an invalid response created timestamp",
       },
       {
+        events: [
+          {
+            id: "chat_stream",
+            model: "claude-sonnet-5",
+            choices: [],
+          },
+        ],
+        message: "contained an invalid response created timestamp",
+      },
+      {
         events: [{ ...chunk([]), choices: null }],
         message: "contained an invalid choices envelope",
       },
@@ -131,7 +195,6 @@ describe("one-shot Chat SSE envelopes", () => {
   for (const [key, value, reason] of [
     ["id", "PRIVATE_ID_VALUE", "changed_response_id"],
     ["model", "PRIVATE_MODEL_VALUE", "changed_response_model"],
-    ["created", 43, "changed_response_created"],
   ] as const) {
     test(`classifies changed response ${key} without exposing its value`, async () => {
       const error = await rejected(
@@ -143,7 +206,7 @@ describe("one-shot Chat SSE envelopes", () => {
 
       expect(error).toBeInstanceOf(ChatCompletionStreamProtocolError)
       expect((error as ChatCompletionStreamProtocolError).reason).toBe(reason)
-      expect(await error.response.clone().text()).not.toContain(String(value))
+      expect(await error.response.clone().text()).not.toContain(value)
     })
   }
 })
