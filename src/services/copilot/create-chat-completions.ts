@@ -56,6 +56,7 @@ export type NativeMessagesRejectionReason =
   | "message_role_developer"
   | "message_role_other"
   | "message_role_system"
+  | "message_role_system_nonprefix"
   | "message_role_tool"
   | "output_format"
   | "redacted_thinking_invalid"

@@ -209,9 +209,11 @@ function nativeMessageContentRejections(
     reasons.add("message_content_invalid")
     return [...reasons]
   }
+  let sawNonSystemMessage = false
   for (const candidateMessage of payload.messages as Array<unknown>) {
     if (!isRecord(candidateMessage)) {
       reasons.add("message_nonobject")
+      sawNonSystemMessage = true
       continue
     }
     if (
@@ -219,8 +221,12 @@ function nativeMessageContentRejections(
       && candidateMessage.role !== "assistant"
     ) {
       reasons.add(unsupportedMessageRoleReason(candidateMessage))
+      if (candidateMessage.role === "system" && sawNonSystemMessage)
+        reasons.add("message_role_system_nonprefix")
+      if (candidateMessage.role !== "system") sawNonSystemMessage = true
       continue
     }
+    sawNonSystemMessage = true
     if (typeof candidateMessage.content === "string") continue
     if (!Array.isArray(candidateMessage.content)) {
       reasons.add("message_content_invalid")

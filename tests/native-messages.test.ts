@@ -581,6 +581,7 @@ describe("native Messages routing and body", () => {
       "message_nonobject",
       "message_role_absent",
       "message_role_system",
+      "message_role_system_nonprefix",
       "message_role_developer",
       "message_role_tool",
       "message_role_other",
@@ -589,6 +590,30 @@ describe("native Messages routing and body", () => {
     expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
       "request_unsupported",
     )
+  })
+
+  test("distinguishes a leading system prefix from a later system message", () => {
+    expect(
+      nativeMessagesRejectionReasons({
+        ...payload(),
+        messages: [
+          { role: "system", content: "First." },
+          { role: "system", content: "Second." },
+          { role: "user", content: "Continue." },
+        ],
+      }),
+    ).toEqual(["message_role_system"])
+
+    expect(
+      nativeMessagesRejectionReasons({
+        ...payload(),
+        messages: [
+          { role: "user", content: "Before." },
+          { role: "system", content: "Later." },
+          { role: "user", content: "After." },
+        ],
+      }),
+    ).toEqual(["message_role_system", "message_role_system_nonprefix"])
   })
 
   test("keeps empty tool results eligible but distinguishes absent and unsupported content", () => {
@@ -704,7 +729,7 @@ describe("native Messages routing and body", () => {
     ])
     const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
     expect(captured).toContain(
-      '"nativeRejectionReasons":["message_role_system"]',
+      '"nativeRejectionReasons":["message_role_system","message_role_system_nonprefix"]',
     )
     expect(captured).not.toContain(privateInstruction)
   })

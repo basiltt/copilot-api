@@ -653,9 +653,11 @@ include only a bounded, fixed-enum set of native rejection reasons. They never
 include prompts, tool names, schemas, signatures, arguments, file paths, or
 other request values. Unsupported message roles are classified only as fixed
 categories (`system`, `developer`, `tool`, absent, non-object, or other), never
-by logging the supplied role. These reasons identify compatibility gates; they
-do not prove that switching transports would change the provider's output
-capacity.
+by logging the supplied role. A separate fixed
+`message_role_system_nonprefix` reason distinguishes a system message that
+appears after conversation content from a leading system-message prefix. These
+reasons identify compatibility gates; they do not prove that switching
+transports would change the provider's output capacity.
 
 The upstream native request uses SSE. The proxy buffers it under a bounded
 wire limit, validates the completed message and tool inputs, and stops reading
