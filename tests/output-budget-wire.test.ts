@@ -138,4 +138,36 @@ describe("Sonnet output budget final wire shape", () => {
       nativeRouting: "not_applicable",
     })
   })
+
+  test("concurrent one-shot rejection metadata stays request-scoped and off wire", async () => {
+    const [typed, context] = await Promise.all([
+      createOneShotCompletion(payload(true), {
+        usesResponses: false,
+        signal: new AbortController().signal,
+        nativeRouting: "request_unsupported",
+        nativeRejectionReasons: ["typed_tools"],
+      }),
+      createOneShotCompletion(payload(true), {
+        usesResponses: false,
+        signal: new AbortController().signal,
+        nativeRouting: "request_unsupported",
+        nativeRejectionReasons: [
+          "context_management",
+          "thinking_signature_missing",
+        ],
+      }),
+    ])
+
+    expect(getFinalUpstreamRequestShape(typed)?.nativeRejectionReasons).toEqual(
+      ["typed_tools"],
+    )
+    expect(
+      getFinalUpstreamRequestShape(context)?.nativeRejectionReasons,
+    ).toEqual(["context_management", "thinking_signature_missing"])
+    expect(bodies).toHaveLength(2)
+    for (const body of bodies) {
+      expect(body).not.toHaveProperty("nativeRouting")
+      expect(body).not.toHaveProperty("nativeRejectionReasons")
+    }
+  })
 })

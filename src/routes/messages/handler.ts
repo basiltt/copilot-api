@@ -34,8 +34,8 @@ import {
 } from "~/services/copilot/create-chat-completions"
 import {
   createNativeMessagesCompletion,
+  evaluateNativeMessagesCompatibility,
   getBufferedNativeResponse,
-  nativeMessagesCompatibility,
 } from "~/services/copilot/create-native-messages-completion"
 import {
   getModelContextWindow,
@@ -1616,10 +1616,15 @@ async function fetchCopilotResponse(
   const selectedModel = state.models?.data.find(
     (model) => model.id === anthropicPayload.model,
   )
-  const nativeRouting = nativeMessagesCompatibility(
+  const nativeCompatibility = evaluateNativeMessagesCompatibility(
     anthropicPayload,
     selectedModel?.supported_endpoints,
   )
+  const nativeRouting = nativeCompatibility.routing
+  const nativeRejectionReasons =
+    nativeCompatibility.rejectionReasons.length > 0 ?
+      nativeCompatibility.rejectionReasons
+    : undefined
   if (nativeRouting === "native_selected") {
     return fetchNativeMessagesResponse(
       anthropicPayload,
@@ -1651,6 +1656,7 @@ async function fetchCopilotResponse(
         selectedModel !== undefined && requiresResponsesApi(selectedModel),
       signal: outputSignal,
       nativeRouting,
+      nativeRejectionReasons,
     })
   }
   consola.debug(
@@ -1663,10 +1669,15 @@ async function fetchCopilotResponse(
     return createResponsesCompletion(
       openAIPayload,
       nativeRouting,
+      nativeRejectionReasons,
     ) as ReturnType<typeof createChatCompletions>
   }
 
-  return createChatCompletions(openAIPayload, nativeRouting)
+  return createChatCompletions(
+    openAIPayload,
+    nativeRouting,
+    nativeRejectionReasons,
+  )
 }
 
 /**

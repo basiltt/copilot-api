@@ -13,6 +13,7 @@ import type { ToolNameMap } from "~/routes/messages/tool-name-mapping"
 import type {
   ChatCompletionResponse,
   FinalUpstreamRequestShape,
+  NativeMessagesRejectionReason,
 } from "~/services/copilot/create-chat-completions"
 
 import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
@@ -58,6 +59,11 @@ export type NativeMessagesCompatibility =
   | "model_not_advertised"
   | "request_unsupported"
 
+export interface NativeMessagesCompatibilityResult {
+  routing: NativeMessagesCompatibility
+  rejectionReasons: Array<NativeMessagesRejectionReason>
+}
+
 type NativeStreamEvent = Record<string, unknown>
 
 function invalidNativeResponse(message: string): never {
@@ -97,74 +103,161 @@ function hasTypedTools(tools: Array<AnthropicTool> | undefined): boolean {
   return Boolean(tools?.some((tool) => !("input_schema" in tool)))
 }
 
-function isNativeToolResultContent(value: unknown): boolean {
-  if (typeof value === "string") return true
-  if (!Array.isArray(value)) return false
-  return value.every(
-    (block) =>
-      isRecord(block)
-      && typeof block.type === "string"
-      && NATIVE_TOOL_RESULT_BLOCK_TYPES.has(block.type),
-  )
+function nativeToolResultContentRejection(
+  value: unknown,
+): NativeMessagesRejectionReason | undefined {
+  if (value === undefined || value === null)
+    return "tool_result_content_missing"
+  if (typeof value === "string") return undefined
+  if (!Array.isArray(value)) return "tool_result_content_unsupported"
+  return (
+      value.every(
+        (block) =>
+          isRecord(block)
+          && typeof block.type === "string"
+          && NATIVE_TOOL_RESULT_BLOCK_TYPES.has(block.type),
+      )
+    ) ?
+      undefined
+    : "tool_result_content_unsupported"
 }
 
-function isNativeMessageContent(payload: AnthropicMessagesPayload): boolean {
+function unsupportedBlockReason(
+  role: "user" | "assistant",
+): NativeMessagesRejectionReason {
+  return role === "user" ?
+      "user_block_unsupported"
+    : "assistant_block_unsupported"
+}
+
+function addKnownNativeBlockRejections(
+  candidate: Record<string, unknown>,
+  reasons: Set<NativeMessagesRejectionReason>,
+): void {
+  const type = candidate.type
+  if (type === "thinking") {
+    if (typeof candidate.thinking !== "string") reasons.add("thinking_invalid")
+    if (
+      typeof candidate.signature !== "string"
+      || candidate.signature.length === 0
+    )
+      reasons.add("thinking_signature_missing")
+  }
+  if (
+    type === "redacted_thinking"
+    && (typeof candidate.data !== "string" || candidate.data.length === 0)
+  )
+    reasons.add("redacted_thinking_invalid")
+  if (
+    type === "tool_use"
+    && (typeof candidate.id !== "string"
+      || typeof candidate.name !== "string"
+      || !isRecord(candidate.input))
+  )
+    reasons.add("tool_use_invalid")
+  if (type === "tool_result") {
+    const rejection = nativeToolResultContentRejection(candidate.content)
+    if (rejection) reasons.add(rejection)
+  }
+}
+
+function addNativeBlockRejections(
+  candidate: unknown,
+  role: "user" | "assistant",
+  reasons: Set<NativeMessagesRejectionReason>,
+): void {
+  if (!isRecord(candidate) || typeof candidate.type !== "string") {
+    reasons.add(unsupportedBlockReason(role))
+    return
+  }
+  const allowed =
+    role === "user" ? NATIVE_USER_BLOCK_TYPES : NATIVE_ASSISTANT_BLOCK_TYPES
+  const type = candidate.type
+  if (!allowed.has(type)) {
+    reasons.add(unsupportedBlockReason(role))
+    return
+  }
+  addKnownNativeBlockRejections(candidate, reasons)
+}
+
+function nativeMessageContentRejections(
+  payload: AnthropicMessagesPayload,
+): Array<NativeMessagesRejectionReason> {
+  const reasons = new Set<NativeMessagesRejectionReason>()
   if (
     Array.isArray(payload.system)
-    && !payload.system.every((block) => block.type === "text")
+    && !payload.system.every(
+      (block) =>
+        isRecord(block)
+        && typeof block.type === "string"
+        && block.type === "text",
+    )
   )
-    return false
-  return payload.messages.every((message) => {
-    if (message.role !== "user" && message.role !== "assistant") return false
-    if (typeof message.content === "string") return true
-    const allowed =
-      message.role === "user" ?
-        NATIVE_USER_BLOCK_TYPES
-      : NATIVE_ASSISTANT_BLOCK_TYPES
-    return message.content.every((block) => {
-      if (!allowed.has(block.type)) return false
-      if (block.type === "thinking")
-        return (
-          typeof block.thinking === "string"
-          && typeof block.signature === "string"
-          && block.signature.length > 0
-        )
-      if (block.type === "redacted_thinking")
-        return typeof block.data === "string" && block.data.length > 0
-      if (block.type === "tool_use")
-        return (
-          typeof block.id === "string"
-          && typeof block.name === "string"
-          && isRecord(block.input)
-        )
-      if (block.type !== "tool_result") return true
-      return isNativeToolResultContent(block.content)
-    })
-  })
+    reasons.add("system_block_unsupported")
+  if (!Array.isArray(payload.messages)) {
+    reasons.add("message_content_invalid")
+    return [...reasons]
+  }
+  for (const candidateMessage of payload.messages as Array<unknown>) {
+    if (!isRecord(candidateMessage)) {
+      reasons.add("message_role_unsupported")
+      continue
+    }
+    const message =
+      candidateMessage as unknown as AnthropicMessagesPayload["messages"][number]
+    if (message.role !== "user" && message.role !== "assistant") {
+      reasons.add("message_role_unsupported")
+      continue
+    }
+    if (typeof message.content === "string") continue
+    if (!Array.isArray(message.content)) {
+      reasons.add("message_content_invalid")
+      continue
+    }
+    for (const candidate of message.content as Array<unknown>)
+      addNativeBlockRejections(candidate, message.role, reasons)
+  }
+  return [...reasons]
 }
 
 export function nativeMessagesCompatibility(
   payload: AnthropicMessagesPayload,
   supportedEndpoints: Array<string> | undefined,
 ): NativeMessagesCompatibility {
-  if (state.nativeMessages !== true) return "native_disabled"
-  if (!supportedEndpoints?.includes("/v1/messages"))
-    return "model_not_advertised"
-  if (hasUnsupportedNativeRequest(payload)) return "request_unsupported"
-  return "native_selected"
+  return evaluateNativeMessagesCompatibility(payload, supportedEndpoints)
+    .routing
 }
 
-function hasUnsupportedNativeRequest(
+export function evaluateNativeMessagesCompatibility(
   payload: AnthropicMessagesPayload,
-): boolean {
+  supportedEndpoints: Array<string> | undefined,
+): NativeMessagesCompatibilityResult {
+  if (state.nativeMessages !== true)
+    return { routing: "native_disabled", rejectionReasons: [] }
+  if (!supportedEndpoints?.includes("/v1/messages"))
+    return { routing: "model_not_advertised", rejectionReasons: [] }
+  const rejectionReasons = nativeMessagesRejectionReasons(payload)
+  return rejectionReasons.length > 0 ?
+      { routing: "request_unsupported", rejectionReasons }
+    : { routing: "native_selected", rejectionReasons: [] }
+}
+
+export function nativeMessagesRejectionReasons(
+  payload: AnthropicMessagesPayload,
+): Array<NativeMessagesRejectionReason> {
+  const reasons: Array<NativeMessagesRejectionReason> = []
   const effort = payload.output_config?.effort
-  if (hasTypedTools(payload.tools)) return true
-  if (payload.mcp_servers && payload.mcp_servers.length > 0) return true
-  if (payload.container || payload.context_management) return true
-  if (payload.output_config?.format) return true
-  if (effort === "xhigh" || effort === "max") return true
-  if (!isNativeMessageContent(payload)) return true
-  return !Number.isFinite(payload.max_tokens) || payload.max_tokens <= 0
+  if (hasTypedTools(payload.tools)) reasons.push("typed_tools")
+  if (payload.mcp_servers && payload.mcp_servers.length > 0)
+    reasons.push("mcp_servers")
+  if (payload.container) reasons.push("container")
+  if (payload.context_management) reasons.push("context_management")
+  if (payload.output_config?.format) reasons.push("output_format")
+  if (effort === "xhigh" || effort === "max") reasons.push("effort_unsupported")
+  reasons.push(...nativeMessageContentRejections(payload))
+  if (!Number.isFinite(payload.max_tokens) || payload.max_tokens <= 0)
+    reasons.push("max_tokens_invalid")
+  return reasons
 }
 
 function mapToolResultContent(

@@ -16,6 +16,7 @@ import {
   buildNativeMessagesBody,
   createNativeMessagesCompletion,
   nativeMessagesCompatibility,
+  nativeMessagesRejectionReasons,
 } from "~/services/copilot/create-native-messages-completion"
 import { configureNativeMessages } from "~/start"
 
@@ -313,6 +314,40 @@ function chatCompletion(text = "fallback"): Response {
   })
 }
 
+function truncatedWriteCompletion(filePath: string): Response {
+  return Response.json({
+    id: "chat_truncated",
+    object: "chat.completion",
+    created: 0,
+    model: "claude-sonnet-5",
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "write_partial",
+              type: "function",
+              function: {
+                name: "Write",
+                arguments: JSON.stringify({ file_path: filePath }),
+              },
+            },
+          ],
+        },
+        finish_reason: "length",
+      },
+    ],
+    usage: {
+      prompt_tokens: 2,
+      completion_tokens: 16_000,
+      total_tokens: 16_002,
+    },
+  })
+}
+
 function send(request = payload(), signal?: AbortSignal): Promise<Response> {
   return Promise.resolve(
     app.request("/v1/messages", {
@@ -436,6 +471,187 @@ describe("native Messages routing and body", () => {
         ),
       ).toBe("native_selected")
     }
+  })
+
+  test("reports all fixed native rejection reasons in deterministic order without values", () => {
+    const privateSentinel = "never-log-this-request-value"
+    const unsafe = {
+      ...payload(),
+      max_tokens: Number.NaN,
+      tools: [
+        {
+          type: "bash_20250124",
+          name: "bash",
+          private_option: privateSentinel,
+        },
+      ],
+      mcp_servers: [{ url: privateSentinel }],
+      container: { id: privateSentinel },
+      context_management: { strategy: privateSentinel },
+      output_config: {
+        effort: "max",
+        format: {
+          type: "json_schema",
+          schema: { description: privateSentinel },
+        },
+      },
+      system: [{ type: privateSentinel }],
+      messages: [
+        { role: "system", content: privateSentinel },
+        {
+          role: "user",
+          content: [
+            null,
+            {
+              type: "tool_result",
+              tool_use_id: privateSentinel,
+            },
+            {
+              type: "tool_result",
+              tool_use_id: privateSentinel,
+              content: [{ type: "browser_state", tabs: [] }],
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: 1, signature: "" },
+            { type: "redacted_thinking", data: "" },
+            {
+              type: "tool_use",
+              id: 1,
+              name: privateSentinel,
+              input: privateSentinel,
+            },
+            {
+              type: "server_tool_use",
+              id: privateSentinel,
+              name: privateSentinel,
+              input: {},
+            },
+          ],
+        },
+      ],
+    } as unknown as AnthropicMessagesPayload
+
+    const reasons = nativeMessagesRejectionReasons(unsafe)
+    expect(reasons).toEqual([
+      "typed_tools",
+      "mcp_servers",
+      "container",
+      "context_management",
+      "output_format",
+      "effort_unsupported",
+      "system_block_unsupported",
+      "message_role_unsupported",
+      "user_block_unsupported",
+      "tool_result_content_missing",
+      "tool_result_content_unsupported",
+      "thinking_invalid",
+      "thinking_signature_missing",
+      "redacted_thinking_invalid",
+      "tool_use_invalid",
+      "assistant_block_unsupported",
+      "max_tokens_invalid",
+    ])
+    expect(JSON.stringify(reasons)).not.toContain(privateSentinel)
+    expect(nativeMessagesCompatibility(unsafe, ["/v1/messages"])).toBe(
+      "request_unsupported",
+    )
+  })
+
+  test("keeps empty tool results eligible but distinguishes absent and unsupported content", () => {
+    const request = payload()
+    request.messages = [
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "call_empty", content: [] },
+        ],
+      },
+    ]
+    expect(nativeMessagesRejectionReasons(request)).toEqual([])
+
+    const missing = structuredClone(request) as unknown as {
+      messages: Array<{ content: Array<Record<string, unknown>> }>
+    }
+    Reflect.deleteProperty(missing.messages[0].content[0], "content")
+    expect(
+      nativeMessagesRejectionReasons(
+        missing as unknown as AnthropicMessagesPayload,
+      ),
+    ).toEqual(["tool_result_content_missing"])
+
+    const unsupported = structuredClone(request) as unknown as {
+      messages: Array<{ content: Array<Record<string, unknown>> }>
+    }
+    unsupported.messages[0].content[0].content = [
+      { type: "browser_state", tabs: [] },
+    ]
+    expect(
+      nativeMessagesRejectionReasons(
+        unsupported as unknown as AnthropicMessagesPayload,
+      ),
+    ).toEqual(["tool_result_content_unsupported"])
+  })
+
+  test("malformed content containers remain bounded request_unsupported diagnostics", () => {
+    const typed = [{ type: "bash_20250124", name: "bash" }]
+    for (const malformed of [
+      {
+        ...payload(),
+        tools: typed,
+        system: [null],
+      },
+      {
+        ...payload(),
+        tools: typed,
+        messages: [{ role: "user", content: null }],
+      },
+      {
+        ...payload(),
+        tools: typed,
+        messages: null,
+      },
+    ] as Array<unknown>) {
+      const request = malformed as AnthropicMessagesPayload
+      expect(() => nativeMessagesRejectionReasons(request)).not.toThrow()
+      expect(nativeMessagesRejectionReasons(request)[0]).toBe("typed_tools")
+      expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
+        "request_unsupported",
+      )
+    }
+    expect(
+      nativeMessagesRejectionReasons({
+        ...payload(),
+        tools: typed,
+        system: [null],
+      } as unknown as AnthropicMessagesPayload),
+    ).toEqual(["typed_tools", "system_block_unsupported"])
+    expect(
+      nativeMessagesRejectionReasons({
+        ...payload(),
+        tools: typed,
+        messages: [{ role: "user", content: null }],
+      } as unknown as AnthropicMessagesPayload),
+    ).toEqual(["typed_tools", "message_content_invalid"])
+  })
+
+  test("bounded output warning includes only fixed rejection reasons", async () => {
+    const privatePath = "private/never-log-this-path.ts"
+    const request = payload()
+    request.tools = [writeTool, { type: "bash_20250124", name: "bash" }]
+    queue(truncatedWriteCompletion(privatePath))
+
+    const response = await send(request)
+    expect(response.status).toBe(200)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain("Upstream tool output reached token limit")
+    expect(captured).toContain('"nativeRouting":"request_unsupported"')
+    expect(captured).toContain('"nativeRejectionReasons":["typed_tools"]')
+    expect(captured).not.toContain(privatePath)
   })
 
   test("uses refined Workflow schema and rejects unrepresentable history", () => {

@@ -40,10 +40,32 @@ export interface FinalUpstreamRequestShape {
     | "model_not_advertised"
     | "request_unsupported"
     | "not_applicable"
+  nativeRejectionReasons?: Array<NativeMessagesRejectionReason>
 }
+
+export type NativeMessagesRejectionReason =
+  | "assistant_block_unsupported"
+  | "container"
+  | "context_management"
+  | "effort_unsupported"
+  | "max_tokens_invalid"
+  | "mcp_servers"
+  | "message_content_invalid"
+  | "message_role_unsupported"
+  | "output_format"
+  | "redacted_thinking_invalid"
+  | "system_block_unsupported"
+  | "thinking_invalid"
+  | "thinking_signature_missing"
+  | "tool_result_content_missing"
+  | "tool_result_content_unsupported"
+  | "tool_use_invalid"
+  | "typed_tools"
+  | "user_block_unsupported"
 
 interface RequestShapeOptions {
   endpoint: FinalUpstreamRequestShape["endpoint"]
+  nativeRejectionReasons?: Array<NativeMessagesRejectionReason>
   nativeRouting?: FinalUpstreamRequestShape["nativeRouting"]
   oneShot: boolean
 }
@@ -72,6 +94,9 @@ function describeFinalUpstreamRequest(
     stream: typeof body.stream === "boolean" ? body.stream : null,
     oneShot: options.oneShot,
     nativeRouting: options.nativeRouting ?? "not_applicable",
+    ...(options.nativeRejectionReasons?.length ?
+      { nativeRejectionReasons: options.nativeRejectionReasons }
+    : {}),
   }
 }
 
@@ -207,6 +232,7 @@ function buildRequestHeaders(
 export const createResponsesCompletion = async (
   payload: ChatCompletionsPayload,
   nativeRouting: FinalUpstreamRequestShape["nativeRouting"] = "not_applicable",
+  nativeRejectionReasons?: Array<NativeMessagesRejectionReason>,
 ): Promise<
   ChatCompletionResponse | AsyncIterable<import("hono/streaming").SSEMessage>
 > => {
@@ -215,7 +241,12 @@ export const createResponsesCompletion = async (
   const responsesPayload = translateToResponsesPayload(payload)
   const requestShape = describeFinalUpstreamRequest(
     responsesPayload as unknown as Record<string, unknown>,
-    { endpoint: "responses", oneShot: false, nativeRouting },
+    {
+      endpoint: "responses",
+      oneShot: false,
+      nativeRouting,
+      nativeRejectionReasons,
+    },
   )
 
   const inactivity = createInactivityAbort()
@@ -329,6 +360,7 @@ export const createResponsesCompletion = async (
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
   nativeRouting: FinalUpstreamRequestShape["nativeRouting"] = "not_applicable",
+  nativeRejectionReasons?: Array<NativeMessagesRejectionReason>,
 ) => {
   const headers = buildRequestHeaders(payload)
 
@@ -339,6 +371,7 @@ export const createChatCompletions = async (
     endpoint: "chat_completions",
     oneShot: false,
     nativeRouting,
+    nativeRejectionReasons,
   })
 
   let response: Response | undefined
@@ -444,16 +477,40 @@ function buildChatRequestBody(
   return body
 }
 
+function describeOneShotRequest(
+  body: Record<string, unknown>,
+  options: {
+    usesResponses: boolean
+    nativeRejectionReasons?: Array<NativeMessagesRejectionReason>
+    nativeRouting: FinalUpstreamRequestShape["nativeRouting"]
+  },
+): FinalUpstreamRequestShape {
+  return describeFinalUpstreamRequest(body, {
+    endpoint: options.usesResponses ? "responses" : "chat_completions",
+    oneShot: true,
+    nativeRouting: options.nativeRouting,
+    nativeRejectionReasons: options.nativeRejectionReasons,
+  })
+}
+
+interface OneShotCompletionOptions {
+  usesResponses: boolean
+  signal: AbortSignal
+  nativeRejectionReasons?: Array<NativeMessagesRejectionReason>
+  nativeRouting?: FinalUpstreamRequestShape["nativeRouting"]
+}
+
 /** One non-streaming request, including body consumption, with no hidden retries. */
 export async function createOneShotCompletion(
   payload: ChatCompletionsPayload,
-  options: {
-    usesResponses: boolean
-    signal: AbortSignal
-    nativeRouting?: FinalUpstreamRequestShape["nativeRouting"]
-  },
+  options: OneShotCompletionOptions,
 ): Promise<ChatCompletionResponse> {
-  const { usesResponses, signal, nativeRouting = "not_applicable" } = options
+  const {
+    usesResponses,
+    signal,
+    nativeRejectionReasons,
+    nativeRouting = "not_applicable",
+  } = options
   const downstream = requestSignal()
   const combined = downstream ? AbortSignal.any([signal, downstream]) : signal
   combined.throwIfAborted()
@@ -462,14 +519,11 @@ export async function createOneShotCompletion(
     usesResponses ?
       translateToResponsesPayload(nonStreaming)
     : buildChatRequestBody(nonStreaming)
-  const requestShape = describeFinalUpstreamRequest(
-    body as Record<string, unknown>,
-    {
-      endpoint: usesResponses ? "responses" : "chat_completions",
-      oneShot: true,
-      nativeRouting,
-    },
-  )
+  const requestShape = describeOneShotRequest(body as Record<string, unknown>, {
+    usesResponses,
+    nativeRouting,
+    nativeRejectionReasons,
+  })
   const response = await fetch(
     `${copilotBaseUrl(state)}/${usesResponses ? "responses" : "chat/completions"}`,
     {
