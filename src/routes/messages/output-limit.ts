@@ -7,9 +7,35 @@ import { toAnthropicToolIdentity, type ToolNameMap } from "./tool-name-mapping"
 
 export const OUTPUT_LIMIT_VISIBLE_TEXT =
   "The upstream model reached its output token limit before completing the "
-  + "response."
+  + "response. Do not execute unfinished tool input. Retry with a larger "
+  + "client output-token budget if available; otherwise use smaller complete "
+  + "tool operations instead of repeating the unchanged oversized call."
+
+const truncatedToolCallOmissions = Symbol("truncatedToolCallOmissions")
 
 type UpstreamFinishReason = "stop" | "length" | "tool_calls" | "content_filter"
+
+type CompletionMessage =
+  ChatCompletionResponse["choices"][number]["message"] & {
+    [truncatedToolCallOmissions]?: number
+  }
+
+export function markTruncatedToolCallOmissions(
+  message: ChatCompletionResponse["choices"][number]["message"],
+  count: number,
+): void {
+  if (count <= 0) return
+  Object.defineProperty(message, truncatedToolCallOmissions, {
+    value: count,
+    enumerable: false,
+  })
+}
+
+export function getTruncatedToolCallOmissionCount(
+  message: ChatCompletionResponse["choices"][number]["message"],
+): number {
+  return (message as CompletionMessage)[truncatedToolCallOmissions] ?? 0
+}
 
 export function selectOutputStopReason(
   current: UpstreamFinishReason | null,

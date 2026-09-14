@@ -35,6 +35,7 @@ import {
 } from "./anthropic-types"
 import { clientTools } from "./client-tools"
 import {
+  getTruncatedToolCallOmissionCount,
   OUTPUT_LIMIT_VISIBLE_TEXT,
   selectOutputStopReason,
   truncatedToolUseBlocks,
@@ -921,8 +922,9 @@ export function translateToAnthropic(
     const toolUseBlocks = getChoiceToolUseBlocks(choice, toolNameMap, refused)
     if (
       effectiveFinishReason === "length"
-      && Boolean(choice.message.tool_calls?.length)
-      && toolUseBlocks.length === 0
+      && (getTruncatedToolCallOmissionCount(choice.message) > 0
+        || (Boolean(choice.message.tool_calls?.length)
+          && toolUseBlocks.length === 0))
     ) {
       omittedTruncatedToolCalls = true
     }

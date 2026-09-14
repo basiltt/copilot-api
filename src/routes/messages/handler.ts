@@ -63,6 +63,7 @@ import {
   translateToAnthropic,
   translateToOpenAI,
 } from "./non-stream-translation"
+import { getTruncatedToolCallOmissionCount } from "./output-limit"
 import {
   isServerWebSearch,
   runServerWebSearch,
@@ -1505,6 +1506,15 @@ type CompletionUsage = {
   completion_tokens_details?: { reasoning_tokens?: number }
 }
 
+interface RuntimeCatalogMetadata {
+  capabilities?: {
+    limits?: { max_context_window_tokens?: unknown }
+    supports?: { streaming?: unknown }
+  }
+  supported_endpoints?: unknown
+  vendor?: unknown
+}
+
 function outputBudget(payload: AnthropicMessagesPayload): {
   catalogMaxContextTokens: number | null
   requestedMaxTokens: number | null
@@ -1514,6 +1524,7 @@ function outputBudget(payload: AnthropicMessagesPayload): {
   const catalogModel = state.models?.data.find(
     (candidate) => candidate.id === payload.model,
   )
+  const runtimeCatalogModel = catalogModel as RuntimeCatalogMetadata | undefined
   const model = catalogModel ?? knownModelMetadata(payload.model)
   const requestedMaxTokens = finiteNumber(payload.max_tokens)
   const modelMaxOutputTokens = finiteNumber(
@@ -1525,7 +1536,7 @@ function outputBudget(payload: AnthropicMessagesPayload): {
   }
   return {
     catalogMaxContextTokens: finiteNumber(
-      catalogModel?.capabilities.limits.max_context_window_tokens,
+      runtimeCatalogModel?.capabilities?.limits?.max_context_window_tokens,
     ),
     requestedMaxTokens,
     effectiveMaxTokens,
@@ -1542,13 +1553,14 @@ function logTruncatedToolOutput(
   response: ChatCompletionResponse,
   clientStream = payload.stream === true,
 ): void {
-  const truncatedToolCallCount = response.choices.reduce(
-    (count, choice) =>
-      choice.finish_reason === "length" ?
-        count + (choice.message.tool_calls?.length ?? 0)
-      : count,
-    0,
-  )
+  const truncatedToolCallCount = response.choices.reduce((count, choice) => {
+    if (choice.finish_reason !== "length") return count
+    return (
+      count
+      + (choice.message.tool_calls?.length ?? 0)
+      + getTruncatedToolCallOmissionCount(choice.message)
+    )
+  }, 0)
   if (truncatedToolCallCount === 0) return
   logTruncatedToolOutputDetails(payload, {
     toolCallCount: truncatedToolCallCount,
@@ -1639,12 +1651,15 @@ function canStreamOneShotChat(
   usesResponses: boolean,
   requested: boolean,
 ): boolean {
+  const runtimeModel = selectedModel as RuntimeCatalogMetadata | undefined
   return (
     requested
     && !usesResponses
-    && selectedModel?.vendor.toLowerCase() === "anthropic"
-    && selectedModel.capabilities.supports.streaming === true
-    && selectedModel.supported_endpoints?.includes("/chat/completions") === true
+    && typeof runtimeModel?.vendor === "string"
+    && runtimeModel.vendor.toLowerCase() === "anthropic"
+    && runtimeModel.capabilities?.supports?.streaming === true
+    && Array.isArray(runtimeModel.supported_endpoints)
+    && runtimeModel.supported_endpoints.includes("/chat/completions")
   )
 }
 

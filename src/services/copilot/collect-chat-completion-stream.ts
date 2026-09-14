@@ -3,6 +3,7 @@ import {
   responseEvents,
   UpstreamEventStreamLimitError,
 } from "~/lib/upstream-lifecycle"
+import { markTruncatedToolCallOmissions } from "~/routes/messages/output-limit"
 
 import type {
   ChatCompletionResponse,
@@ -67,7 +68,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function nonnegativeInteger(value: unknown, label: string): number {
-  if (!Number.isInteger(value) || (value as number) < 0)
+  if (!Number.isSafeInteger(value) || (value as number) < 0)
     throw invalidStream(`contained an invalid ${label}`)
   return value as number
 }
@@ -281,22 +282,36 @@ function collectChoice(
 }
 
 function resolveToolId(fragments: Array<string>): string | undefined {
-  let id = ""
+  const values = fragments.filter(Boolean)
+  if (values.length === 0) return undefined
+  const id = values[0]
+  if (values.some((value) => value !== id))
+    throw invalidStream("changed a tool-call identity")
+  return id
+}
+
+function matchesToolNameSequence(
+  fragments: Array<string>,
+  candidate: string,
+): boolean {
+  let assembled = ""
   for (const fragment of fragments) {
-    if (!fragment) continue
-    if (fragment === id) continue
-    if (fragment.startsWith(id)) {
-      id = fragment
+    if (fragment === candidate) {
+      assembled = candidate
       continue
     }
-    if (
-      /^(?:call|toolu)_[\w-]+$/.test(id)
-      && /^(?:call|toolu)_[\w-]+$/.test(fragment)
-    )
-      throw invalidStream("changed a tool-call identity")
-    id += fragment
+    if (assembled === candidate) return false
+    if (candidate.startsWith(assembled + fragment)) {
+      assembled += fragment
+      continue
+    }
+    if (fragment.startsWith(assembled) && candidate.startsWith(fragment)) {
+      assembled = fragment
+      continue
+    }
+    return false
   }
-  return id || undefined
+  return assembled === candidate
 }
 
 function resolveToolName(
@@ -306,14 +321,11 @@ function resolveToolName(
   const values = fragments.filter(Boolean)
   if (values.length === 0) return undefined
   if (allowedToolNames) {
-    const concatenated = values.join("")
-    const candidates = new Set<string>()
-    if (allowedToolNames.has(concatenated)) candidates.add(concatenated)
-    for (const value of values) {
-      if (allowedToolNames.has(value)) candidates.add(value)
-    }
-    if (candidates.size === 1) return [...candidates][0]
-    if (candidates.size > 1)
+    const candidates = [...allowedToolNames].filter((candidate) =>
+      matchesToolNameSequence(values, candidate),
+    )
+    if (candidates.length === 1) return candidates[0]
+    if (candidates.length > 1)
       throw invalidStream("contained an ambiguous tool name")
     throw invalidStream("changed a tool name")
   }
@@ -328,25 +340,22 @@ function resolveToolName(
 function finalizedToolCalls(
   choice: MutableChoice,
   allowedToolNames?: ReadonlySet<string>,
-): Array<ToolCall> | undefined {
+): { omitted: number; toolCalls?: Array<ToolCall> } {
   const { finishReason: terminal, sawRefusal: refused, tools } = choice
   if (tools.size === 0 || refused || terminal === "content_filter")
-    return undefined
+    return { omitted: 0 }
   const result: Array<ToolCall> = []
+  let omitted = 0
   for (const [, tool] of [...tools.entries()].sort(
     ([left], [right]) => left - right,
   )) {
-    let id: string | undefined
-    let name: string | undefined
-    try {
-      id = resolveToolId(tool.idFragments)
-      name = resolveToolName(tool.nameFragments, allowedToolNames)
-    } catch (error) {
-      if (terminal === "length") continue
-      throw error
-    }
+    const id = resolveToolId(tool.idFragments)
+    const name = resolveToolName(tool.nameFragments, allowedToolNames)
     if (!id || !name) {
-      if (terminal === "length") continue
+      if (terminal === "length") {
+        omitted++
+        continue
+      }
       throw invalidStream("ended with incomplete tool identity")
     }
     result.push({
@@ -355,7 +364,10 @@ function finalizedToolCalls(
       function: { name, arguments: tool.arguments },
     })
   }
-  return result.length > 0 ? result : undefined
+  return {
+    omitted,
+    ...(result.length > 0 ? { toolCalls: result } : {}),
+  }
 }
 
 // eslint-disable-next-line max-lines-per-function, complexity -- One state machine validates the complete SSE protocol before releasing output.
@@ -451,18 +463,20 @@ export async function collectChatCompletionStream(
       .map(([index, choice]) => {
         if (choice.finishReason === undefined)
           throw invalidStream("ended before a terminal choice")
-        const toolCalls = finalizedToolCalls(choice, options.allowedToolNames)
+        const finalized = finalizedToolCalls(choice, options.allowedToolNames)
+        const message: ChatCompletionResponse["choices"][number]["message"] = {
+          role: "assistant",
+          content: choice.sawContent ? choice.content : null,
+          ...(choice.sawReasoning ?
+            { reasoning_content: choice.reasoningContent }
+          : {}),
+          ...(choice.sawRefusal ? { refusal: choice.refusal } : {}),
+          ...(finalized.toolCalls ? { tool_calls: finalized.toolCalls } : {}),
+        }
+        markTruncatedToolCallOmissions(message, finalized.omitted)
         return {
           index,
-          message: {
-            role: "assistant",
-            content: choice.sawContent ? choice.content : null,
-            ...(choice.sawReasoning ?
-              { reasoning_content: choice.reasoningContent }
-            : {}),
-            ...(choice.sawRefusal ? { refusal: choice.refusal } : {}),
-            ...(toolCalls ? { tool_calls: toolCalls } : {}),
-          },
+          message,
           logprobs: null,
           finish_reason: choice.finishReason,
         }

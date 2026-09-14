@@ -11,6 +11,7 @@ import type {
 
 import { knownModelMetadata } from "~/lib/known-models"
 import { state } from "~/lib/state"
+import { OUTPUT_LIMIT_VISIBLE_TEXT } from "~/routes/messages/output-limit"
 import { messageRoutes } from "~/routes/messages/route"
 import { STRUCTURED_OUTPUT_RECOVERY_TIMEOUT_MS } from "~/routes/messages/structured-output-recovery"
 import {
@@ -285,12 +286,14 @@ describe("bounded output-format recovery through Messages", () => {
     { capability: "missing", vendor: "Anthropic" },
     { capability: "false", vendor: "Anthropic" },
     { capability: "true", vendor: "Other" },
+    { capability: "true", vendor: undefined },
   ])(
     "keeps buffered JSON when streaming=$capability and vendor=$vendor",
     async ({ capability, vendor }) => {
       const model = state.models?.data[0]
       if (!model) throw new Error("Expected model")
-      model.vendor = vendor
+      if (vendor === undefined) Reflect.deleteProperty(model, "vendor")
+      else model.vendor = vendor
       if (capability === "missing") delete model.capabilities.supports.streaming
       else model.capabilities.supports.streaming = capability === "true"
       queue(completion())
@@ -304,6 +307,40 @@ describe("bounded output-format recovery through Messages", () => {
       expect(bodies[0].stream_options).toBeUndefined()
     },
   )
+
+  test("partial catalog metadata stays safe and preserves the explicit streaming gate", async () => {
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Expected model")
+    Reflect.deleteProperty(model, "capabilities")
+    const truncated = completion('{"answer":"partial"}')
+    truncated.choices[0].finish_reason = "length"
+    queue(truncated)
+
+    const response = await send(payload(true))
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('"stop_reason":"max_tokens"')
+    expect(bodies[0].stream).toBe(false)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"catalogMaxContextTokens":null')
+  })
+
+  test("missing catalog limits stays safe without disabling an explicit streaming capability", async () => {
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Expected model")
+    Reflect.deleteProperty(model.capabilities, "limits")
+    const truncated = completion('{"answer":"partial"}')
+    truncated.choices[0].finish_reason = "length"
+    queue(truncated)
+
+    const response = await send(payload(true))
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain('"stop_reason":"max_tokens"')
+    expect(bodies[0].stream).toBe(true)
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"catalogMaxContextTokens":null')
+  })
 
   test("nonstream client stays upstream nonstream with streaming capability", async () => {
     queue(completion())
@@ -336,6 +373,30 @@ describe("bounded output-format recovery through Messages", () => {
     expect(captured).toContain('"promptTokens":20')
     expect(captured).toContain('"cachedPromptTokens":3')
     expect(captured).toContain('"completionTokens":5')
+  })
+
+  test("streamed truncation with prose and missing identity keeps omission notice and count", async () => {
+    const truncated = completion('{"answer":"partial"')
+    truncated.choices[0].finish_reason = "length"
+    truncated.choices[0].message.content = "Partial explanation."
+    const call = truncated.choices[0].message.tool_calls?.[0]
+    if (!call) throw new Error("Expected tool")
+    Reflect.deleteProperty(call, "id")
+    queue(chatCompletionSSE(truncated))
+
+    const response = await send(payload(true))
+    const output = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(output).toContain("Partial explanation.")
+    expect(output).toContain(OUTPUT_LIMIT_VISIBLE_TEXT)
+    expect(output).toContain("Do not execute unfinished tool input")
+    expect(output).toContain("smaller complete tool operations")
+    expect(output).not.toContain('"type":"tool_use"')
+    expect(output).not.toContain("original_call")
+    expect(output).not.toContain('{"answer"')
+    const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+    expect(captured).toContain('"toolCallCount":1')
   })
 
   test("recovery is disabled by default, with explicit startup parsing", async () => {

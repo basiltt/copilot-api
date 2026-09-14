@@ -2,6 +2,10 @@ import { describe, expect, test } from "bun:test"
 
 import { HTTPError } from "~/lib/error"
 import { translateToAnthropic } from "~/routes/messages/non-stream-translation"
+import {
+  getTruncatedToolCallOmissionCount,
+  OUTPUT_LIMIT_VISIBLE_TEXT,
+} from "~/routes/messages/output-limit"
 import { collectChatCompletionStream } from "~/services/copilot/collect-chat-completion-stream"
 
 function event(data: unknown): string {
@@ -44,7 +48,7 @@ async function rejected(promise: Promise<unknown>): Promise<unknown> {
 
 // eslint-disable-next-line max-lines-per-function -- Protocol cases share compact SSE fixture builders.
 describe("one-shot Chat SSE collection", () => {
-  test("preserves fragmented identities, argument bytes, reasoning, and usage", async () => {
+  test("preserves sparse identities, split names, argument bytes, reasoning, and usage", async () => {
     const upstream = response([
       chunk([
         {
@@ -55,7 +59,7 @@ describe("one-shot Chat SSE collection", () => {
             tool_calls: [
               {
                 index: 2,
-                id: "call_",
+                id: "call_read",
                 type: "function",
                 function: { name: "Re", arguments: '{"file_' },
               },
@@ -87,7 +91,6 @@ describe("one-shot Chat SSE collection", () => {
               },
               {
                 index: 2,
-                id: "read",
                 function: { name: "ad", arguments: 'path":"src/a.ts"}' },
               },
             ],
@@ -111,6 +114,7 @@ describe("one-shot Chat SSE collection", () => {
     const completion = await collectChatCompletionStream(
       upstream,
       new AbortController().signal,
+      { allowedToolNames: new Set(["Read", "Write"]) },
     )
 
     expect(completion.choices).toHaveLength(1)
@@ -284,6 +288,13 @@ describe("one-shot Chat SSE collection", () => {
       expect(translated.stop_reason).toBe(
         terminal === "length" ? "max_tokens" : "refusal",
       )
+      expect(
+        getTruncatedToolCallOmissionCount(completion.choices[0].message),
+      ).toBe(terminal === "length" ? 1 : 0)
+      if (terminal === "length")
+        expect(JSON.stringify(translated.content)).toContain(
+          OUTPUT_LIMIT_VISIBLE_TEXT,
+        )
       expect(JSON.stringify(translated.content)).not.toContain("sentinel")
     }
   })
@@ -404,6 +415,134 @@ describe("one-shot Chat SSE collection", () => {
         ]),
         new AbortController().signal,
         { allowedToolNames: new Set(["Write", "Read"]) },
+      ),
+    )
+    expect(error).toBeInstanceOf(HTTPError)
+  })
+
+  test.each([
+    ["call_A", "call_AB"],
+    ["opaque-A", "opaque-B"],
+  ])("rejects changed opaque tool identity %s -> %s", async (first, second) => {
+    const error = await rejected(
+      collectChatCompletionStream(
+        response([
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: first,
+                    function: { name: "Write", arguments: "{" },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ]),
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: second,
+                    function: { arguments: "}" },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ]),
+        ]),
+        new AbortController().signal,
+        { allowedToolNames: new Set(["Write"]) },
+      ),
+    )
+    expect(error).toBeInstanceOf(HTTPError)
+  })
+
+  test("rejects an unknown tail after a complete registered tool name", async () => {
+    const error = await rejected(
+      collectChatCompletionStream(
+        response([
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_same",
+                    function: { name: "Write", arguments: "{" },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ]),
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: { name: "Unexpected", arguments: "}" },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ]),
+        ]),
+        new AbortController().signal,
+        { allowedToolNames: new Set(["Write"]) },
+      ),
+    )
+    expect(error).toBeInstanceOf(HTTPError)
+  })
+
+  test("does not hide identity conflicts behind length truncation", async () => {
+    const error = await rejected(
+      collectChatCompletionStream(
+        response([
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_A",
+                    function: { name: "Write", arguments: "{" },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ]),
+          chunk([
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_AB",
+                    function: { arguments: "" },
+                  },
+                ],
+              },
+              finish_reason: "length",
+            },
+          ]),
+        ]),
+        new AbortController().signal,
+        { allowedToolNames: new Set(["Write"]) },
       ),
     )
     expect(error).toBeInstanceOf(HTTPError)
@@ -558,6 +697,24 @@ describe("one-shot Chat SSE collection", () => {
   ])("rejects $name", async ({ upstream }) => {
     const error = await rejected(
       collectChatCompletionStream(upstream, new AbortController().signal),
+    )
+    expect(error).toBeInstanceOf(HTTPError)
+  })
+
+  test("rejects unsafe streamed indexes", async () => {
+    const error = await rejected(
+      collectChatCompletionStream(
+        response([
+          chunk([
+            {
+              index: Number.MAX_SAFE_INTEGER + 1,
+              delta: { content: "unsafe" },
+              finish_reason: "stop",
+            },
+          ]),
+        ]),
+        new AbortController().signal,
+      ),
     )
     expect(error).toBeInstanceOf(HTTPError)
   })

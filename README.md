@@ -626,9 +626,12 @@ ID, name, and partial input without validating it as a completed executable
 call. Anthropic clients can recognize the final incomplete `tool_use` block
 together with `max_tokens`, raise `max_tokens` within the model's advertised
 output limit, and retry; the proxy does not retry, increase the caller's budget,
-or execute the tool. If the partial arguments cannot be represented as a JSON
-object, the tool block is omitted and a fixed output-limit notice is returned
-with `max_tokens` instead of fabricating arguments.
+or execute the tool. If a larger client output-token budget is unavailable,
+the caller should use smaller complete tool operations rather than repeat the
+unchanged oversized call. If the partial arguments or identity cannot be
+represented safely, the tool block is omitted and a fixed notice says not to
+execute unfinished tool input; it is returned with `max_tokens` instead of
+fabricating arguments or identity.
 
 The model's context-window size is not its per-turn output limit. Large writes
 may still need to be split across smaller tool calls even when the conversation
