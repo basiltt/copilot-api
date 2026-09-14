@@ -282,6 +282,41 @@ describe("bounded output-format recovery through Messages", () => {
     })
   })
 
+  test("buffered stream protocol failures emit bounded private-value-free warnings", async () => {
+    const privateSentinel = "PRIVATE_FRAME_VALUE"
+    const request = payload(true)
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Expected model")
+    model.id = "claude-sonnet-5"
+    model.name = "claude-sonnet-5"
+    model.capabilities.family = "claude-sonnet-5"
+    request.model = "claude-sonnet-5"
+    queue(
+      new Response(
+        `data: ${JSON.stringify({
+          id: "chat_private",
+          object: privateSentinel,
+          created: 1,
+          model: "claude-sonnet-5",
+          choices: [],
+        })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    )
+
+    const response = await send(request)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toContain("invalid chunk object")
+    const warnings = JSON.stringify(logs[1].mock.calls)
+    expect(warnings).toContain("Buffered Anthropic stream failed")
+    expect(warnings).toContain('"kind":"protocol"')
+    expect(warnings).toContain('"reason":"invalid_chunk_object"')
+    expect(warnings).toContain('"logicalStatus":502')
+    expect(warnings).not.toContain(privateSentinel)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
   test.each([
     { capability: "missing", vendor: "Anthropic" },
     { capability: "false", vendor: "Anthropic" },

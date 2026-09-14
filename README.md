@@ -647,7 +647,12 @@ dedicated one-shot transport requests upstream Chat SSE only if the selected
 raw catalog entry identifies an Anthropic model and explicitly advertises both
 Chat Completions and streaming support. The proxy bounds raw upstream bytes,
 assembles one complete response, validates it, and only then emits the buffered
-downstream SSE sequence with keepalive pings while waiting. Other models,
+downstream SSE sequence with keepalive pings while waiting. Copilot Chat chunks
+may omit the optional `object` discriminator; when present it must be
+`chat.completion.chunk`, while response ID, model, timestamp, choices, terminal
+state, and tool identity remain mandatory and consistent. Buffered protocol or
+transport failures emit one fixed-enum, value-free warning without exposing
+frames, prompts, headers, or tool input. Other models,
 nonstreaming callers, and catalog entries without that explicit capability stay
 on the existing JSON one-shot path. This path still makes one HTTP attempt,
 does not use ordinary transient retries, does not increase token budgets, and

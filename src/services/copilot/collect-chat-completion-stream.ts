@@ -407,16 +407,18 @@ export async function collectChatCompletionStream(
       if (!isRecord(chunk)) throw invalidStream("contained a non-object event")
       if ("error" in chunk && chunk.error) throw streamedError(chunk.error)
       if (
-        chunk.object !== "chat.completion.chunk"
-        || typeof chunk.id !== "string"
-        || !chunk.id
-        || typeof chunk.model !== "string"
-        || !chunk.model
-        || typeof chunk.created !== "number"
-        || !Number.isFinite(chunk.created)
-        || !Array.isArray(chunk.choices)
+        chunk.object !== undefined
+        && chunk.object !== "chat.completion.chunk"
       )
-        throw invalidStream("contained an invalid chunk envelope")
+        throw invalidStream("contained an invalid chunk object")
+      if (typeof chunk.id !== "string" || !chunk.id)
+        throw invalidStream("contained an invalid response id")
+      if (typeof chunk.model !== "string" || !chunk.model)
+        throw invalidStream("contained an invalid response model")
+      if (typeof chunk.created !== "number" || !Number.isFinite(chunk.created))
+        throw invalidStream("contained an invalid response created timestamp")
+      if (!Array.isArray(chunk.choices))
+        throw invalidStream("contained an invalid choices envelope")
       if (
         (id !== undefined && id !== chunk.id)
         || (model !== undefined && model !== chunk.model)

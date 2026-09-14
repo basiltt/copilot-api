@@ -453,7 +453,10 @@ async function handleServerSearch(
         await emitAnthropicResponseAsSSE(stream, await run())
       } catch (error) {
         if (!signal.aborted)
-          await emitStreamingError(stream, error, payload.model)
+          await emitStreamingError(stream, error, {
+            modelId: payload.model,
+            warnBufferedFailure: true,
+          })
       } finally {
         stopKeepalive()
       }
@@ -516,7 +519,10 @@ async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
         await emitAnthropicResponseAsSSE(stream, response)
       } catch (error) {
         if (!signal.aborted)
-          await emitStreamingError(stream, error, payload.model)
+          await emitStreamingError(stream, error, {
+            modelId: payload.model,
+            warnBufferedFailure: true,
+          })
       } finally {
         stopKeepalive()
       }
@@ -1464,7 +1470,9 @@ async function handleStreaming(
     // Context window errors and CompactionNeededError are already handled
     // in handleCompletion (before the SSE stream starts).
     consola.error("Error during stream piping:", error)
-    await emitStreamingError(stream, error, anthropicPayload.model)
+    await emitStreamingError(stream, error, {
+      modelId: anthropicPayload.model,
+    })
   }
 }
 
@@ -2300,6 +2308,86 @@ function mapStatusToAnthropicErrorType(status: number): string {
   return "api_error"
 }
 
+function upstreamFailureReason(status: number): string {
+  if (status === 429) return "rate_limited"
+  if (status >= 500) return "server_error"
+  if (status >= 400) return "client_error"
+  return "unexpected_status"
+}
+
+function transportFailureReason(error: Error): string {
+  if (error.name === "TimeoutError") return "timeout"
+  if (error.name === "AbortError") return "aborted"
+  return "failure"
+}
+
+function bufferedFailureMetadata(
+  error: unknown,
+  publicMessage: string,
+): {
+  kind: "protocol" | "transport" | "upstream_http" | "unexpected"
+  reason: string
+  logicalStatus: number | null
+} {
+  if (error instanceof HTTPError) {
+    const logicalStatus = error.response.status
+    if (error.message === "Invalid Copilot streamed completion") {
+      const reasons = new Map([
+        [
+          "Upstream streamed completion contained an invalid chunk object.",
+          "invalid_chunk_object",
+        ],
+        [
+          "Upstream streamed completion contained an invalid response id.",
+          "invalid_response_id",
+        ],
+        [
+          "Upstream streamed completion contained an invalid response model.",
+          "invalid_response_model",
+        ],
+        [
+          "Upstream streamed completion contained an invalid response created timestamp.",
+          "invalid_response_created",
+        ],
+        [
+          "Upstream streamed completion contained an invalid choices envelope.",
+          "invalid_choices",
+        ],
+        [
+          "Upstream streamed completion contained malformed JSON.",
+          "malformed_json",
+        ],
+        [
+          "Upstream streamed completion exceeded the buffered wire limit.",
+          "wire_limit",
+        ],
+        [
+          "Upstream streamed completion ended before the [DONE] marker.",
+          "missing_done",
+        ],
+      ])
+      return {
+        kind: "protocol",
+        reason: reasons.get(publicMessage) ?? "invalid_stream",
+        logicalStatus,
+      }
+    }
+    return {
+      kind: "upstream_http",
+      reason: upstreamFailureReason(logicalStatus),
+      logicalStatus,
+    }
+  }
+  if (error instanceof Error) {
+    return {
+      kind: "transport",
+      reason: transportFailureReason(error),
+      logicalStatus: null,
+    }
+  }
+  return { kind: "unexpected", reason: "non_error", logicalStatus: null }
+}
+
 /**
  * Emits an SSE error event for a streaming request.
  *
@@ -2312,15 +2400,24 @@ function mapStatusToAnthropicErrorType(status: number): string {
 async function emitStreamingError(
   stream: SSEStreamingApi,
   error: unknown,
-  modelId?: string,
+  options: {
+    modelId?: string
+    warnBufferedFailure?: boolean
+  } = {},
 ): Promise<void> {
   if (requestSignal()?.aborted) return
   const { errorMessage, errorType } = await extractStreamingErrorDetails(error)
+  if (options.warnBufferedFailure)
+    consola.warn(
+      "Buffered Anthropic stream failed",
+      bufferedFailureMetadata(error, errorMessage),
+    )
 
   const contextWindowError = isContextWindowError(errorMessage)
   const effectiveErrorType =
     contextWindowError ? "invalid_request_error" : errorType
-  const modelLimit = modelId ? lookupModelLimit(modelId) : undefined
+  const modelLimit =
+    options.modelId ? lookupModelLimit(options.modelId) : undefined
   const effectiveMessage =
     contextWindowError ?
       formatAnthropicContextWindowError(errorMessage, modelLimit)
