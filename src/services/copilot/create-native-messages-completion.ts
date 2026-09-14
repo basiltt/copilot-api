@@ -203,19 +203,20 @@ function nativeMessageContentRejections(
       reasons.add("message_role_unsupported")
       continue
     }
-    const message =
-      candidateMessage as unknown as AnthropicMessagesPayload["messages"][number]
-    if (message.role !== "user" && message.role !== "assistant") {
+    if (
+      candidateMessage.role !== "user"
+      && candidateMessage.role !== "assistant"
+    ) {
       reasons.add("message_role_unsupported")
       continue
     }
-    if (typeof message.content === "string") continue
-    if (!Array.isArray(message.content)) {
+    if (typeof candidateMessage.content === "string") continue
+    if (!Array.isArray(candidateMessage.content)) {
       reasons.add("message_content_invalid")
       continue
     }
-    for (const candidate of message.content as Array<unknown>)
-      addNativeBlockRejections(candidate, message.role, reasons)
+    for (const candidate of candidateMessage.content)
+      addNativeBlockRejections(candidate, candidateMessage.role, reasons)
   }
   return [...reasons]
 }
