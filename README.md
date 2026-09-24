@@ -852,6 +852,17 @@ More options: [Claude Code settings](https://docs.anthropic.com/en/docs/claude-c
 
 Models declare their `supported_endpoints`. When a model doesn't support `/chat/completions` (e.g. some gpt-5.x variants), the proxy automatically routes through the Responses API with full translation. Claude models go the opposite direction — they're translated from Responses API to Chat Completions.
 
+For Responses requests routed through Chat Completions, streamed output is
+buffered until the upstream turn reaches a valid terminal state. Completed
+function calls are parsed and checked against the caller's original schema
+before executable completion events are emitted. A call that ends because of
+the output limit remains non-executable and returns `response.incomplete` with
+`max_output_tokens`; refusals and upstream errors take precedence over partial
+tool output. If a completed function declared no parameters (or a closed empty
+object schema) and omitted its argument serialization entirely, the bridge
+normalizes only that schema-proven empty input to `{}`. Malformed, truncated,
+parameterized, open-schema, and unknown tool inputs remain errors.
+
 ### Ultra Reasoning Effort
 
 On the OpenAI endpoints, `reasoning.effort: "ultra"` (Responses) and `reasoning_effort: "ultra"` (Chat Completions) are case-insensitive aliases for the target model's highest supported reasoning effort. Normalization happens **before the first upstream request**, for both streaming and non-streaming requests and in either translation direction. For example, `gpt-6-astra` with `"Ultra"` is sent upstream with `"max"`.

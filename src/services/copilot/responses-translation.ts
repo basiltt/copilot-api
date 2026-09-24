@@ -7,7 +7,11 @@ import type { SSEMessage } from "hono/streaming"
 
 import consola from "consola"
 
-import { HTTPError, extractUpstreamErrorMessage } from "~/lib/error"
+import {
+  HTTPError,
+  extractUpstreamErrorMessage,
+  isContextWindowError,
+} from "~/lib/error"
 import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
 import { invalidToolInput, parseToolInput } from "~/routes/messages/tool-input"
 
@@ -109,7 +113,9 @@ interface ResponsesOutputMessage {
 }
 
 interface ResponsesFunctionCall {
+  id?: string
   type: "function_call"
+  status?: "in_progress" | "completed" | "incomplete"
   call_id: string
   name: string
   arguments: string
@@ -636,74 +642,257 @@ function translateResponsesContentToCC(
 }
 
 // ─── Response translation: Chat Completions → Responses API ─────────────────
+type CCResponseChoice = ChatCompletionResponse["choices"][number]
+
+function ccResponseStatus(choice: CCResponseChoice): {
+  incomplete: boolean
+  refused: boolean
+  status: "completed" | "incomplete"
+} {
+  const refused =
+    choice.message.refusal !== undefined && choice.message.refusal !== null
+  const incomplete =
+    choice.finish_reason === "length"
+    || (choice.finish_reason === "content_filter" && !refused)
+  return {
+    incomplete,
+    refused,
+    status: incomplete ? "incomplete" : "completed",
+  }
+}
+
+function ccResponseMessageOutput(options: {
+  choice: CCResponseChoice
+  id: string
+  refused: boolean
+  status: "completed" | "incomplete"
+}): Array<Record<string, unknown>> {
+  const { choice, id, refused, status } = options
+  const output: Array<Record<string, unknown>> = []
+  const reasoning =
+    choice.message.reasoning_content ?? choice.message.reasoning_text
+  if (reasoning)
+    output.push({
+      id: `${id}_reasoning`,
+      type: "reasoning",
+      status,
+      summary: [{ type: "summary_text", text: reasoning }],
+    })
+  const content: Array<Record<string, unknown>> = []
+  if (choice.message.content)
+    content.push({ type: "output_text", text: choice.message.content })
+  if (refused)
+    content.push({ type: "refusal", refusal: choice.message.refusal })
+  if (content.length > 0)
+    output.push({
+      id: `${id}_message`,
+      type: "message",
+      status,
+      role: "assistant",
+      content,
+    })
+  return output
+}
+
+function normalizeBufferedCCArguments(
+  toolCall: ToolCall,
+  contract: CCToolContract | undefined,
+): string {
+  let argumentsJson = toolCall.function.arguments
+  if (contract?.noInput && argumentsJson === "") {
+    consola.warn("[responses→cc] normalized omitted tool arguments", {
+      reason: "completed_declared_no_input",
+      argumentPresence: "empty",
+      argumentJsonClass: "empty",
+      argumentByteCount: 0,
+      idPresent: toolCall.id.length > 0,
+      nameResolved: true,
+      schemaNoInput: true,
+    })
+    argumentsJson = "{}"
+  }
+  parseToolInput(argumentsJson, toolCall.function.name, contract?.schema)
+  return argumentsJson
+}
+
+function ccResponseToolOutput(options: {
+  choice: CCResponseChoice
+  incomplete: boolean
+  refused: boolean
+  status: "completed" | "incomplete"
+  tools: Array<ResponsesTool> | undefined
+}): Array<ResponsesFunctionCall> {
+  const { choice, incomplete, refused, status, tools } = options
+  if (!choice.message.tool_calls || refused) return []
+  const contracts = buildCCToolContracts(tools)
+  return choice.message.tool_calls.map((toolCall) => {
+    const contract = contracts.get(toolCall.function.name)
+    if (!contract)
+      throw invalidToolInput(
+        toolCall.function.name,
+        "tool name is not declared by the request",
+      )
+    const argumentsJson =
+      incomplete ?
+        toolCall.function.arguments
+      : normalizeBufferedCCArguments(toolCall, contract)
+    return {
+      id: toolCall.id,
+      type: "function_call",
+      status,
+      call_id: toolCall.id,
+      name: toolCall.function.name,
+      arguments: argumentsJson,
+    }
+  })
+}
+
+function ccResponseUsage(
+  usage: ChatCompletionResponse["usage"],
+): ResponsesResponse["usage"] {
+  const cachedTokens = usage?.prompt_tokens_details?.cached_tokens
+  return {
+    input_tokens: usage?.prompt_tokens ?? 0,
+    output_tokens: usage?.completion_tokens ?? 0,
+    total_tokens: usage?.total_tokens ?? 0,
+    ...(cachedTokens !== undefined ?
+      { input_tokens_details: { cached_tokens: cachedTokens } }
+    : {}),
+  }
+}
+
 export function translateFromCCToResponsesResponse(
   resp: ChatCompletionResponse,
   responsesId?: string,
+  tools?: Array<ResponsesTool>,
 ): Record<string, unknown> {
   const id = responsesId ?? `resp_${Date.now()}`
-  const choice = resp.choices.at(0)
-  if (!choice) {
-    return { id, object: "response", model: resp.model, output: [], usage: {} }
-  }
+  if (resp.choices.length !== 1)
+    throw invalidToolInput(
+      "response",
+      "upstream returned an invalid choice count",
+    )
+  const choice = resp.choices[0]
 
-  const output: Array<Record<string, unknown>> = []
-
-  if (choice.message.content) {
-    output.push({
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text: choice.message.content }],
-    })
-  }
-
-  if (choice.message.tool_calls) {
-    for (const tc of choice.message.tool_calls) {
-      output.push({
-        type: "function_call",
-        call_id: tc.id,
-        name: tc.function.name,
-        arguments: tc.function.arguments,
-      })
-    }
-  }
+  const { incomplete, refused, status } = ccResponseStatus(choice)
+  const output = ccResponseMessageOutput({ choice, id, status, refused })
+  const validatedCalls = ccResponseToolOutput({
+    choice,
+    tools,
+    status,
+    incomplete,
+    refused,
+  })
+  if (
+    !incomplete
+    && !refused
+    && ((choice.finish_reason === "tool_calls" && validatedCalls.length === 0)
+      || (choice.finish_reason === "stop" && validatedCalls.length > 0))
+  )
+    throw invalidToolInput(
+      "response",
+      "finish reason conflicts with tool-call output",
+    )
+  output.push(...validatedCalls.map((call) => ({ ...call })))
 
   return {
     id,
     object: "response",
     model: resp.model,
+    status,
+    ...(incomplete ?
+      {
+        incomplete_details: {
+          reason:
+            choice.finish_reason === "length" ?
+              "max_output_tokens"
+            : "content_filter",
+        },
+      }
+    : {}),
     output,
-    usage: {
-      input_tokens: resp.usage?.prompt_tokens ?? 0,
-      output_tokens: resp.usage?.completion_tokens ?? 0,
-      total_tokens: resp.usage?.total_tokens ?? 0,
-    },
+    usage: ccResponseUsage(resp.usage),
   }
 }
 
 // ─── Stream translation: CC SSE chunk → Responses API SSE events ────────────
 export interface CCToResponsesStreamState {
-  outputIndex: number
-  textItemAdded: boolean
-  reasoningSummaryAdded: boolean
-  pendingToolCalls: Map<number, { id: string; name: string }>
-  toolItemsAdded: Set<number>
-  usage: { input_tokens: number; output_tokens: number; total_tokens: number }
+  responseId: string
+  model: string
+  sequenceNumber: number
+  nextOutputIndex: number
+  outputOrder: Array<
+    | { kind: "message"; outputIndex: number }
+    | { kind: "reasoning"; outputIndex: number }
+    | { kind: "tool"; outputIndex: number; toolIndex: number }
+  >
+  messageOutputIndex?: number
+  reasoningOutputIndex?: number
+  pendingToolCalls: Map<number, PendingCCToolCall>
+  toolContracts: Map<string, CCToolContract>
+  usage: ResponsesResponse["usage"]
   accumulatedText: string
   accumulatedReasoningText: string
-  accumulatedToolArgs: Map<number, string>
+  accumulatedRefusal: string
+  sawRefusal: boolean
+  finishReason?: CCFinishReason
+  upstreamId?: string
+  upstreamModel?: string
+  terminalEmitted: boolean
 }
 
-export function createCCToResponsesStreamState(): CCToResponsesStreamState {
+type CCFinishReason = "stop" | "length" | "tool_calls" | "content_filter"
+
+interface CCToolContract {
+  schema: Record<string, unknown>
+  noInput: boolean
+}
+
+interface PendingCCToolCall {
+  outputIndex: number
+  idFragments: Array<string>
+  nameFragments: Array<string>
+  arguments: string
+  sawArguments: boolean
+}
+
+interface CompletedCCToolCall {
+  outputIndex: number
+  id: string
+  name: string
+  arguments: string
+}
+
+interface CCToResponsesStreamOptions {
+  responseId: string
+  model: string
+  tools?: Array<ResponsesTool>
+}
+
+const EMPTY_PARAMETER_SCHEMA = {
+  type: "object",
+  properties: {},
+  required: [],
+  additionalProperties: false,
+} as const
+
+export function createCCToResponsesStreamState(
+  options: CCToResponsesStreamOptions,
+): CCToResponsesStreamState {
   return {
-    outputIndex: 0,
-    textItemAdded: false,
-    reasoningSummaryAdded: false,
+    responseId: options.responseId,
+    model: options.model,
+    sequenceNumber: 0,
+    nextOutputIndex: 0,
+    outputOrder: [],
     pendingToolCalls: new Map(),
-    toolItemsAdded: new Set(),
+    toolContracts: buildCCToolContracts(options.tools),
     usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
     accumulatedText: "",
     accumulatedReasoningText: "",
-    accumulatedToolArgs: new Map(),
+    accumulatedRefusal: "",
+    sawRefusal: false,
+    terminalEmitted: false,
   }
 }
 
@@ -712,326 +901,1051 @@ interface ResponsesSSEEvent {
   data: string
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function invalidCCStream(reason: string): HTTPError {
+  return invalidToolInput("response", reason)
+}
+
+export function invalidCCToResponsesFrame(): HTTPError {
+  return invalidCCStream("upstream stream contained malformed JSON")
+}
+
+function isClosedEmptyObjectSchema(schema: Record<string, unknown>): boolean {
+  const allowed = new Set([
+    "$schema",
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "title",
+    "description",
+    "default",
+    "examples",
+  ])
+  const properties = schema.properties
+  const required = schema.required
+  return (
+    schema.type === "object"
+    && isRecord(properties)
+    && Object.keys(properties).length === 0
+    && (required === undefined
+      || (Array.isArray(required) && required.length === 0))
+    && schema.additionalProperties === false
+    && Object.keys(schema).every((key) => allowed.has(key))
+  )
+}
+
+function addCCToolContract(options: {
+  contracts: Map<string, CCToolContract>
+  name: string
+  omittedParameters: boolean
+  parameters: Record<string, unknown> | undefined
+}): void {
+  const { contracts, name, omittedParameters, parameters } = options
+  if (contracts.has(name))
+    throw invalidCCStream("declared tool names collide after translation")
+  contracts.set(name, {
+    schema:
+      omittedParameters ? { ...EMPTY_PARAMETER_SCHEMA } : (parameters ?? {}),
+    noInput:
+      omittedParameters
+      || (parameters !== undefined && isClosedEmptyObjectSchema(parameters)),
+  })
+}
+
+function buildCCToolContracts(
+  tools: Array<ResponsesTool> | undefined,
+): Map<string, CCToolContract> {
+  const contracts = new Map<string, CCToolContract>()
+  for (const tool of tools ?? []) {
+    if (tool.type === "function" && tool.name) {
+      addCCToolContract({
+        contracts,
+        name: tool.name,
+        parameters: tool.parameters,
+        omittedParameters: tool.parameters === undefined,
+      })
+      continue
+    }
+    if (tool.type === "custom" && tool.name) {
+      addCCToolContract({
+        contracts,
+        name: tool.name,
+        parameters: tool.parameters,
+        omittedParameters: false,
+      })
+      continue
+    }
+    if (tool.type === "local_shell") {
+      const translated = responsesToolToCC(tool)[0]
+      addCCToolContract({
+        contracts,
+        name: translated.function.name,
+        parameters: translated.function.parameters,
+        omittedParameters: false,
+      })
+      continue
+    }
+    if (tool.type !== "namespace") continue
+    const members = Array.isArray(tool.tools) ? tool.tools : []
+    for (const raw of members) {
+      if (!isRecord(raw) || typeof raw.name !== "string") continue
+      const memberName = raw.name
+      const member = raw as ResponsesTool
+      const name = tool.name ? `${tool.name}__${memberName}` : memberName
+      addCCToolContract({
+        contracts,
+        name,
+        parameters: member.parameters,
+        omittedParameters: member.parameters === undefined,
+      })
+    }
+  }
+  return contracts
+}
+
+function nextEvent(
+  streamState: CCToResponsesStreamState,
+  event: string,
+  data: Record<string, unknown>,
+): ResponsesSSEEvent {
+  return {
+    event,
+    data: JSON.stringify({
+      ...data,
+      sequence_number: streamState.sequenceNumber++,
+    }),
+  }
+}
+
+function responseSnapshot(options: {
+  incompleteReason?: string
+  output?: Array<Record<string, unknown>>
+  status: "in_progress" | "completed" | "incomplete"
+  streamState: CCToResponsesStreamState
+}): Record<string, unknown> {
+  const {
+    incompleteReason = "max_output_tokens",
+    output = [],
+    status,
+    streamState,
+  } = options
+  return {
+    id: streamState.responseId,
+    object: "response",
+    model: streamState.model,
+    status,
+    output,
+    ...(status === "incomplete" ?
+      { incomplete_details: { reason: incompleteReason } }
+    : {}),
+    ...(status === "in_progress" ? {} : { usage: streamState.usage }),
+  }
+}
+
+export function createCCToResponsesInitialEvents(
+  streamState: CCToResponsesStreamState,
+): Array<ResponsesSSEEvent> {
+  const response = responseSnapshot({ streamState, status: "in_progress" })
+  return [
+    nextEvent(streamState, "response.created", {
+      type: "response.created",
+      response,
+    }),
+    nextEvent(streamState, "response.in_progress", {
+      type: "response.in_progress",
+      response,
+    }),
+  ]
+}
+
+function tokenCount(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0)
+    throw invalidCCStream(`upstream usage has an invalid ${field}`)
+  return value
+}
+
+function captureCCUsage(
+  value: unknown,
+  streamState: CCToResponsesStreamState,
+): void {
+  if (value === undefined || value === null) return
+  if (!isRecord(value)) throw invalidCCStream("upstream usage is invalid")
+  const promptDetails = value.prompt_tokens_details
+  let cachedTokens: number | undefined
+  if (promptDetails !== undefined && promptDetails !== null) {
+    if (!isRecord(promptDetails))
+      throw invalidCCStream("upstream cached usage is invalid")
+    if (promptDetails.cached_tokens !== undefined)
+      cachedTokens = tokenCount(
+        promptDetails.cached_tokens,
+        "cached token count",
+      )
+  }
+  streamState.usage = {
+    input_tokens: tokenCount(value.prompt_tokens, "input token count"),
+    output_tokens: tokenCount(value.completion_tokens, "output token count"),
+    total_tokens: tokenCount(value.total_tokens, "total token count"),
+    ...(cachedTokens !== undefined ?
+      { input_tokens_details: { cached_tokens: cachedTokens } }
+    : {}),
+  }
+}
+
+function validatedCCChunkIdentity(chunk: Record<string, unknown>): {
+  id: string
+  model: string
+} {
+  if (typeof chunk.id !== "string" || chunk.id.length === 0)
+    throw invalidCCStream("upstream chunk lacks a response id")
+  if (typeof chunk.model !== "string" || chunk.model.length === 0)
+    throw invalidCCStream("upstream chunk lacks a model")
+  if (
+    chunk.object !== undefined
+    && chunk.object !== "chat.completion.chunk"
+    && chunk.object !== "chat.completion"
+  )
+    throw invalidCCStream("upstream chunk has an invalid object type")
+  if (
+    chunk.created !== undefined
+    && (typeof chunk.created !== "number" || !Number.isFinite(chunk.created))
+  )
+    throw invalidCCStream("upstream chunk has an invalid created timestamp")
+  return { id: chunk.id, model: chunk.model }
+}
+
+function captureCCIdentity(
+  chunk: Record<string, unknown>,
+  streamState: CCToResponsesStreamState,
+): void {
+  const { id, model } = validatedCCChunkIdentity(chunk)
+  if (streamState.upstreamId && streamState.upstreamId !== id)
+    throw invalidCCStream("upstream response id changed mid-stream")
+  if (streamState.upstreamModel && streamState.upstreamModel !== model)
+    throw invalidCCStream("upstream model changed mid-stream")
+  streamState.upstreamId ??= id
+  streamState.upstreamModel ??= model
+}
+
+function allocateOutput(
+  streamState: CCToResponsesStreamState,
+  item:
+    | { kind: "message" }
+    | { kind: "reasoning" }
+    | { kind: "tool"; toolIndex: number },
+): number {
+  const outputIndex = streamState.nextOutputIndex++
+  streamState.outputOrder.push({ ...item, outputIndex })
+  return outputIndex
+}
+
+function appendCCString(
+  source: Record<string, unknown>,
+  key: string,
+  append: (value: string) => void,
+): void {
+  const value = source[key]
+  if (value === undefined) return
+  if (typeof value !== "string")
+    throw invalidCCStream(`upstream ${key} delta is invalid`)
+  append(value)
+}
+
+function pendingCCToolCall(
+  index: number,
+  streamState: CCToResponsesStreamState,
+): PendingCCToolCall {
+  const existing = streamState.pendingToolCalls.get(index)
+  if (existing) return existing
+  if (streamState.pendingToolCalls.size >= 128)
+    throw invalidCCStream("upstream returned too many tool calls")
+  const created: PendingCCToolCall = {
+    outputIndex: allocateOutput(streamState, {
+      kind: "tool",
+      toolIndex: index,
+    }),
+    idFragments: [],
+    nameFragments: [],
+    arguments: "",
+    sawArguments: false,
+  }
+  streamState.pendingToolCalls.set(index, created)
+  return created
+}
+
+function captureCCToolCalls(
+  value: unknown,
+  streamState: CCToResponsesStreamState,
+): void {
+  if (value === undefined || value === null) return
+  if (!Array.isArray(value))
+    throw invalidCCStream("upstream tool-call deltas are invalid")
+  for (const raw of value) {
+    if (!isRecord(raw))
+      throw invalidCCStream("upstream tool-call delta is invalid")
+    const index = raw.index
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 0)
+      throw invalidCCStream("upstream tool-call index is invalid")
+    if (raw.type !== undefined && raw.type !== null && raw.type !== "function")
+      throw invalidCCStream("upstream tool-call type is unsupported")
+    const call = pendingCCToolCall(index, streamState)
+    appendCCString(raw, "id", (fragment) => {
+      if (fragment) call.idFragments.push(fragment)
+    })
+    if (raw.function === undefined) continue
+    if (!isRecord(raw.function))
+      throw invalidCCStream("upstream tool function delta is invalid")
+    appendCCString(raw.function, "name", (fragment) => {
+      if (fragment) call.nameFragments.push(fragment)
+    })
+    if (Object.hasOwn(raw.function, "arguments")) {
+      if (typeof raw.function.arguments !== "string")
+        throw invalidCCStream("upstream tool arguments delta is invalid")
+      call.sawArguments = true
+      call.arguments += raw.function.arguments
+    }
+  }
+}
+
+function captureCCText(
+  delta: Record<string, unknown>,
+  streamState: CCToResponsesStreamState,
+): void {
+  if (
+    delta.role !== undefined
+    && delta.role !== null
+    && delta.role !== "assistant"
+  )
+    throw invalidCCStream("upstream assistant role is invalid")
+  if (delta.content !== undefined && delta.content !== null) {
+    if (typeof delta.content !== "string")
+      throw invalidCCStream("upstream content delta is invalid")
+    if (streamState.messageOutputIndex === undefined)
+      streamState.messageOutputIndex = allocateOutput(streamState, {
+        kind: "message",
+      })
+    streamState.accumulatedText += delta.content
+  }
+}
+
+function captureCCReasoning(
+  delta: Record<string, unknown>,
+  streamState: CCToResponsesStreamState,
+): void {
+  const reasoning = delta.reasoning_content ?? delta.reasoning_text
+  if (reasoning !== undefined && reasoning !== null) {
+    if (typeof reasoning !== "string")
+      throw invalidCCStream("upstream reasoning delta is invalid")
+    if (streamState.reasoningOutputIndex === undefined)
+      streamState.reasoningOutputIndex = allocateOutput(streamState, {
+        kind: "reasoning",
+      })
+    streamState.accumulatedReasoningText += reasoning
+  }
+}
+
+function captureCCRefusal(
+  delta: Record<string, unknown>,
+  streamState: CCToResponsesStreamState,
+): void {
+  if (delta.refusal !== undefined && delta.refusal !== null) {
+    if (typeof delta.refusal !== "string")
+      throw invalidCCStream("upstream refusal delta is invalid")
+    streamState.sawRefusal = true
+    if (streamState.messageOutputIndex === undefined)
+      streamState.messageOutputIndex = allocateOutput(streamState, {
+        kind: "message",
+      })
+    streamState.accumulatedRefusal += delta.refusal
+  }
+}
+
+function captureCCFinishReason(
+  value: unknown,
+  streamState: CCToResponsesStreamState,
+): void {
+  if (value === undefined || value === null) return
+  if (
+    value !== "stop"
+    && value !== "length"
+    && value !== "tool_calls"
+    && value !== "content_filter"
+  )
+    throw invalidCCStream("upstream finish reason is invalid")
+  streamState.finishReason = value
+}
+
+function captureCCChoice(
+  choice: unknown,
+  streamState: CCToResponsesStreamState,
+): void {
+  if (!isRecord(choice)) throw invalidCCStream("upstream choice is invalid")
+  if (choice.index !== 0)
+    throw invalidCCStream("upstream choice index is unsupported")
+  if (!isRecord(choice.delta))
+    throw invalidCCStream("upstream choice delta is invalid")
+  if (streamState.finishReason)
+    throw invalidCCStream("upstream sent data after the terminal choice")
+  const delta = choice.delta
+  captureCCText(delta, streamState)
+  captureCCReasoning(delta, streamState)
+  captureCCRefusal(delta, streamState)
+  captureCCToolCalls(delta.tool_calls, streamState)
+  captureCCFinishReason(choice.finish_reason, streamState)
+}
+
 export function translateFromCCStreamToResponsesEvents(
   chunk: Record<string, unknown>,
   streamState: CCToResponsesStreamState,
 ): Array<ResponsesSSEEvent> {
-  // Capture usage from the final chunk (sent when stream_options.include_usage is set)
-  const usage = chunk.usage as Record<string, number> | undefined
-  if (usage) {
-    streamState.usage = {
-      input_tokens: usage.prompt_tokens,
-      output_tokens: usage.completion_tokens,
-      total_tokens: usage.total_tokens,
-    }
-  }
-
-  const choices = chunk.choices as Array<Record<string, unknown>> | undefined
-  if (!choices || choices.length === 0) return []
-
-  const choice = choices[0]
-  const delta = choice.delta as Record<string, unknown> | undefined
-  if (!delta) return []
-
-  const result: Array<ResponsesSSEEvent> = []
-  const responseId = chunk.id as string
-  const model = chunk.model as string
-
-  if (delta.content && typeof delta.content === "string") {
-    handleCCTextDelta(delta.content, streamState, result)
-  }
-
-  const reasoning =
-    (delta.reasoning_content as string | undefined)
-    ?? (delta.reasoning_text as string | undefined)
-  if (reasoning) {
-    handleCCReasoningDelta(reasoning, streamState, result)
-  }
-
-  const toolCalls = delta.tool_calls as
-    | Array<Record<string, unknown>>
-    | undefined
-  if (toolCalls) {
-    handleCCToolCallDeltas(toolCalls, streamState, result)
-  }
-
-  const finishReason = choice.finish_reason as string | null
-  if (finishReason) {
-    handleCCFinishReason(finishReason, responseId, {
-      model,
-      out: result,
-      streamState,
-    })
-  }
-
-  return result
-}
-
-function handleCCTextDelta(
-  content: string,
-  streamState: CCToResponsesStreamState,
-  out: Array<ResponsesSSEEvent>,
-): void {
-  streamState.accumulatedText += content
-  if (!streamState.textItemAdded) {
-    streamState.textItemAdded = true
-    out.push(
-      {
-        event: "response.output_item.added",
-        data: JSON.stringify({
-          type: "response.output_item.added",
-          output_index: streamState.outputIndex,
-          item: {
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "" }],
-          },
-        }),
-      },
-      {
-        event: "response.content_part.added",
-        data: JSON.stringify({
-          type: "response.content_part.added",
-          output_index: streamState.outputIndex,
-          content_index: 0,
-          part: { type: "output_text", text: "" },
-        }),
-      },
+  if (streamState.terminalEmitted)
+    throw invalidCCStream("upstream sent data after response terminal")
+  if (chunk.error !== undefined && chunk.error !== null) {
+    throw new HTTPError(
+      "Upstream chat completion stream failed",
+      Response.json({ error: chunk.error }, { status: 502 }),
     )
   }
-  out.push({
-    event: "response.output_text.delta",
-    data: JSON.stringify({
-      type: "response.output_text.delta",
-      output_index: 0,
-      content_index: 0,
-      delta: content,
-    }),
-  })
+  captureCCIdentity(chunk, streamState)
+  captureCCUsage(chunk.usage, streamState)
+  if (!Array.isArray(chunk.choices))
+    throw invalidCCStream("upstream choices are invalid")
+  if (chunk.choices.length === 0) return []
+  if (chunk.choices.length !== 1)
+    throw invalidCCStream("upstream returned multiple choices")
+  captureCCChoice(chunk.choices[0], streamState)
+  return []
 }
 
-function handleCCReasoningDelta(
-  content: string,
+function resolveCCId(fragments: Array<string>): string | undefined {
+  const values = fragments.filter(Boolean)
+  if (values.length === 0) return undefined
+  const id = values[0]
+  if (values.some((value) => value !== id))
+    throw invalidCCStream("upstream tool-call identity changed")
+  return id
+}
+
+function reachableNamePositions(
+  fragments: Array<string>,
+  candidate: string,
+): ReadonlySet<number> {
+  let positions = new Set([0])
+  for (const fragment of fragments) {
+    const next = new Set<number>()
+    for (const position of positions) {
+      if (candidate.startsWith(fragment, position))
+        next.add(position + fragment.length)
+      if (fragment.length >= position && candidate.startsWith(fragment))
+        next.add(fragment.length)
+    }
+    positions = next
+    if (positions.size === 0) break
+  }
+  return positions
+}
+
+function resolveCCName(
+  fragments: Array<string>,
+  allowed: ReadonlySet<string>,
+): string | undefined {
+  const values = fragments.filter(Boolean)
+  if (values.length === 0) return undefined
+  const reachable = [...allowed].map((candidate) => ({
+    candidate,
+    positions: reachableNamePositions(values, candidate),
+  }))
+  const complete = reachable.filter(({ candidate, positions }) =>
+    positions.has(candidate.length),
+  )
+  if (complete.length === 1) return complete[0].candidate
+  if (complete.length > 1)
+    throw invalidCCStream("upstream tool name is ambiguous")
+  if (reachable.some(({ positions }) => positions.size > 0)) return undefined
+  throw invalidCCStream("upstream tool name changed")
+}
+
+function argumentJsonClass(
+  call: PendingCCToolCall,
+): "absent" | "empty" | "whitespace" | "malformed" | "object" | "non_object" {
+  if (!call.sawArguments) return "absent"
+  if (call.arguments === "") return "empty"
+  if (call.arguments.trim() === "") return "whitespace"
+  try {
+    const parsed: unknown = JSON.parse(call.arguments)
+    return isRecord(parsed) ? "object" : "non_object"
+  } catch {
+    return "malformed"
+  }
+}
+
+function argumentPresence(
+  call: PendingCCToolCall,
+): "absent" | "empty" | "nonempty" {
+  if (!call.sawArguments) return "absent"
+  return call.arguments === "" ? "empty" : "nonempty"
+}
+
+function toolFailureMetadata(options: {
+  call: PendingCCToolCall
+  contract: CCToolContract | undefined
+  idPresent: boolean
+  nameResolved: boolean
+  streamState: CCToResponsesStreamState
+}): Record<string, unknown> {
+  const { call, contract, idPresent, nameResolved, streamState } = options
+  return {
+    finishReason: streamState.finishReason,
+    argumentPresence: argumentPresence(call),
+    argumentJsonClass: argumentJsonClass(call),
+    argumentByteCount: new TextEncoder().encode(call.arguments).byteLength,
+    idPresent,
+    nameResolved,
+    schemaNoInput: contract?.noInput ?? false,
+  }
+}
+
+function resolveCompletedTools(
   streamState: CCToResponsesStreamState,
-  out: Array<ResponsesSSEEvent>,
-): void {
-  streamState.accumulatedReasoningText += content
-  if (!streamState.reasoningSummaryAdded) {
-    streamState.reasoningSummaryAdded = true
-    out.push({
-      event: "response.reasoning_summary_part.added",
-      data: JSON.stringify({
-        type: "response.reasoning_summary_part.added",
-        output_index: streamState.outputIndex,
-        summary_index: 0,
-        part: { type: "summary_text", text: "" },
+): Map<number, CompletedCCToolCall> {
+  const completed = new Map<number, CompletedCCToolCall>()
+  const usedIds = new Set<string>()
+  const allowedNames = new Set(streamState.toolContracts.keys())
+  for (const [index, call] of streamState.pendingToolCalls) {
+    const id = resolveCCId(call.idFragments)
+    const name = resolveCCName(call.nameFragments, allowedNames)
+    const contract = name ? streamState.toolContracts.get(name) : undefined
+    if (!id || !name || !contract) {
+      consola.warn(
+        "[responses→cc] rejected completed tool call",
+        toolFailureMetadata({
+          streamState,
+          call,
+          contract,
+          idPresent: Boolean(id),
+          nameResolved: Boolean(name),
+        }),
+      )
+      throw invalidCCStream("completed tool call lacks a declared identity")
+    }
+    if (usedIds.has(id))
+      throw invalidCCStream("completed tool calls reuse an identity")
+    usedIds.add(id)
+    let args = call.arguments
+    if (contract.noInput && (!call.sawArguments || call.arguments === "")) {
+      consola.warn("[responses→cc] normalized omitted tool arguments", {
+        reason: "completed_declared_no_input",
+        argumentPresence: argumentPresence(call),
+        argumentJsonClass: argumentJsonClass(call),
+        argumentByteCount: 0,
+        idPresent: true,
+        nameResolved: true,
+        schemaNoInput: true,
+      })
+      args = "{}"
+    }
+    try {
+      parseToolInput(args, name, contract.schema)
+    } catch (error) {
+      consola.warn(
+        "[responses→cc] rejected completed tool call",
+        toolFailureMetadata({
+          streamState,
+          call,
+          contract,
+          idPresent: true,
+          nameResolved: true,
+        }),
+      )
+      throw error
+    }
+    completed.set(index, {
+      outputIndex: call.outputIndex,
+      id,
+      name,
+      arguments: args,
+    })
+  }
+  return completed
+}
+
+function messageItem(
+  streamState: CCToResponsesStreamState,
+  status: "completed" | "incomplete",
+): Record<string, unknown> {
+  const content: Array<Record<string, unknown>> = []
+  if (streamState.accumulatedText !== "")
+    content.push({ type: "output_text", text: streamState.accumulatedText })
+  if (streamState.sawRefusal)
+    content.push({ type: "refusal", refusal: streamState.accumulatedRefusal })
+  return {
+    id: `${streamState.responseId}_message`,
+    type: "message",
+    status,
+    role: "assistant",
+    content,
+  }
+}
+
+function reasoningItem(
+  streamState: CCToResponsesStreamState,
+  status: "completed" | "incomplete",
+): Record<string, unknown> {
+  return {
+    id: `${streamState.responseId}_reasoning`,
+    type: "reasoning",
+    status,
+    summary: [
+      { type: "summary_text", text: streamState.accumulatedReasoningText },
+    ],
+  }
+}
+
+function emitMessageEvents(options: {
+  out: Array<ResponsesSSEEvent>
+  outputIndex: number
+  status: "completed" | "incomplete"
+  streamState: CCToResponsesStreamState
+}): Record<string, unknown> {
+  const { out, outputIndex, status, streamState } = options
+  const item = messageItem(streamState, status)
+  const itemId = item.id as string
+  out.push(
+    nextEvent(streamState, "response.output_item.added", {
+      type: "response.output_item.added",
+      response_id: streamState.responseId,
+      output_index: outputIndex,
+      item: { ...item, status: "in_progress", content: [] },
+    }),
+  )
+  let contentIndex = 0
+  for (const part of item.content as Array<Record<string, unknown>>) {
+    const isRefusal = part.type === "refusal"
+    const text = (isRefusal ? part.refusal : part.text) as string
+    const prefix = isRefusal ? "response.refusal" : "response.output_text"
+    out.push(
+      nextEvent(streamState, "response.content_part.added", {
+        type: "response.content_part.added",
+        response_id: streamState.responseId,
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: contentIndex,
+        part:
+          isRefusal ?
+            { type: "refusal", refusal: "" }
+          : { type: "output_text", text: "" },
       }),
-    })
+      nextEvent(streamState, `${prefix}.delta`, {
+        type: `${prefix}.delta`,
+        response_id: streamState.responseId,
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: contentIndex,
+        delta: text,
+      }),
+      nextEvent(streamState, `${prefix}.done`, {
+        type: `${prefix}.done`,
+        response_id: streamState.responseId,
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: contentIndex,
+        [isRefusal ? "refusal" : "text"]: text,
+      }),
+      nextEvent(streamState, "response.content_part.done", {
+        type: "response.content_part.done",
+        response_id: streamState.responseId,
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: contentIndex,
+        part,
+      }),
+    )
+    contentIndex += 1
   }
-  out.push({
-    event: "response.reasoning_summary_text.delta",
-    data: JSON.stringify({
-      type: "response.reasoning_summary_text.delta",
-      output_index: streamState.outputIndex,
+  out.push(
+    nextEvent(streamState, "response.output_item.done", {
+      type: "response.output_item.done",
+      response_id: streamState.responseId,
+      output_index: outputIndex,
+      item,
+    }),
+  )
+  return item
+}
+
+function emitReasoningEvents(options: {
+  out: Array<ResponsesSSEEvent>
+  outputIndex: number
+  status: "completed" | "incomplete"
+  streamState: CCToResponsesStreamState
+}): Record<string, unknown> {
+  const { out, outputIndex, status, streamState } = options
+  const item = reasoningItem(streamState, status)
+  const itemId = item.id as string
+  const text = streamState.accumulatedReasoningText
+  out.push(
+    nextEvent(streamState, "response.output_item.added", {
+      type: "response.output_item.added",
+      response_id: streamState.responseId,
+      output_index: outputIndex,
+      item: { ...item, status: "in_progress", summary: [] },
+    }),
+    nextEvent(streamState, "response.reasoning_summary_part.added", {
+      type: "response.reasoning_summary_part.added",
+      response_id: streamState.responseId,
+      item_id: itemId,
+      output_index: outputIndex,
       summary_index: 0,
-      delta: content,
+      part: { type: "summary_text", text: "" },
     }),
-  })
+    nextEvent(streamState, "response.reasoning_summary_text.delta", {
+      type: "response.reasoning_summary_text.delta",
+      response_id: streamState.responseId,
+      item_id: itemId,
+      output_index: outputIndex,
+      summary_index: 0,
+      delta: text,
+    }),
+    nextEvent(streamState, "response.reasoning_summary_text.done", {
+      type: "response.reasoning_summary_text.done",
+      response_id: streamState.responseId,
+      item_id: itemId,
+      output_index: outputIndex,
+      summary_index: 0,
+      text,
+    }),
+    nextEvent(streamState, "response.reasoning_summary_part.done", {
+      type: "response.reasoning_summary_part.done",
+      response_id: streamState.responseId,
+      item_id: itemId,
+      output_index: outputIndex,
+      summary_index: 0,
+      part: { type: "summary_text", text },
+    }),
+    nextEvent(streamState, "response.output_item.done", {
+      type: "response.output_item.done",
+      response_id: streamState.responseId,
+      output_index: outputIndex,
+      item,
+    }),
+  )
+  return item
 }
 
-function getToolOutputIndex(
-  tcIndex: number,
+function emitCompletedToolEvents(
   streamState: CCToResponsesStreamState,
-): number {
-  return streamState.textItemAdded ?
-      streamState.outputIndex + 1 + tcIndex
-    : streamState.outputIndex + tcIndex
-}
-
-function handleCCToolCallDeltas(
-  toolCalls: Array<Record<string, unknown>>,
-  streamState: CCToResponsesStreamState,
+  tool: CompletedCCToolCall,
   out: Array<ResponsesSSEEvent>,
+): Record<string, unknown> {
+  const item = {
+    id: tool.id,
+    type: "function_call",
+    status: "completed",
+    call_id: tool.id,
+    name: tool.name,
+    arguments: tool.arguments,
+  }
+  out.push(
+    nextEvent(streamState, "response.output_item.added", {
+      type: "response.output_item.added",
+      response_id: streamState.responseId,
+      output_index: tool.outputIndex,
+      item: { ...item, status: "in_progress", arguments: "" },
+    }),
+    nextEvent(streamState, "response.function_call_arguments.delta", {
+      type: "response.function_call_arguments.delta",
+      response_id: streamState.responseId,
+      item_id: tool.id,
+      output_index: tool.outputIndex,
+      delta: tool.arguments,
+    }),
+    nextEvent(streamState, "response.function_call_arguments.done", {
+      type: "response.function_call_arguments.done",
+      response_id: streamState.responseId,
+      item_id: tool.id,
+      output_index: tool.outputIndex,
+      call_id: tool.id,
+      name: tool.name,
+      arguments: tool.arguments,
+    }),
+    nextEvent(streamState, "response.output_item.done", {
+      type: "response.output_item.done",
+      response_id: streamState.responseId,
+      output_index: tool.outputIndex,
+      item,
+    }),
+  )
+  return item
+}
+
+function partialToolItem(
+  index: number,
+  streamState: CCToResponsesStreamState,
+): Record<string, unknown> | undefined {
+  const call = streamState.pendingToolCalls.get(index)
+  if (!call) return undefined
+  const id = resolveCCId(call.idFragments)
+  const name = resolveCCName(
+    call.nameFragments,
+    new Set(streamState.toolContracts.keys()),
+  )
+  if (!id || !name) return undefined
+  return {
+    id,
+    type: "function_call",
+    status: "incomplete",
+    call_id: id,
+    name,
+    arguments: call.arguments,
+  }
+}
+
+function emitPartialToolEvents(options: {
+  item: Record<string, unknown>
+  out: Array<ResponsesSSEEvent>
+  outputIndex: number
+  streamState: CCToResponsesStreamState
+}): void {
+  const { item, out, outputIndex, streamState } = options
+  out.push(
+    nextEvent(streamState, "response.output_item.added", {
+      type: "response.output_item.added",
+      response_id: streamState.responseId,
+      output_index: outputIndex,
+      item: { ...item, status: "in_progress", arguments: "" },
+    }),
+  )
+  if (item.arguments !== "")
+    out.push(
+      nextEvent(streamState, "response.function_call_arguments.delta", {
+        type: "response.function_call_arguments.delta",
+        response_id: streamState.responseId,
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: item.arguments,
+      }),
+    )
+}
+
+function validateCCFinish(
+  finishReason: CCToResponsesStreamState["finishReason"],
+  completedTools: Map<number, CompletedCCToolCall>,
+  interrupted: boolean,
 ): void {
-  for (const tc of toolCalls) {
-    const index = (tc.index as number | undefined) ?? 0
-    const fn = tc.function as Record<string, unknown> | undefined
+  if (
+    !interrupted
+    && ((finishReason === "tool_calls" && completedTools.size === 0)
+      || (finishReason === "stop" && completedTools.size > 0))
+  )
+    throw invalidCCStream("finish reason conflicts with tool-call output")
+}
 
-    if (tc.id && fn?.name) {
-      streamState.pendingToolCalls.set(index, {
-        id: tc.id as string,
-        name: fn.name as string,
-      })
+function emitBufferedCCOutput(options: {
+  completedTools: Map<number, CompletedCCToolCall>
+  filtered: boolean
+  incomplete: boolean
+  refused: boolean
+  status: "completed" | "incomplete"
+  streamState: CCToResponsesStreamState
+}): {
+  events: Array<ResponsesSSEEvent>
+  output: Array<Record<string, unknown>>
+} {
+  const { completedTools, filtered, incomplete, refused, status, streamState } =
+    options
+  const events: Array<ResponsesSSEEvent> = []
+  const output: Array<Record<string, unknown>> = []
+  let finalOutputIndex = 0
+  for (const slot of streamState.outputOrder) {
+    if (slot.kind === "message") {
+      output.push(
+        emitMessageEvents({
+          streamState,
+          outputIndex: finalOutputIndex++,
+          status,
+          out: events,
+        }),
+      )
+      continue
     }
-
-    if (
-      !streamState.toolItemsAdded.has(index)
-      && streamState.pendingToolCalls.has(index)
-    ) {
-      streamState.toolItemsAdded.add(index)
-      const info = streamState.pendingToolCalls.get(index)
-      if (info) {
-        out.push({
-          event: "response.output_item.added",
-          data: JSON.stringify({
-            type: "response.output_item.added",
-            output_index: getToolOutputIndex(index, streamState),
-            item: {
-              type: "function_call",
-              call_id: info.id,
-              name: info.name,
-              arguments: "",
-            },
-          }),
+    if (slot.kind === "reasoning") {
+      output.push(
+        emitReasoningEvents({
+          streamState,
+          outputIndex: finalOutputIndex++,
+          status,
+          out: events,
+        }),
+      )
+      continue
+    }
+    if (refused || filtered) continue
+    if (incomplete) {
+      const partial = partialToolItem(slot.toolIndex, streamState)
+      if (partial) {
+        emitPartialToolEvents({
+          streamState,
+          outputIndex: finalOutputIndex++,
+          item: partial,
+          out: events,
         })
+        output.push(partial)
       }
+      continue
     }
-
-    if (fn?.arguments && typeof fn.arguments === "string") {
-      const prev = streamState.accumulatedToolArgs.get(index) ?? ""
-      streamState.accumulatedToolArgs.set(index, prev + fn.arguments)
-      out.push({
-        event: "response.function_call_arguments.delta",
-        data: JSON.stringify({
-          type: "response.function_call_arguments.delta",
-          output_index: getToolOutputIndex(index, streamState),
-          delta: fn.arguments,
-        }),
-      })
-    }
-  }
-}
-
-function handleCCFinishReason(
-  finishReason: string,
-  responseId: string,
-  {
-    model,
-    out,
-    streamState,
-  }: {
-    model: string
-    out: Array<ResponsesSSEEvent>
-    streamState: CCToResponsesStreamState
-  },
-): void {
-  if (finishReason === "length" && streamState.pendingToolCalls.size > 0) {
-    handleCCTextDelta(
-      "\n\n[Tool call was truncated due to output token limit. Please retry with a higher max_output_tokens.]",
-      streamState,
-      out,
+    const tool = completedTools.get(slot.toolIndex)
+    if (!tool) throw invalidCCStream("completed tool call was lost")
+    output.push(
+      emitCompletedToolEvents(
+        streamState,
+        { ...tool, outputIndex: finalOutputIndex++ },
+        events,
+      ),
     )
   }
-
-  emitDoneEvents(streamState, out)
-
-  const status = finishReason === "length" ? "incomplete" : "completed"
-  out.push({
-    event: "response.completed",
-    data: JSON.stringify({
-      type: "response.completed",
-      response: {
-        id: responseId,
-        object: "response",
-        model,
-        status,
-        output: [],
-        usage: streamState.usage,
-      },
-    }),
-  })
+  return { events, output }
 }
 
-function emitDoneEvents(
+export function finalizeCCToResponsesStream(
   streamState: CCToResponsesStreamState,
-  out: Array<ResponsesSSEEvent>,
-): void {
-  if (streamState.reasoningSummaryAdded) {
-    out.push(
-      {
-        event: "response.reasoning_summary_text.done",
-        data: JSON.stringify({
-          type: "response.reasoning_summary_text.done",
-          output_index: streamState.outputIndex,
-          summary_index: 0,
-          text: streamState.accumulatedReasoningText,
-        }),
-      },
-      {
-        event: "response.reasoning_summary_part.done",
-        data: JSON.stringify({
-          type: "response.reasoning_summary_part.done",
-          output_index: streamState.outputIndex,
-          summary_index: 0,
-          part: {
-            type: "summary_text",
-            text: streamState.accumulatedReasoningText,
-          },
-        }),
-      },
-    )
-  }
+): Array<ResponsesSSEEvent> {
+  if (streamState.terminalEmitted)
+    throw invalidCCStream("upstream response terminal was repeated")
+  const finishReason = streamState.finishReason
+  if (!finishReason)
+    throw invalidCCStream("upstream stream ended without a finish reason")
+  const refused = streamState.sawRefusal
+  const incomplete = finishReason === "length" && !refused
+  const filtered = finishReason === "content_filter" && !refused
+  const completedTools =
+    !incomplete && !filtered && !refused ?
+      resolveCompletedTools(streamState)
+    : new Map<number, CompletedCCToolCall>()
+  validateCCFinish(
+    finishReason,
+    completedTools,
+    refused || incomplete || filtered,
+  )
+  const status = incomplete || filtered ? "incomplete" : "completed"
+  const { events, output } = emitBufferedCCOutput({
+    completedTools,
+    filtered,
+    incomplete,
+    refused,
+    status,
+    streamState,
+  })
+  const terminalType =
+    status === "incomplete" ? "response.incomplete" : "response.completed"
+  events.push(
+    nextEvent(streamState, terminalType, {
+      type: terminalType,
+      response: responseSnapshot({
+        streamState,
+        status,
+        output,
+        incompleteReason: filtered ? "content_filter" : "max_output_tokens",
+      }),
+    }),
+  )
+  streamState.terminalEmitted = true
+  return events
+}
 
-  if (streamState.textItemAdded) {
-    out.push(
-      {
-        event: "response.content_part.done",
-        data: JSON.stringify({
-          type: "response.content_part.done",
-          output_index: streamState.outputIndex,
-          content_index: 0,
-          part: { type: "output_text", text: streamState.accumulatedText },
-        }),
-      },
-      {
-        event: "response.output_item.done",
-        data: JSON.stringify({
-          type: "response.output_item.done",
-          output_index: streamState.outputIndex,
-          item: {
-            type: "message",
-            role: "assistant",
-            content: [
-              { type: "output_text", text: streamState.accumulatedText },
-            ],
-          },
-        }),
-      },
-    )
+export function ccToResponsesFailureMetadata(error: unknown): {
+  kind: "protocol" | "transport" | "upstream_http" | "unexpected"
+  reason:
+    | "abort"
+    | "failure"
+    | "invalid_output"
+    | "size_limit"
+    | "timeout"
+    | "upstream_error"
+  status: number | null
+} {
+  if (error instanceof HTTPError) {
+    return {
+      kind:
+        error.message.startsWith("Invalid upstream tool call") ?
+          "protocol"
+        : "upstream_http",
+      reason:
+        error.message.startsWith("Invalid upstream tool call") ?
+          "invalid_output"
+        : "upstream_error",
+      status: error.response.status,
+    }
   }
-
-  for (const index of streamState.toolItemsAdded) {
-    const info = streamState.pendingToolCalls.get(index)
-    if (!info) continue
-    const args = streamState.accumulatedToolArgs.get(index) ?? ""
-    parseToolInput(args, info.name)
-
-    out.push(
-      {
-        event: "response.function_call_arguments.done",
-        data: JSON.stringify({
-          type: "response.function_call_arguments.done",
-          output_index: getToolOutputIndex(index, streamState),
-          call_id: info.id,
-          name: info.name,
-          arguments: args,
-        }),
-      },
-      {
-        event: "response.output_item.done",
-        data: JSON.stringify({
-          type: "response.output_item.done",
-          output_index: getToolOutputIndex(index, streamState),
-          item: {
-            type: "function_call",
-            call_id: info.id,
-            name: info.name,
-            arguments: args,
-          },
-        }),
-      },
-    )
+  if (error instanceof Error) {
+    if (error.name === "TimeoutError")
+      return { kind: "transport", reason: "timeout", status: null }
+    if (error.name === "AbortError")
+      return { kind: "transport", reason: "abort", status: null }
+    if (error.name === "UpstreamEventStreamLimitError")
+      return { kind: "transport", reason: "size_limit", status: null }
+    return { kind: "transport", reason: "failure", status: null }
   }
+  return { kind: "unexpected", reason: "failure", status: null }
+}
+
+async function ccFailureDetails(
+  error: unknown,
+): Promise<{ code: string; message: string }> {
+  if (error instanceof HTTPError) {
+    let body: unknown
+    let fallback = error.message
+    try {
+      fallback = await error.response.clone().text()
+      body = JSON.parse(fallback) as unknown
+    } catch {
+      body = null
+    }
+    const message = extractUpstreamErrorMessage(
+      body,
+      fallback,
+      error.response.headers.get("content-type"),
+    )
+    const details =
+      isRecord(body) && isRecord(body.error) ? body.error : undefined
+    let code = "upstream_error"
+    if (typeof details?.code === "string") code = details.code
+    else if (error.message.startsWith("Invalid upstream tool call"))
+      code = "invalid_tool_call"
+    return { code, message }
+  }
+  const message = error instanceof Error ? error.message : ""
+  if (isContextWindowError(message))
+    return { code: "context_length_exceeded", message }
+  return {
+    code: "stream_error",
+    message: "The upstream Chat completion stream failed before completion.",
+  }
+}
+
+export async function createCCToResponsesFailedEvent(
+  streamState: CCToResponsesStreamState,
+  error: unknown,
+): Promise<ResponsesSSEEvent> {
+  if (streamState.terminalEmitted)
+    throw invalidCCStream("upstream response terminal was repeated")
+  streamState.terminalEmitted = true
+  const details = await ccFailureDetails(error)
+  return nextEvent(streamState, "response.failed", {
+    type: "response.failed",
+    response: {
+      id: streamState.responseId,
+      object: "response",
+      model: streamState.model,
+      status: "failed",
+      output: [],
+      error: details,
+      usage: streamState.usage,
+      metadata: {},
+    },
+  })
 }
 
 function validateBufferedResponse(resp: ResponsesResponse): void {

@@ -34,10 +34,17 @@ import {
   translateFromResponsesPayloadToCC,
   translateFromCCToResponsesResponse,
   translateFromCCStreamToResponsesEvents,
+  ccToResponsesFailureMetadata,
+  createCCToResponsesInitialEvents,
+  createCCToResponsesFailedEvent,
   createCCToResponsesStreamState,
+  finalizeCCToResponsesStream,
+  invalidCCToResponsesFrame,
 } from "~/services/copilot/responses-translation"
 
 const MAX_IMAGE_SEARCH_DEPTH = 12
+const RESPONSES_CC_STREAM_MAX_BYTES = 32 * 1024 * 1024
+const RESPONSES_CC_KEEPALIVE_MS = 10_000
 const IMAGE_REMOVED_PLACEHOLDER =
   "[Image removed by proxy after Copilot rejected the request body]"
 const imageRejectedWindowKeys = new Set<string>()
@@ -483,53 +490,55 @@ function sendResponsesContextWindowError(
 async function handleViaCC(c: Context, payload: ResponsesPayload) {
   const ccPayload = translateFromResponsesPayloadToCC(payload)
   const isStreaming = payload.stream === true
+  const responsesId = `resp_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
+  const streamState =
+    isStreaming ?
+      createCCToResponsesStreamState({
+        responseId: responsesId,
+        model: payload.model,
+        tools: payload.tools,
+      })
+    : undefined
 
   consola.debug(
     `[responses→cc] Routing ${payload.model} through /chat/completions`,
   )
 
-  const result = await createChatCompletions(ccPayload)
+  const result = await createChatCompletions(ccPayload, "not_applicable", {
+    streamMaxBytes: isStreaming ? RESPONSES_CC_STREAM_MAX_BYTES : undefined,
+  })
 
-  if (isStreaming && Symbol.asyncIterator in Object(result)) {
-    const streamState = createCCToResponsesStreamState()
-    const responsesId = `resp_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
-
+  if (isStreaming && streamState && Symbol.asyncIterator in Object(result)) {
     return streamSSE(c, async (stream) => {
-      const responseStub = {
-        id: responsesId,
-        object: "response",
-        model: payload.model,
-        status: "in_progress",
-        output: [],
-      }
-      await stream.writeSSE({
-        event: "response.created",
-        data: JSON.stringify({
-          type: "response.created",
-          response: responseStub,
-        }),
-      })
-      await stream.writeSSE({
-        event: "response.in_progress",
-        data: JSON.stringify({
-          type: "response.in_progress",
-          response: responseStub,
-        }),
-      })
-
+      const keepalive = setInterval(() => {
+        void stream.write(": keepalive\n\n").catch(() => {
+          clearInterval(keepalive)
+        })
+      }, RESPONSES_CC_KEEPALIVE_MS)
       try {
+        for (const event of createCCToResponsesInitialEvents(streamState))
+          await stream.writeSSE(event)
+        let finalized = false
         for await (const event of result as AsyncIterable<{
           data?: string
           event?: string
         }>) {
           const data = event.data ?? (event as Record<string, unknown>).data
-          if (!data || data === "[DONE]") continue
+          if (!data) continue
+          if (data === "[DONE]") {
+            for (const responseEvent of finalizeCCToResponsesStream(
+              streamState,
+            ))
+              await stream.writeSSE(responseEvent)
+            finalized = true
+            break
+          }
 
           let parsed: Record<string, unknown>
           try {
             parsed = JSON.parse(data as string) as Record<string, unknown>
           } catch {
-            continue
+            throw invalidCCToResponsesFrame()
           }
 
           const responsesEvents = translateFromCCStreamToResponsesEvents(
@@ -540,49 +549,30 @@ async function handleViaCC(c: Context, payload: ResponsesPayload) {
             await stream.writeSSE({ event: evt.event, data: evt.data })
           }
         }
+        if (!finalized)
+          for (const event of finalizeCCToResponsesStream(streamState))
+            await stream.writeSSE(event)
       } catch (error) {
         if (requestSignal()?.aborted) return
-        // Once `streamSSE` has begun, headers are already 200 and the route's
-        // try/catch can no longer produce an HTTP error response.  Without a
-        // terminal event here the socket simply closes, and the Codex SSE
-        // parser sees a truncated stream with no resolution.
-        //
-        // `response.failed` is the only channel Codex reads for a fatal
-        // mid-stream error (codex-rs/codex-api/src/sse/responses.rs), and it
-        // keys off `response.error.code`: `context_length_exceeded` maps to
-        // `ApiError::ContextWindowExceeded`, which is what drives compaction.
-        const message = error instanceof Error ? error.message : String(error)
-        consola.error("[responses→cc] stream failed mid-flight:", error)
-
-        const failedEvent =
-          isContextWindowError(message) ?
-            buildResponsesContextWindowFailedEvent(message)
-          : {
-              type: "response.failed" as const,
-              response: {
-                id: responsesId,
-                object: "response",
-                status: "failed",
-                error: { code: "stream_error", message },
-                usage: null,
-                metadata: {},
-              },
-            }
-
-        await stream.writeSSE({
-          event: "response.failed",
-          data: JSON.stringify(failedEvent),
-        })
+        consola.error(
+          "[responses→cc] stream failed mid-flight",
+          ccToResponsesFailureMetadata(error),
+        )
+        await stream.writeSSE(
+          await createCCToResponsesFailedEvent(streamState, error),
+        )
+      } finally {
+        clearInterval(keepalive)
       }
       await stream.writeSSE({ data: "[DONE]" })
     })
   }
 
   // Non-streaming
-  const responsesId = `resp_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
   const responsesResponse = translateFromCCToResponsesResponse(
     result as import("~/services/copilot/create-chat-completions").ChatCompletionResponse,
     responsesId,
+    payload.tools,
   )
   return c.json(responsesResponse)
 }

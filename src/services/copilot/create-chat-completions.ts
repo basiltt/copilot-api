@@ -364,11 +364,20 @@ export const createResponsesCompletion = async (
   }
 }
 
+interface CreateChatCompletionOptions {
+  nativeRejectionReasons?: Array<NativeMessagesRejectionReason>
+  streamMaxBytes?: number
+}
+
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
   nativeRouting: FinalUpstreamRequestShape["nativeRouting"] = "not_applicable",
-  nativeRejectionReasons?: Array<NativeMessagesRejectionReason>,
+  options:
+    | Array<NativeMessagesRejectionReason>
+    | CreateChatCompletionOptions = {},
 ) => {
+  const { nativeRejectionReasons, streamMaxBytes } =
+    Array.isArray(options) ? { nativeRejectionReasons: options } : options
   const headers = buildRequestHeaders(payload)
 
   const inactivity = createInactivityAbort()
@@ -434,7 +443,7 @@ export const createChatCompletions = async (
     // Wrap the events iterator to reset the inactivity timer on each chunk
     // and clean up when the stream ends.  This ensures a slow-but-active
     // stream (e.g. a large Write tool call) is never killed prematurely.
-    const upstream = responseEvents(response, inactivity.signal)
+    const upstream = responseEvents(response, inactivity.signal, streamMaxBytes)
 
     async function* withInactivityReset() {
       try {
