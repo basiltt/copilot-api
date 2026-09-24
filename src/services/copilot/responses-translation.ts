@@ -47,7 +47,7 @@ export interface ResponsesTool {
   type: string
   name?: string
   description?: string
-  parameters?: Record<string, unknown>
+  parameters?: Record<string, unknown> | null
   strict?: boolean
   [key: string]: unknown
 }
@@ -645,19 +645,23 @@ function translateResponsesContentToCC(
 type CCResponseChoice = ChatCompletionResponse["choices"][number]
 
 function ccResponseStatus(choice: CCResponseChoice): {
+  filtered: boolean
   incomplete: boolean
   refused: boolean
   status: "completed" | "incomplete"
+  truncated: boolean
 } {
   const refused =
     choice.message.refusal !== undefined && choice.message.refusal !== null
-  const incomplete =
-    choice.finish_reason === "length"
-    || (choice.finish_reason === "content_filter" && !refused)
+  const truncated = choice.finish_reason === "length" && !refused
+  const filtered = choice.finish_reason === "content_filter" && !refused
+  const incomplete = truncated || filtered
   return {
+    filtered,
     incomplete,
     refused,
     status: incomplete ? "incomplete" : "completed",
+    truncated,
   }
 }
 
@@ -694,67 +698,174 @@ function ccResponseMessageOutput(options: {
   return output
 }
 
-function normalizeBufferedCCArguments(
-  toolCall: ToolCall,
-  contract: CCToolContract | undefined,
-): string {
-  let argumentsJson = toolCall.function.arguments
-  if (contract?.noInput && argumentsJson === "") {
+function normalizeBufferedCCArguments(options: {
+  argumentsJson: string
+  contract: CCToolContract
+  id: string
+  name: string
+  sawArguments: boolean
+}): string {
+  const { contract, id, name, sawArguments } = options
+  let { argumentsJson } = options
+  if (contract.noInput && (!sawArguments || argumentsJson === "")) {
+    const argumentPresence = sawArguments ? "empty" : "absent"
     consola.warn("[responses→cc] normalized omitted tool arguments", {
       reason: "completed_declared_no_input",
-      argumentPresence: "empty",
-      argumentJsonClass: "empty",
+      argumentPresence,
+      argumentJsonClass: argumentPresence,
       argumentByteCount: 0,
-      idPresent: toolCall.id.length > 0,
+      idPresent: id.length > 0,
       nameResolved: true,
       schemaNoInput: true,
     })
     argumentsJson = "{}"
   }
-  parseToolInput(argumentsJson, toolCall.function.name, contract?.schema)
+  parseToolInput(argumentsJson, name, contract.schema)
   return argumentsJson
+}
+
+function validateBufferedCCChoice(
+  value: unknown,
+): asserts value is CCResponseChoice {
+  if (!isRecord(value))
+    throw invalidToolInput("response", "upstream choice is invalid")
+  if (value.index !== 0)
+    throw invalidToolInput("response", "upstream choice index is invalid")
+  if (!isRecord(value.message) || value.message.role !== "assistant")
+    throw invalidToolInput("response", "upstream assistant message is invalid")
+  for (const field of [
+    "content",
+    "refusal",
+    "reasoning_content",
+    "reasoning_text",
+  ]) {
+    const fieldValue = value.message[field]
+    if (
+      fieldValue !== undefined
+      && fieldValue !== null
+      && typeof fieldValue !== "string"
+    )
+      throw invalidToolInput(
+        "response",
+        `upstream assistant ${field} is invalid`,
+      )
+  }
+  if (
+    value.finish_reason !== "stop"
+    && value.finish_reason !== "length"
+    && value.finish_reason !== "tool_calls"
+    && value.finish_reason !== "content_filter"
+  )
+    throw invalidToolInput("response", "upstream finish reason is invalid")
+}
+
+function bufferedCCToolCall(
+  value: unknown,
+  allowIncompleteIdentity: boolean,
+):
+  | {
+      argumentsJson: string
+      id: string
+      name: string
+      sawArguments: boolean
+    }
+  | undefined {
+  if (!isRecord(value))
+    throw invalidToolInput("response", "upstream tool call is invalid")
+  if (value.type !== "function")
+    throw invalidToolInput("response", "upstream tool call type is invalid")
+  if (!isRecord(value.function))
+    throw invalidToolInput("response", "upstream tool function is invalid")
+  const sawArguments = Object.hasOwn(value.function, "arguments")
+  const argumentsValue = value.function.arguments
+  if (sawArguments && typeof argumentsValue !== "string")
+    throw invalidToolInput(
+      typeof value.function.name === "string" ?
+        value.function.name
+      : "response",
+      "tool arguments are not a JSON string",
+    )
+  if (value.id === undefined || value.id === "") {
+    if (allowIncompleteIdentity) return undefined
+    throw invalidToolInput("response", "upstream tool call lacks an id")
+  }
+  if (typeof value.id !== "string")
+    throw invalidToolInput("response", "upstream tool call id is invalid")
+  if (value.function.name === undefined || value.function.name === "") {
+    if (allowIncompleteIdentity) return undefined
+    throw invalidToolInput("response", "upstream tool call lacks a name")
+  }
+  if (typeof value.function.name !== "string")
+    throw invalidToolInput("response", "upstream tool call name is invalid")
+  return {
+    argumentsJson: sawArguments ? (argumentsValue as string) : "",
+    id: value.id,
+    name: value.function.name,
+    sawArguments,
+  }
 }
 
 function ccResponseToolOutput(options: {
   choice: CCResponseChoice
-  incomplete: boolean
+  filtered: boolean
   refused: boolean
   status: "completed" | "incomplete"
   tools: Array<ResponsesTool> | undefined
+  truncated: boolean
 }): Array<ResponsesFunctionCall> {
-  const { choice, incomplete, refused, status, tools } = options
-  if (!choice.message.tool_calls || refused) return []
+  const { choice, filtered, refused, status, tools, truncated } = options
+  if (refused || filtered) return []
+  const rawCalls = (choice.message as unknown as Record<string, unknown>)
+    .tool_calls
+  if (rawCalls === undefined || rawCalls === null) return []
+  if (!Array.isArray(rawCalls))
+    throw invalidToolInput("response", "upstream tool calls are invalid")
   const contracts = buildCCToolContracts(tools)
-  return choice.message.tool_calls.map((toolCall) => {
-    const contract = contracts.get(toolCall.function.name)
+  const usedIds = new Set<string>()
+  const output: Array<ResponsesFunctionCall> = []
+  for (const rawCall of rawCalls) {
+    const toolCall = bufferedCCToolCall(rawCall, truncated)
+    if (!toolCall) continue
+    if (usedIds.has(toolCall.id))
+      throw invalidToolInput("response", "upstream tool calls reuse an id")
+    usedIds.add(toolCall.id)
+    const contract = contracts.get(toolCall.name)
     if (!contract)
       throw invalidToolInput(
-        toolCall.function.name,
+        toolCall.name,
         "tool name is not declared by the request",
       )
     const argumentsJson =
-      incomplete ?
-        toolCall.function.arguments
-      : normalizeBufferedCCArguments(toolCall, contract)
-    return {
+      truncated ?
+        toolCall.argumentsJson
+      : normalizeBufferedCCArguments({ ...toolCall, contract })
+    output.push({
       id: toolCall.id,
       type: "function_call",
       status,
       call_id: toolCall.id,
-      name: toolCall.function.name,
+      name: toolCall.name,
       arguments: argumentsJson,
-    }
-  })
+    })
+  }
+  return output
 }
 
 function ccResponseUsage(
   usage: ChatCompletionResponse["usage"],
 ): ResponsesResponse["usage"] {
-  const cachedTokens = usage?.prompt_tokens_details?.cached_tokens
+  const cachedValue: unknown = usage?.prompt_tokens_details?.cached_tokens
+  const cachedTokens =
+    cachedValue === undefined || cachedValue === null ?
+      undefined
+    : tokenCount(cachedValue, "cached token count")
   return {
-    input_tokens: usage?.prompt_tokens ?? 0,
-    output_tokens: usage?.completion_tokens ?? 0,
-    total_tokens: usage?.total_tokens ?? 0,
+    input_tokens: tokenCount(usage?.prompt_tokens ?? 0, "input token count"),
+    output_tokens: tokenCount(
+      usage?.completion_tokens ?? 0,
+      "output token count",
+    ),
+    total_tokens: tokenCount(usage?.total_tokens ?? 0, "total token count"),
     ...(cachedTokens !== undefined ?
       { input_tokens_details: { cached_tokens: cachedTokens } }
     : {}),
@@ -773,15 +884,18 @@ export function translateFromCCToResponsesResponse(
       "upstream returned an invalid choice count",
     )
   const choice = resp.choices[0]
+  validateBufferedCCChoice(choice)
 
-  const { incomplete, refused, status } = ccResponseStatus(choice)
+  const { filtered, incomplete, refused, status, truncated } =
+    ccResponseStatus(choice)
   const output = ccResponseMessageOutput({ choice, id, status, refused })
   const validatedCalls = ccResponseToolOutput({
     choice,
     tools,
     status,
-    incomplete,
+    filtered,
     refused,
+    truncated,
   })
   if (
     !incomplete
@@ -844,7 +958,7 @@ export interface CCToResponsesStreamState {
 type CCFinishReason = "stop" | "length" | "tool_calls" | "content_filter"
 
 interface CCToolContract {
-  schema: Record<string, unknown>
+  schema?: Record<string, unknown>
   noInput: boolean
 }
 
@@ -942,17 +1056,19 @@ function addCCToolContract(options: {
   contracts: Map<string, CCToolContract>
   name: string
   omittedParameters: boolean
-  parameters: Record<string, unknown> | undefined
+  parameters: Record<string, unknown> | null | undefined
 }): void {
   const { contracts, name, omittedParameters, parameters } = options
   if (contracts.has(name))
     throw invalidCCStream("declared tool names collide after translation")
   contracts.set(name, {
     schema:
-      omittedParameters ? { ...EMPTY_PARAMETER_SCHEMA } : (parameters ?? {}),
+      omittedParameters ?
+        { ...EMPTY_PARAMETER_SCHEMA }
+      : (parameters ?? undefined),
     noInput:
       omittedParameters
-      || (parameters !== undefined && isClosedEmptyObjectSchema(parameters)),
+      || (isRecord(parameters) && isClosedEmptyObjectSchema(parameters)),
   })
 }
 
@@ -1000,7 +1116,8 @@ function buildCCToolContracts(
         contracts,
         name,
         parameters: member.parameters,
-        omittedParameters: member.parameters === undefined,
+        omittedParameters:
+          member.type === "function" && member.parameters === undefined,
       })
     }
   }
@@ -1063,7 +1180,7 @@ export function createCCToResponsesInitialEvents(
 }
 
 function tokenCount(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0)
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
     throw invalidCCStream(`upstream usage has an invalid ${field}`)
   return value
 }
@@ -1079,7 +1196,10 @@ function captureCCUsage(
   if (promptDetails !== undefined && promptDetails !== null) {
     if (!isRecord(promptDetails))
       throw invalidCCStream("upstream cached usage is invalid")
-    if (promptDetails.cached_tokens !== undefined)
+    if (
+      promptDetails.cached_tokens !== undefined
+      && promptDetails.cached_tokens !== null
+    )
       cachedTokens = tokenCount(
         promptDetails.cached_tokens,
         "cached token count",
@@ -1187,7 +1307,7 @@ function captureCCToolCalls(
     if (!isRecord(raw))
       throw invalidCCStream("upstream tool-call delta is invalid")
     const index = raw.index
-    if (typeof index !== "number" || !Number.isInteger(index) || index < 0)
+    if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 0)
       throw invalidCCStream("upstream tool-call index is invalid")
     if (raw.type !== undefined && raw.type !== null && raw.type !== "function")
       throw invalidCCStream("upstream tool-call type is unsupported")

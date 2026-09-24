@@ -13,6 +13,10 @@ import type { State } from "~/lib/state"
 import type { Model } from "~/services/copilot/get-models"
 
 import { state } from "~/lib/state"
+import {
+  UpstreamEventStreamLimitError,
+  responseEvents,
+} from "~/lib/upstream-lifecycle"
 import { server } from "~/server"
 
 const model: Model = {
@@ -146,21 +150,7 @@ function request(
   }
 }
 
-async function send(
-  frames: Array<Record<string, unknown> | string>,
-  options: {
-    body?: Record<string, unknown>
-    done?: boolean
-  } = {},
-): Promise<Array<ParsedEvent>> {
-  fetchMock.mockResolvedValueOnce(streamResponse(frames, options.done))
-  const response = await server.request("/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(options.body ?? request()),
-  })
-  expect(response.status).toBe(200)
-  const text = await response.text()
+function parseSSE(text: string): Array<ParsedEvent> {
   return text
     .split(/\r?\n\r?\n/)
     .filter(Boolean)
@@ -175,6 +165,23 @@ async function send(
     })
 }
 
+async function send(
+  frames: Array<Record<string, unknown> | string>,
+  options: {
+    body?: Record<string, unknown>
+    done?: boolean
+  } = {},
+): Promise<Array<ParsedEvent>> {
+  fetchMock.mockResolvedValueOnce(streamResponse(frames, options.done))
+  const response = await server.request("/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(options.body ?? request()),
+  })
+  expect(response.status).toBe(200)
+  return parseSSE(await response.text())
+}
+
 function eventData(
   events: Array<ParsedEvent>,
   type: string,
@@ -185,16 +192,28 @@ function eventData(
 }
 
 function completion(
-  argumentsJson: string,
-  finishReason: "stop" | "length" | "tool_calls" | "content_filter",
+  argumentsJson: unknown,
+  finishReason: unknown,
   options: {
     content?: string
+    duplicateToolId?: boolean
+    id?: string
     includeToolCall?: boolean
     name?: string
+    omitArguments?: boolean
     reasoning?: string
     refusal?: string
+    toolType?: string
   } = {},
 ): Record<string, unknown> {
+  const toolCall = {
+    id: options.id ?? "call_sessions",
+    type: options.toolType ?? "function",
+    function: {
+      name: options.name ?? "list_sessions_and_chats",
+      ...(options.omitArguments ? {} : { arguments: argumentsJson }),
+    },
+  }
   return {
     id: "chat_response",
     object: "chat.completion",
@@ -215,16 +234,10 @@ function completion(
           ...(options.includeToolCall === false ?
             {}
           : {
-              tool_calls: [
-                {
-                  id: "call_sessions",
-                  type: "function",
-                  function: {
-                    name: options.name ?? "list_sessions_and_chats",
-                    arguments: argumentsJson,
-                  },
-                },
-              ],
+              tool_calls:
+                options.duplicateToolId ?
+                  [toolCall, { ...toolCall }]
+                : [toolCall],
             }),
         },
         finish_reason: finishReason,
@@ -300,6 +313,17 @@ describe("Responses Chat fallback JSON consistency", () => {
     })
   })
 
+  test("normalizes absent arguments for the same declared no-input call", async () => {
+    const result = await sendJson(
+      completion(undefined, "tool_calls", { omitArguments: true }),
+    )
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({
+      status: "completed",
+      output: [{ arguments: "{}", status: "completed" }],
+    })
+  })
+
   test("keeps a truncated malformed call incomplete and non-completed", async () => {
     const result = await sendJson(completion("{", "length"))
     expect(result.status).toBe(200)
@@ -313,6 +337,51 @@ describe("Responses Chat fallback JSON consistency", () => {
           arguments: "{",
         },
       ],
+    })
+  })
+
+  test.each([
+    { label: "missing id", options: { id: "" } },
+    { label: "missing name", options: { name: "" } },
+  ])("omits a length-truncated tool with $label", async ({ options }) => {
+    const result = await sendJson(completion("{", "length", options))
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [],
+    })
+  })
+
+  test("keeps non-string length metadata strict despite a missing id", async () => {
+    const result = await sendJson(completion(null, "length", { id: "" }))
+    expect(result.status).toBe(502)
+  })
+
+  test("lets an empty refusal outrank a length finish", async () => {
+    const result = await sendJson(completion("{", "length", { refusal: "" }))
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          status: "completed",
+          content: [{ type: "refusal", refusal: "" }],
+        },
+      ],
+    })
+    expect(result.body).not.toHaveProperty("incomplete_details")
+    expect(JSON.stringify(result.body)).not.toContain("function_call")
+  })
+
+  test("suppresses partial tools for content filtering without refusal", async () => {
+    const result = await sendJson(completion("{", "content_filter"))
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({
+      status: "incomplete",
+      incomplete_details: { reason: "content_filter" },
+      output: [],
     })
   })
 
@@ -335,6 +404,51 @@ describe("Responses Chat fallback JSON consistency", () => {
       type: "error",
       error: { type: "api_error" },
     })
+  })
+
+  test.each([
+    { label: "null", value: null },
+    { label: "numeric", value: 42 },
+    { label: "whitespace", value: " " },
+  ])("rejects $label completed JSON arguments", async ({ value }) => {
+    const result = await sendJson(completion(value, "tool_calls"))
+    expect(result.status).toBe(502)
+  })
+
+  test.each([
+    { label: "missing id", options: { id: "" } },
+    { label: "invalid type", options: { toolType: "custom" } },
+    { label: "missing name", options: { name: "" } },
+    { label: "duplicate id", options: { duplicateToolId: true } },
+  ])("rejects completed JSON tool metadata: $label", async ({ options }) => {
+    const result = await sendJson(completion("{}", "tool_calls", options))
+    expect(result.status).toBe(502)
+  })
+
+  test.each([null, "unknown"])(
+    "rejects an invalid JSON finish reason: %p",
+    async (finishReason) => {
+      const result = await sendJson(
+        completion("{}", finishReason, { includeToolCall: false }),
+      )
+      expect(result.status).toBe(502)
+    },
+  )
+
+  test("treats a null parameter schema as unknown, not no-input proof", async () => {
+    const tool = {
+      type: "function",
+      name: "list_sessions_and_chats",
+      parameters: null,
+    }
+    const accepted = await sendJson(
+      completion("{}", "tool_calls"),
+      request(tool),
+    )
+    expect(accepted.status).toBe(200)
+
+    const rejected = await sendJson(completion("", "tool_calls"), request(tool))
+    expect(rejected.status).toBe(502)
   })
 
   test("refusal suppresses a malformed tool call", async () => {
@@ -377,6 +491,17 @@ describe("Responses Chat fallback JSON consistency", () => {
         },
       ],
     })
+  })
+
+  test("omits nullable cached usage metadata in JSON", async () => {
+    const response = completion("{}", "tool_calls")
+    const usage = response.usage as Record<string, unknown>
+    usage.prompt_tokens_details = { cached_tokens: null }
+    const result = await sendJson(response)
+    expect(result.status).toBe(200)
+    expect(
+      (result.body.usage as Record<string, unknown>).input_tokens_details,
+    ).toBeUndefined()
   })
 })
 
@@ -439,6 +564,86 @@ describe("Responses Chat fallback argument validation", () => {
     expect(done[0].arguments).toBe("{}")
   })
 
+  test("treats a null parameter schema as unknown in the stream path", async () => {
+    const tool = {
+      type: "function",
+      name: "list_sessions_and_chats",
+      parameters: null,
+    }
+    const accepted = await send(
+      [
+        frame({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_sessions",
+              type: "function",
+              function: {
+                name: "list_sessions_and_chats",
+                arguments: "{}",
+              },
+            },
+          ],
+        }),
+        frame({}, "tool_calls"),
+      ],
+      { body: request(tool) },
+    )
+    expect(eventData(accepted, "response.completed")).toHaveLength(1)
+
+    const rejected = await send(
+      [
+        frame({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_sessions",
+              type: "function",
+              function: {
+                name: "list_sessions_and_chats",
+                arguments: "",
+              },
+            },
+          ],
+        }),
+        frame({}, "tool_calls"),
+      ],
+      { body: request(tool) },
+    )
+    expect(eventData(rejected, "response.failed")).toHaveLength(1)
+  })
+
+  test("does not infer no-input for an omitted custom namespace member schema", async () => {
+    const events = await send(
+      [
+        frame({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_custom",
+              type: "function",
+              function: { name: "tools__freeform" },
+            },
+          ],
+        }),
+        frame({}, "tool_calls"),
+      ],
+      {
+        body: request({
+          type: "namespace",
+          name: "tools",
+          tools: [{ type: "custom", name: "freeform" }],
+        }),
+      },
+    )
+    expect(eventData(events, "response.failed")).toHaveLength(1)
+    expect(
+      eventData(events, "response.function_call_arguments.done"),
+    ).toHaveLength(0)
+  })
+})
+
+describe("Responses Chat fallback strict argument rejection", () => {
   test.each([
     {
       label: "parameterized",
@@ -714,6 +919,54 @@ describe("Responses Chat fallback upstream metadata", () => {
     expect(eventData(events, "response.failed")).toHaveLength(1)
     expect(eventData(events, "response.output_item.added")).toHaveLength(0)
   })
+
+  test("omits nullable cached usage metadata", async () => {
+    const usage = usageFrame()
+    const usageValue = usage.usage as Record<string, unknown>
+    usageValue.prompt_tokens_details = { cached_tokens: null }
+    const events = await send([
+      frame({ content: "complete" }),
+      frame({}, "stop"),
+      usage,
+    ])
+    const terminal = eventData(events, "response.completed")[0]
+    const response = terminal.response as Record<string, unknown>
+    expect(response.usage).toEqual({
+      input_tokens: 12,
+      output_tokens: 4,
+      total_tokens: 16,
+    })
+  })
+
+  test("rejects an unsafe tool index", async () => {
+    const events = await send([
+      frame({
+        tool_calls: [
+          {
+            index: Number.MAX_SAFE_INTEGER + 1,
+            id: "call_sessions",
+            type: "function",
+            function: {
+              name: "list_sessions_and_chats",
+              arguments: "{}",
+            },
+          },
+        ],
+      }),
+      frame({}, "tool_calls"),
+    ])
+    expect(eventData(events, "response.failed")).toHaveLength(1)
+    expect(eventData(events, "response.output_item.added")).toHaveLength(0)
+  })
+
+  test("rejects an unsafe usage token count", async () => {
+    const usage = usageFrame()
+    const usageValue = usage.usage as Record<string, unknown>
+    usageValue.total_tokens = Number.MAX_SAFE_INTEGER + 1
+    const events = await send([frame({}, "stop"), usage])
+    expect(eventData(events, "response.failed")).toHaveLength(1)
+    expect(eventData(events, "response.completed")).toHaveLength(0)
+  })
 })
 
 describe("Responses Chat fallback output ordering", () => {
@@ -884,6 +1137,58 @@ describe("Responses Chat fallback output ordering", () => {
 })
 
 describe("Responses Chat fallback failure handling", () => {
+  test("bounds raw bytes before SSE parsing and cancels the reader", async () => {
+    let canceled = false
+    const upstream = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(`: ${"x".repeat(64)}`))
+        },
+        cancel() {
+          canceled = true
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    )
+    let failure: unknown
+    try {
+      const iterator = responseEvents(
+        upstream,
+        new AbortController().signal,
+        16,
+      )
+      await iterator.next()
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(UpstreamEventStreamLimitError)
+    expect(canceled).toBe(true)
+  })
+
+  test("emits no tool completion when the bounded reader fails", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull() {
+            throw new UpstreamEventStreamLimitError()
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    )
+    const response = await server.request("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request()),
+    })
+    const events = parseSSE(await response.text())
+    expect(eventData(events, "response.failed")).toHaveLength(1)
+    expect(
+      eventData(events, "response.function_call_arguments.done"),
+    ).toHaveLength(0)
+    expect(eventData(events, "response.output_item.done")).toHaveLength(0)
+  })
+
   test("fails malformed frames instead of skipping them", async () => {
     const events = await send(["{"])
     const failed = eventData(events, "response.failed")
@@ -965,6 +1270,61 @@ describe("Responses Chat fallback failure handling", () => {
     expect(output[0].type).toBe("message")
   })
 
+  test("an empty refusal outranks a length finish", async () => {
+    const events = await send([
+      frame({
+        tool_calls: [
+          {
+            index: 0,
+            id: "call_partial",
+            function: {
+              name: "list_sessions_and_chats",
+              arguments: "{",
+            },
+          },
+        ],
+      }),
+      frame({ refusal: "" }),
+      frame({}, "length"),
+    ])
+
+    expect(eventData(events, "response.completed")).toHaveLength(1)
+    expect(eventData(events, "response.incomplete")).toHaveLength(0)
+    expect(
+      eventData(events, "response.function_call_arguments.done"),
+    ).toHaveLength(0)
+  })
+
+  test("content filtering suppresses partial tools without a refusal", async () => {
+    const events = await send([
+      frame({
+        tool_calls: [
+          {
+            index: 0,
+            id: "call_partial",
+            function: {
+              name: "list_sessions_and_chats",
+              arguments: "{",
+            },
+          },
+        ],
+      }),
+      frame({}, "content_filter"),
+    ])
+
+    const incomplete = eventData(events, "response.incomplete")
+    expect(incomplete).toHaveLength(1)
+    expect(incomplete[0]).toMatchObject({
+      response: {
+        incomplete_details: { reason: "content_filter" },
+        output: [],
+      },
+    })
+    expect(eventData(events, "response.output_item.added")).toHaveLength(0)
+  })
+})
+
+describe("Responses Chat fallback terminal failures", () => {
   test("an upstream error outranks buffered output", async () => {
     const events = await send([
       frame({ content: "partial" }),
@@ -1010,6 +1370,7 @@ describe("Responses Chat fallback failure handling", () => {
 
   test("cancels the upstream reader when the downstream stream closes", async () => {
     const canceled = barrier()
+    const clearIntervalMock = spyOn(globalThis, "clearInterval")
     let upstreamSignal: AbortSignal | undefined
     fetchMock.mockImplementationOnce(
       Object.assign(
@@ -1046,8 +1407,11 @@ describe("Responses Chat fallback failure handling", () => {
     await reader.read()
     await reader.cancel()
     await canceled.promise
+    await Bun.sleep(0)
     expect(upstreamSignal?.aborted).toBe(true)
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(clearIntervalMock).toHaveBeenCalled()
+    clearIntervalMock.mockRestore()
   })
 
   test("accepts EOF after a finish reason and emits one terminal", async () => {
