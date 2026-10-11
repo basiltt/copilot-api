@@ -27,10 +27,16 @@ type Transport =
 
 interface WireRequest {
   model: string
+  output_config?: { effort?: string }
   tools: Array<{
     name?: string
+    strict?: boolean
     input_schema?: Record<string, unknown>
-    function?: { name: string; parameters: Record<string, unknown> }
+    function?: {
+      name: string
+      strict?: boolean
+      parameters: Record<string, unknown>
+    }
   }>
 }
 
@@ -79,6 +85,7 @@ beforeEach(() => {
     accountType: "individual",
     models: { object: "list", data: [model] },
     nativeMessages: false,
+    agentSchemaConstraints: false,
     writeToolRecovery: false,
     toolSearchRecovery: false,
     structuredOutputRecovery: false,
@@ -318,6 +325,110 @@ function toolInputs(text: string, streaming: boolean): Array<unknown> {
     .filter((delta) => delta.partial_json !== undefined)
     .map((delta) => JSON.parse(delta.partial_json ?? "") as unknown)
 }
+
+describe("native Agent schema constraints", () => {
+  for (const modelId of ["claude-fable-5.1", "claude-opus-5.5"]) {
+    for (const transport of ["native-json", "native-sse"] as const) {
+      for (const effort of ["low", "xhigh", "max"] as const) {
+        test(`${modelId}, ${transport}, ${effort}: enforces the unchanged client contract before generation`, async () => {
+          const request = payload(transport, claudeCodeAgentSchema)
+          const model = state.models?.data[0]
+          if (!model) throw new Error("Missing test model")
+          model.id = modelId
+          request.model = modelId
+          Object.assign(model.capabilities.supports, {
+            structured_outputs: true,
+            reasoning_effort: ["low", "medium", "high", "xhigh", "max"],
+          })
+          Object.assign(state, { agentSchemaConstraints: true })
+          request.thinking = { type: "adaptive" }
+          request.output_config = { effort }
+          const original = structuredClone(request)
+          const operation = {
+            description: "Inspect a synthetic fixture",
+            prompt: "Inspect this synthetic fixture without changing anything.",
+            subagent_type: "general-purpose",
+            model: "fable",
+            effort: "high",
+            run_in_background: false,
+            isolation: "worktree",
+          }
+          mockReply(transport, completion(request, operation))
+          const response = await send(request)
+          expect(response.status).toBe(200)
+          const text = await response.text()
+          expect(toolInputs(text, request.stream === true)).toEqual([operation])
+          expect(text).toContain("call_agent")
+          expect(bodies[0].tools[0].strict).toBe(true)
+          expect(bodies[0].tools[0].input_schema).toEqual(claudeCodeAgentSchema)
+          expect(bodies[0].tools[0].function).toBeUndefined()
+          expect(bodies[0].output_config).toEqual({ effort })
+          expect(bodies[0].model).toBe(modelId)
+          expect(request).toEqual(original)
+          expect(fetchSpy).toHaveBeenCalledTimes(1)
+        })
+      }
+    }
+  }
+
+  test("concurrent native Agent constraints keep different caller schemas and values isolated", async () => {
+    const requests = ["first", "second"].map((marker) =>
+      payload("native-json", {
+        ...claudeCodeAgentSchema,
+        properties: {
+          ...claudeCodeAgentSchema.properties,
+          marker: { type: "string", const: marker },
+        },
+        required: [...claudeCodeAgentSchema.required, "marker"],
+      }),
+    )
+    state.agentSchemaConstraints = true
+    const model = state.models?.data[0]
+    if (!model) throw new Error("Missing test model")
+    model.capabilities.supports.structured_outputs = true
+    let release!: () => void
+    const bothStarted = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let started = 0
+    fetchSpy.mockImplementation(
+      Object.assign(
+        async (_url: string | URL | Request, init?: RequestInit) => {
+          if (typeof init?.body !== "string") throw new Error("Expected JSON")
+          const body = JSON.parse(init.body) as WireRequest
+          if (++started === 2) release()
+          await bothStarted
+          expect(body.tools[0].strict).toBe(true)
+          const properties = body.tools[0].input_schema?.properties as {
+            marker: { const: string }
+          }
+          return nativeSSE(
+            completion(requests[0], {
+              description: "Inspect fixture",
+              prompt: "Read-only synthetic task.",
+              marker: properties.marker.const,
+            }),
+          )
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      ),
+    )
+    const responses = await Promise.all(
+      requests.map((request) => send(request)),
+    )
+    for (const [index, response] of responses.entries()) {
+      expect(response.status).toBe(200)
+      expect(toolInputs(await response.text(), false)).toEqual([
+        {
+          description: "Inspect fixture",
+          prompt: "Read-only synthetic task.",
+          marker: index === 0 ? "first" : "second",
+        },
+      ])
+    }
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+})
 
 describe("Agent schema fidelity and atomic validation", () => {
   for (const transport of transports) {

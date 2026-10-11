@@ -15,6 +15,7 @@ export interface State {
   toolSearchRecovery?: boolean
   writeToolRecovery?: boolean
   nativeMessages?: boolean
+  agentSchemaConstraints?: boolean
 
   // Rate limiting configuration
   rateLimitSeconds?: number
@@ -43,6 +44,7 @@ export const state: State = {
   toolSearchRecovery: false,
   writeToolRecovery: false,
   nativeMessages: false,
+  agentSchemaConstraints: false,
   burstRequestTimestamps: [],
   burstMinSpacingMs: 0,
   burstScope: "global",

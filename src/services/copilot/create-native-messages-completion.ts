@@ -242,20 +242,28 @@ function nativeMessageContentRejections(
 export function nativeMessagesCompatibility(
   payload: AnthropicMessagesPayload,
   supportedEndpoints: Array<string> | undefined,
+  supportedEfforts?: Array<string>,
 ): NativeMessagesCompatibility {
-  return evaluateNativeMessagesCompatibility(payload, supportedEndpoints)
-    .routing
+  return evaluateNativeMessagesCompatibility(
+    payload,
+    supportedEndpoints,
+    supportedEfforts,
+  ).routing
 }
 
 export function evaluateNativeMessagesCompatibility(
   payload: AnthropicMessagesPayload,
   supportedEndpoints: Array<string> | undefined,
+  supportedEfforts?: Array<string>,
 ): NativeMessagesCompatibilityResult {
   if (state.nativeMessages !== true)
     return { routing: "native_disabled", rejectionReasons: [] }
   if (!supportedEndpoints?.includes("/v1/messages"))
     return { routing: "model_not_advertised", rejectionReasons: [] }
-  const rejectionReasons = nativeMessagesRejectionReasons(payload)
+  const rejectionReasons = nativeMessagesRejectionReasons(
+    payload,
+    supportedEfforts,
+  )
   return rejectionReasons.length > 0 ?
       { routing: "request_unsupported", rejectionReasons }
     : { routing: "native_selected", rejectionReasons: [] }
@@ -263,6 +271,7 @@ export function evaluateNativeMessagesCompatibility(
 
 export function nativeMessagesRejectionReasons(
   payload: AnthropicMessagesPayload,
+  supportedEfforts?: Array<string>,
 ): Array<NativeMessagesRejectionReason> {
   const reasons: Array<NativeMessagesRejectionReason> = []
   const effort = payload.output_config?.effort
@@ -272,7 +281,11 @@ export function nativeMessagesRejectionReasons(
   if (payload.container) reasons.push("container")
   if (payload.context_management) reasons.push("context_management")
   if (payload.output_config?.format) reasons.push("output_format")
-  if (effort === "xhigh" || effort === "max") reasons.push("effort_unsupported")
+  if (
+    (effort === "xhigh" || effort === "max")
+    && (!Array.isArray(supportedEfforts) || !supportedEfforts.includes(effort))
+  )
+    reasons.push("effort_unsupported")
   reasons.push(...nativeMessageContentRejections(payload))
   if (!Number.isFinite(payload.max_tokens) || payload.max_tokens <= 0)
     reasons.push("max_tokens_invalid")

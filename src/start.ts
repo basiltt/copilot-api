@@ -165,6 +165,24 @@ export function configureNativeMessages(): void {
   }
 }
 
+export function configureAgentSchemaConstraints(): void {
+  const value = process.env.AGENT_SCHEMA_CONSTRAINTS?.trim()
+  if (value !== undefined && value !== "0" && value !== "1") {
+    throw new Error("AGENT_SCHEMA_CONSTRAINTS must be 0 or 1.")
+  }
+  state.agentSchemaConstraints = value === "1"
+  if (state.agentSchemaConstraints && state.nativeMessages !== true) {
+    throw new Error(
+      "AGENT_SCHEMA_CONSTRAINTS=1 requires COPILOT_NATIVE_MESSAGES=1.",
+    )
+  }
+  if (state.agentSchemaConstraints) {
+    consola.info(
+      "Agent schema constraints enabled for compatible native Messages requests with advertised structured-output support; arguments are never rewritten.",
+    )
+  }
+}
+
 // eslint-disable-next-line max-lines-per-function -- Startup ordering coordinates authentication, configuration, and server lifetime.
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
@@ -209,6 +227,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   configureToolSearchRecovery()
   configureWriteToolRecovery()
   configureNativeMessages()
+  configureAgentSchemaConstraints()
 
   await ensurePaths()
   await cacheVSCodeVersion()

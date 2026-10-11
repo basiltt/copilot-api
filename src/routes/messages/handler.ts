@@ -42,10 +42,16 @@ import {
 import {
   getModelContextWindow,
   getModelMaxOutput,
+  getModelReasoningEfforts,
   type Model,
 } from "~/services/copilot/get-models"
 import { requiresResponsesApi } from "~/services/copilot/responses-translation"
 
+import {
+  applyNativeAgentSchemaConstraints,
+  logSkippedAgentSchemaConstraints,
+  usesAgentSchemaConstraints,
+} from "./agent-schema-constraints"
 import {
   type AnthropicMessagesPayload,
   type AnthropicResponse,
@@ -1617,7 +1623,10 @@ function fetchNativeMessagesResponse(
       modelMaxOutput
     : payload.max_tokens
   return createNativeMessagesCompletion(
-    { ...payload, max_tokens: maxTokens },
+    {
+      ...applyNativeAgentSchemaConstraints(payload, selectedModel),
+      max_tokens: maxTokens,
+    },
     createToolNameMapFromAnthropicPayload(payload),
     outputSignal,
   ) as ReturnType<typeof createChatCompletions>
@@ -1640,6 +1649,23 @@ function canStreamOneShotChat(
   )
 }
 
+function evaluateNativeRouting(
+  payload: AnthropicMessagesPayload,
+  selectedModel: Model | undefined,
+) {
+  const result = evaluateNativeMessagesCompatibility(
+    payload,
+    selectedModel?.supported_endpoints,
+    getModelReasoningEfforts(selectedModel),
+  )
+  if (
+    result.routing !== "native_selected"
+    && usesAgentSchemaConstraints(payload)
+  )
+    logSkippedAgentSchemaConstraints("native_unavailable")
+  return result
+}
+
 async function fetchCopilotResponse(
   anthropicPayload: AnthropicMessagesPayload,
   outputSignal?: AbortSignal,
@@ -1649,9 +1675,9 @@ async function fetchCopilotResponse(
   const selectedModel = state.models?.data.find(
     (model) => model.id === anthropicPayload.model,
   )
-  const nativeCompatibility = evaluateNativeMessagesCompatibility(
+  const nativeCompatibility = evaluateNativeRouting(
     anthropicPayload,
-    selectedModel?.supported_endpoints,
+    selectedModel,
   )
   const nativeRouting = nativeCompatibility.routing
   const nativeRejectionReasons =
@@ -1665,7 +1691,6 @@ async function fetchCopilotResponse(
       outputSignal,
     )
   }
-
   const openAIPayload = translateToOpenAI(anthropicPayload)
   if (
     !outputSignal

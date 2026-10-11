@@ -18,6 +18,7 @@ import {
   nativeMessagesCompatibility,
   nativeMessagesRejectionReasons,
 } from "~/services/copilot/create-native-messages-completion"
+import { getModelReasoningEfforts } from "~/services/copilot/get-models"
 import { configureNativeMessages } from "~/start"
 
 const app = new Hono().route("/v1/messages", messageRoutes)
@@ -81,6 +82,29 @@ function payload(stream = false): AnthropicMessagesPayload {
     tools: [writeTool],
     tool_choice: { type: "auto" },
   }
+}
+
+function agentPayload(stream = false): AnthropicMessagesPayload {
+  const request = payload(stream)
+  state.agentSchemaConstraints = true
+  const selected = state.models?.data[0]
+  if (!selected) throw new Error("Missing test model")
+  selected.capabilities.supports.structured_outputs = true
+  request.tools = [
+    {
+      name: "Agent",
+      input_schema: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          prompt: { type: "string" },
+        },
+        required: ["description", "prompt"],
+        additionalProperties: false,
+      },
+    },
+  ]
+  return request
 }
 
 type NativeBlock =
@@ -365,6 +389,7 @@ beforeEach(() => {
   replies = []
   Object.assign(state, {
     nativeMessages: true,
+    agentSchemaConstraints: false,
     writeToolRecovery: true,
     toolSearchRecovery: true,
     structuredOutputRecovery: true,
@@ -410,6 +435,26 @@ afterEach(() => {
 })
 
 describe("native Messages routing and body", () => {
+  test("reads only well-formed explicit effort lists from raw model metadata", () => {
+    expect(getModelReasoningEfforts(undefined)).toBeUndefined()
+    expect(getModelReasoningEfforts({ id: "claude-fable-5.1" })).toBeUndefined()
+    for (const reasoningEffort of ["max", [true, "max"], null]) {
+      expect(
+        getModelReasoningEfforts({
+          id: "claude-fable-5.1",
+          capabilities: { supports: { reasoning_effort: reasoningEffort } },
+        }),
+      ).toBeUndefined()
+    }
+    const efforts = ["low", "xhigh", "max"]
+    expect(
+      getModelReasoningEfforts({
+        id: "claude-fable-5.1",
+        capabilities: { supports: { reasoning_effort: efforts } },
+      }),
+    ).toBe(efforts)
+  })
+
   test("configuration is explicit and defaults off", () => {
     delete process.env.COPILOT_NATIVE_MESSAGES
     configureNativeMessages()
@@ -472,6 +517,33 @@ describe("native Messages routing and body", () => {
       ).toBe("native_selected")
     }
   })
+
+  for (const effort of ["xhigh", "max"] as const) {
+    test(`${effort} requires an explicit matching catalog effort capability`, () => {
+      const request = { ...payload(), output_config: { effort } }
+      for (const efforts of [
+        undefined,
+        [],
+        ["low", "medium", "high"],
+        "max" as never,
+      ]) {
+        expect(
+          nativeMessagesCompatibility(request, ["/v1/messages"], efforts),
+        ).toBe("request_unsupported")
+      }
+      expect(
+        nativeMessagesCompatibility(request, ["/v1/messages"], [effort]),
+      ).toBe("native_selected")
+      request.context_management = { edits: [] }
+      expect(nativeMessagesRejectionReasons(request, [effort])).toEqual([
+        "context_management",
+      ])
+      state.nativeMessages = false
+      expect(
+        nativeMessagesCompatibility(request, ["/v1/messages"], [effort]),
+      ).toBe("native_disabled")
+    })
+  }
 
   test("reports all fixed native rejection reasons in deterministic order without values", () => {
     const privateSentinel = "never-log-this-request-value"
@@ -917,6 +989,186 @@ describe("native Messages routing and body", () => {
     expect(alias).not.toBe(longName)
     expect(JSON.stringify(body.messages)).not.toContain(longName)
     expect(JSON.stringify(body.messages)).toContain(alias)
+  })
+})
+
+describe("native Agent constraint safety", () => {
+  for (const stream of [false, true]) {
+    test(`stream=${stream}: preserves valid actions, call IDs, and signed thinking without correction`, async () => {
+      const request = agentPayload(stream)
+      request.thinking = { type: "adaptive" }
+      const input = {
+        description: "Inspect fixture",
+        prompt: "Read-only synthetic task.",
+      }
+      queue(
+        nativeSSE(
+          [
+            {
+              type: "thinking",
+              thinking: "Synthetic fixture.",
+              signature: "sig_fixture",
+            },
+            {
+              type: "tool_use",
+              id: "call_agent",
+              name: "Agent",
+              inputJson: JSON.stringify(input),
+            },
+          ],
+          "tool_use",
+        ),
+      )
+      const response = await send(request)
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toContain("call_agent")
+      expect(text).toContain("sig_fixture")
+      expect(text).toContain('"stop_reason":"tool_use"')
+      expect(bodies[0].tools).toEqual(
+        request.tools?.map((tool) => ({ ...tool, strict: true })),
+      )
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test(`stream=${stream}: still rejects a provider's invalid constrained output atomically`, async () => {
+      const request = agentPayload(stream)
+      request.tools?.push({
+        name: "Sibling",
+        input_schema: { type: "object", additionalProperties: false },
+      })
+      queue(
+        nativeSSE(
+          [
+            {
+              type: "tool_use",
+              id: "call_sibling",
+              name: "Sibling",
+              inputJson: "{}",
+            },
+            {
+              type: "tool_use",
+              id: "call_agent",
+              name: "Agent",
+              inputJson: JSON.stringify({
+                description: "Inspect fixture",
+                prompt: "Read-only synthetic task.",
+                diagnostic_tag: "PRIVATE_SYNTHETIC_VALUE",
+              }),
+            },
+          ],
+          "tool_use",
+        ),
+      )
+      const response = await send(request)
+      expect(response.status).toBe(stream ? 200 : 502)
+      const text = await response.text()
+      expect(text).toContain("additionalProperties at $")
+      expect(text).not.toContain('"type":"tool_use"')
+      expect(text).not.toContain("PRIVATE_SYNTHETIC_VALUE")
+      expect(text).not.toContain("diagnostic_tag")
+      expect(bodies[0].tools).toEqual([
+        { ...request.tools?.[0], strict: true },
+        request.tools?.[1],
+      ])
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    for (const reason of ["refusal", "max_tokens"] as const) {
+      test(`stream=${stream}: ${reason} takes precedence over invalid constrained input`, async () => {
+        const request = agentPayload(stream)
+        queue(
+          nativeSSE(
+            [
+              { type: "text", text: "Synthetic terminal fixture." },
+              {
+                type: "tool_use",
+                id: "call_agent",
+                name: "Agent",
+                inputJson: "{}",
+              },
+            ],
+            reason,
+          ),
+        )
+        const response = await send(request)
+        expect(response.status).toBe(200)
+        const text = await response.text()
+        expect(text).not.toContain('"stop_reason":"tool_use"')
+        expect(text).not.toContain("arguments do not match")
+        if (reason === "max_tokens")
+          expect(text).toContain('"stop_reason":"max_tokens"')
+        else expect(text).not.toContain('"type":"tool_use"')
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      })
+    }
+
+    test(`stream=${stream}: compilation errors never downgrade or retry unconstrained`, async () => {
+      const request = agentPayload(stream)
+      queue(
+        Response.json(
+          {
+            type: "error",
+            error: {
+              type: "invalid_request_error",
+              message: "Schema is too complex for compilation.",
+            },
+          },
+          { status: 400 },
+        ),
+      )
+      const response = await send(request)
+      expect(response.status).toBe(400)
+      expect(await response.text()).toContain("Schema is too complex")
+      expect(urls).toEqual(["https://api.githubcopilot.com/v1/messages"])
+      expect(bodies[0].tools).toEqual(
+        request.tools?.map((tool) => ({ ...tool, strict: true })),
+      )
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test(`stream=${stream}: upstream policy rejection remains a single failed native attempt`, async () => {
+      const request = agentPayload(stream)
+      queue(
+        Response.json(
+          {
+            type: "error",
+            error: {
+              type: "permission_error",
+              message: "Synthetic policy rejection.",
+            },
+          },
+          { status: 403 },
+        ),
+      )
+      const response = await send(request)
+      expect(response.status).toBe(403)
+      const text = await response.text()
+      expect(text).toContain("Synthetic policy rejection")
+      expect(text).not.toContain('"type":"tool_use"')
+      expect(urls).toEqual(["https://api.githubcopilot.com/v1/messages"])
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+  }
+
+  test("an incompatible request remains compatible without a false strict-generation guarantee", async () => {
+    const request = agentPayload()
+    request.messages = [
+      { role: "system", content: "Synthetic legacy history." },
+      ...request.messages,
+    ]
+    queue(chatCompletion())
+    const response = await send(request)
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(urls).toEqual(["https://api.githubcopilot.com/chat/completions"])
+    const tools = bodies[0].tools as Array<{ function: { strict?: boolean } }>
+    expect(tools[0].function.strict).toBeUndefined()
+    expect(logs[1]).toHaveBeenCalledWith(
+      "Agent schema constraints not applied",
+      { reason: "native_unavailable" },
+    )
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 })
 

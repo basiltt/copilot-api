@@ -271,6 +271,7 @@ BRAVE_API_KEY=BSA...             # Alternative: brave.com/search/api
 
 # Anthropic transport compatibility (optional, off by default)
 # COPILOT_NATIVE_MESSAGES=1      # Use /v1/messages only when the raw model catalog advertises it
+# AGENT_SCHEMA_CONSTRAINTS=1     # Opt-in strict generation for compatible native Agent schemas
 
 # Proxy (optional)
 HTTP_PROXY=http://proxy:8080
@@ -584,6 +585,45 @@ locally sanitized schema and failing argument object, retaining their field
 relationships and types, plus the finish reason and transport. Do not publish
 raw prompts, credentials, or private tool arguments.
 
+### Optional native Agent schema constraints
+
+`AGENT_SCHEMA_CONSTRAINTS=1` prevents undeclared Agent arguments at generation
+time by adding `strict: true` to an eligible native custom `Agent` declaration.
+It is **off by default**; `0` disables it and any other value fails startup.
+It requires `COPILOT_NATIVE_MESSAGES=1`, a native-compatible request, and an
+Anthropic catalog entry advertising `/v1/messages` and `structured_outputs`.
+Enabling it while native Messages is disabled fails startup explicitly.
+The caller's schema, optional fields, prompt, model, tool choice, and permissions
+remain unchanged. An explicit caller `strict` setting always takes precedence.
+This is constrained generation, not a repair retry or deletion of generated
+arguments.
+
+Automatic constraints cover one closed, flat object schema with at most 24
+scalar properties, 32 values per enum, and 16,384 UTF-8 bytes. Supported scalar
+types are string, boolean, number, integer, and null, with optional `enum`,
+`const`, and matching scalar defaults. Root `$schema`, titles, and descriptions
+are preserved. Nested schemas, references, unions, patterns, other constraints,
+multiple Agent declarations, another strict tool, or a JSON output format are
+not automatically converted. These conservative limits avoid altering schemas
+or consuming another caller-selected strict output's shared compilation budget.
+Unsupported cases keep their original request and emit a fixed-reason warning;
+they retain normal validation rather than an implicit schema downgrade.
+
+The Chat compatibility path is **not** assumed to enforce `function.strict`.
+If native transport is unavailable, automatic constraints are skipped and
+reported. Native compilation, policy, or protocol failures are surfaced without
+retrying unconstrained. All completed calls still undergo full original-schema
+validation before any sibling action is released. Refusal, truncation,
+cancellation, call identity, and provider thinking signatures keep their
+existing handling. No Agent is executed by the proxy.
+
+The flat functional schema captured from an isolated Claude Code 2.1.295 client
+is covered. Native Copilot checks confirmed strict compilation and valid Agent
+envelopes on Fable 5.1 and Opus 5.5. This does not identify the unknown property
+in the historical redacted failure or guarantee protection for incompatible
+schemas or fallback transports. See Anthropic's
+[strict tool use and schema limits](https://platform.claude.com/docs/en/build-with-claude/structured-outputs#json-schema-limitations).
+
 ### Optional Write missing-content recovery
 
 `WRITE_TOOL_RECOVERY=1` enables one model-only correction for a nonstreaming,
@@ -676,6 +716,9 @@ does not establish that streaming changes any provider-side output cutoff.
 `COPILOT_NATIVE_MESSAGES=1` enables the upstream `/v1/messages` transport for
 models whose raw Copilot catalog metadata explicitly advertises that endpoint.
 It is **off by default**; `0` disables it and any other value fails startup.
+Explicit `xhigh` and `max` effort stay native only when the same catalog entry's
+`capabilities.supports.reasoning_effort` includes the requested value. The
+effort is forwarded unchanged; missing capability data does not imply support.
 The caller's explicit `max_tokens` remains subject to the same advertised model
 limit. Unsupported request constructs are routed to the existing compatible
 transport before any native request is made. Once a native request is issued,

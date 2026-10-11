@@ -29,6 +29,7 @@ interface ModelSupports {
   tool_calls?: boolean
   parallel_tool_calls?: boolean
   streaming?: boolean
+  structured_outputs?: boolean
   dimensions?: boolean
   reasoning_effort?: Array<string>
 }
@@ -73,7 +74,24 @@ export interface Model {
  * despite the TypeScript types marking them as required.
  */
 type RuntimeModel = Pick<Model, "id"> & {
-  capabilities?: { limits?: Partial<Model["capabilities"]["limits"]> }
+  capabilities?: {
+    limits?: Partial<Model["capabilities"]["limits"]>
+    supports?: { reasoning_effort?: unknown }
+  }
+}
+
+export function getModelReasoningEfforts(
+  model: RuntimeModel | undefined,
+): Array<string> | undefined {
+  const efforts = model?.capabilities?.supports?.reasoning_effort
+  return (
+      Array.isArray(efforts)
+        && efforts.every(
+          (effort): effort is string => typeof effort === "string",
+        )
+    ) ?
+      efforts
+    : undefined
 }
 
 export function getModelContextWindow(model: RuntimeModel): number | undefined {
