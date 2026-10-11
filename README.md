@@ -573,6 +573,17 @@ coercion or default insertion. Invalid/unsupported schemas fail as request error
 remote schemas are not fetched. Tool names are request-scoped and reversible, so
 custom `screenshot`, `browser.screenshot`, and `computer.screenshot` cannot collide.
 
+`Agent` also uses the caller's complete schema, not a hard-coded Agent version.
+An `additionalProperties at $` rejection means the generated root object has an
+undeclared property; the redacted error does not identify its meaning or prove
+schema drift. Agent arguments are not silently stripped or regenerated, and an
+invalid call cannot release a valid sibling action. The schema-fidelity fixtures
+cover JSON/SSE, native Messages, aliases, all three supported dialects, and
+concurrent declarations. Investigating a live rejection still requires a
+locally sanitized schema and failing argument object, retaining their field
+relationships and types, plus the finish reason and transport. Do not publish
+raw prompts, credentials, or private tool arguments.
+
 ### Optional Write missing-content recovery
 
 `WRITE_TOOL_RECOVERY=1` enables one model-only correction for a nonstreaming,
@@ -881,11 +892,24 @@ Ultra is not a new upstream value, an error-triggered fallback, or agent delegat
 
 ### Context Overflow Auto-Switch
 
-When estimated token count exceeds the requested model's context window, the proxy auto-switches to the largest available model. This prevents context-window errors without client-side changes.
+OpenAI Chat Completions retains its pre-dispatch selection of a larger cached
+model when the input estimate exceeds the requested model's window and fits the
+larger one. Anthropic Messages does not switch models from local estimates.
+Neither behavior guarantees that an upstream request will fit.
+
+Explicit upstream context rejections, including `prompt is too long`, are not
+retried with the same payload, even under a normally retryable HTTP status.
+Genuine token counts are preserved; missing
+counts are not estimated. Messages clients receive `invalid_request_error`;
+streamed Responses requests receive `response.failed` with
+`context_length_exceeded`, including the Chat Completions fallback. These
+signals allow client-managed compaction but do not prove that a client
+compacted successfully. The rejection itself never triggers a model switch
+or silent history/image removal.
 
 ### Image Handling
 
-- **413 Stripping Cascade:** On payload-too-large errors, the proxy retries by progressively stripping images: older images first → all images → trigger compaction
+- **413 Stripping Cascade:** On body-size errors, the proxy retries by progressively stripping images: older images first → all images → trigger compaction. A 413 that explicitly reports token/context overflow bypasses this cascade and retains its original counts. Named policy rejections also bypass image stripping.
 - **Proactive Trimming:** Set `IMAGE_CONTEXT_TRIMMING_ENABLED=1` to auto-trim processed images beyond a message threshold
 - **Validation:** Rejects PNG images smaller than 4×4 pixels
 

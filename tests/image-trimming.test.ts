@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 
 import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
 
+import { HTTPError } from "~/lib/error"
 import {
   fetchWithImageStripping,
   type ImageStrippingResult,
@@ -50,6 +51,66 @@ function buildImage(data = "A".repeat(4_000)) {
 }
 
 describe("processed image trimming", () => {
+  test.each([
+    "invalid_request_body",
+    "cyber_policy",
+    "content_filter",
+    "content_policy_violation",
+  ])(
+    "a context or policy 413 (%s) preserves images and the original error",
+    async (code) => {
+      const payload: AnthropicMessagesPayload = {
+        model: "claude-fable-5.1",
+        max_tokens: 128,
+        messages: [{ role: "user", content: [buildImage(), buildImage()] }],
+      }
+      const original = structuredClone(payload)
+      const message = "prompt is too long: 1886265 tokens > 1000000 maximum"
+      const error = new HTTPError(
+        "Too long",
+        Response.json({ error: { message, code } }, { status: 413 }),
+      )
+      let attempts = 0
+      const result = await fetchWithImageStripping(() => {
+        attempts++
+        return Promise.reject(error)
+      }, payload).catch((error: unknown) => error)
+      expect(result).toBe(error)
+      expect(attempts).toBe(1)
+      expect(payload).toEqual(original)
+      expect(await error.response.text()).toContain(message)
+    },
+  )
+
+  test("an opaque body-size 413 still uses the existing image retry", async () => {
+    const payload: AnthropicMessagesPayload = {
+      model: "claude-fable-5.1",
+      max_tokens: 128,
+      messages: [{ role: "user", content: [buildImage(), buildImage()] }],
+    }
+    let attempts = 0
+    const result = await fetchWithImageStripping((received) => {
+      attempts++
+      if (attempts === 1)
+        return Promise.reject(
+          new HTTPError(
+            "Too large",
+            Response.json(
+              { error: { message: "failed to parse request" } },
+              { status: 413 },
+            ),
+          ),
+        )
+      return Promise.resolve(received)
+    }, payload)
+    expect(attempts).toBe(2)
+    expect(result.response.messages[0].content).toEqual([
+      { type: "text", text: "[Image removed to reduce request size]" },
+      buildImage(),
+    ])
+    expect(payload.messages[0].content).toEqual([buildImage(), buildImage()])
+  })
+
   test("does not trim anything when feature is disabled", async () => {
     const payload: AnthropicMessagesPayload = {
       model: "claude-sonnet-4.6",

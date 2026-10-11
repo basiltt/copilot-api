@@ -156,13 +156,25 @@ describe("isContextWindowError", () => {
   })
 
   test("does not treat opaque parser 413 as context-window", () => {
-    expect(isContextWindowError("failed to parse request", 413)).toBe(false)
+    expect(isContextWindowError("failed to parse request")).toBe(false)
+    expect(isContextWindowError("Request Entity Too Large")).toBe(false)
+  })
+
+  test("recognizes the actual upstream prompt-too-long message", () => {
+    expect(
+      isContextWindowError(
+        "prompt is too long: 1886265 tokens > 1000000 maximum",
+      ),
+    ).toBe(true)
   })
 
   test("returns false for unrelated errors", () => {
     expect(isContextWindowError("rate limit exceeded")).toBe(false)
     expect(isContextWindowError("internal server error")).toBe(false)
     expect(isContextWindowError("model not found")).toBe(false)
+    expect(isContextWindowError("header size exceeds the limit of 8192")).toBe(
+      false,
+    )
   })
 })
 
@@ -183,14 +195,34 @@ describe("formatAnthropicContextWindowError", () => {
     ).toBe("prompt is too long: 622303 tokens > 168000 maximum")
   })
 
-  test("falls back to defaults when no numbers found", () => {
-    const result = formatAnthropicContextWindowError("context_length_exceeded")
-    expect(result).toMatch(/^prompt is too long: \d+ tokens > \d+ maximum$/)
+  test("preserves genuine Anthropic counts instead of estimating replacements", () => {
+    const message = "prompt is too long: 1886265 tokens > 1000000 maximum"
+    expect(formatAnthropicContextWindowError(message, 935_000)).toBe(message)
   })
 
-  test("falls back to defaults for empty string", () => {
+  test("keeps genuine counts in other upstream formats", () => {
+    const message =
+      "This model's maximum context length is 128000 tokens; you requested 140001 tokens."
+    expect(formatAnthropicContextWindowError(message)).toContain(message)
+  })
+
+  test("does not invent counts when upstream supplies none", () => {
+    const result = formatAnthropicContextWindowError("context_length_exceeded")
+    expect(result).toMatch(/^prompt is too long/)
+    expect(result).not.toMatch(/\d/)
+  })
+
+  test("does not invent counts for an empty message", () => {
     const result = formatAnthropicContextWindowError("")
-    expect(result).toMatch(/^prompt is too long: \d+ tokens > \d+ maximum$/)
+    expect(result).toMatch(/^prompt is too long/)
+    expect(result).not.toMatch(/\d/)
+  })
+
+  test("a known model limit is not evidence of an actual input count", () => {
+    const result = formatAnthropicContextWindowError("", 1_000_000)
+    expect(result).not.toMatch(/\d+ tokens > \d+/)
+    expect(result).not.toContain("1500000")
+    expect(result).not.toContain("935000")
   })
 })
 
@@ -269,6 +301,8 @@ describe("Responses API (Codex) context-window signaling", () => {
         "prompt token count of 55059 exceeds the limit of 12288",
       ),
     ).toBe("prompt token count of 55059 exceeds the limit of 12288")
+    const alternate = "Input tokens: 1886265. Allowed input tokens: 1000000."
+    expect(contextWindowErrorMessage(alternate)).toBe(alternate)
   })
 
   test("contextWindowErrorMessage falls back for unhelpful upstream text", () => {

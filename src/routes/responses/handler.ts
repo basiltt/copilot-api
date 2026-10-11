@@ -11,6 +11,7 @@ import {
   buildOpenAIContextWindowErrorBody,
   buildResponsesContextWindowFailedEvent,
   extractUpstreamErrorMessage,
+  getUpstreamErrorCode,
   isContextWindowError,
 } from "~/lib/error"
 import { resolveModelId } from "~/lib/model-resolver"
@@ -342,7 +343,7 @@ function streamResponsesPassthrough(
 
 /**
  * Reads an upstream error response and, if it indicates a context-window
- * overflow (HTTP 413 or a recognizable message), returns the extracted upstream
+ * overflow (an explicit code or message), returns the extracted upstream
  * message. Returns null for unrelated errors.
  *
  * Reads from a clone so the original response body stays intact for
@@ -363,7 +364,8 @@ async function detectContextWindowError(
     errorText,
     response.headers.get("content-type"),
   )
-  if (!isContextWindowError(message, response.status)) return null
+  if (!isContextWindowError(message, getUpstreamErrorCode(errorJson)))
+    return null
   return { message }
 }
 
@@ -504,9 +506,16 @@ async function handleViaCC(c: Context, payload: ResponsesPayload) {
     `[responses→cc] Routing ${payload.model} through /chat/completions`,
   )
 
-  const result = await createChatCompletions(ccPayload, "not_applicable", {
-    streamMaxBytes: isStreaming ? RESPONSES_CC_STREAM_MAX_BYTES : undefined,
-  })
+  let result: Awaited<ReturnType<typeof createChatCompletions>>
+  try {
+    result = await createChatCompletions(ccPayload, "not_applicable", {
+      streamMaxBytes: isStreaming ? RESPONSES_CC_STREAM_MAX_BYTES : undefined,
+    })
+  } catch (error) {
+    if (error instanceof HTTPError)
+      return handleUpstreamError(c, error.response, isStreaming)
+    throw error
+  }
 
   if (isStreaming && streamState && Symbol.asyncIterator in Object(result)) {
     return streamSSE(c, async (stream) => {

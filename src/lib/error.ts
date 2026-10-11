@@ -40,7 +40,7 @@ export async function forwardError(c: Context, error: unknown) {
     // auto-compaction instead of just displaying a generic API error.
     // The raw Copilot error JSON uses a non-Anthropic format that Claude
     // Code doesn't recognize as retriable.
-    if (isContextWindowError(errorMessage, error.response.status)) {
+    if (isContextWindowError(errorMessage, getUpstreamErrorCode(errorJson))) {
       consola.debug(
         `Context window exceeded — extracted message: "${errorMessage}"`,
       )
@@ -154,7 +154,7 @@ export async function forwardAnthropicError(c: Context, error: unknown) {
 
     const status = error.response.status
 
-    if (isContextWindowError(errorMessage, status)) {
+    if (isContextWindowError(errorMessage, getUpstreamErrorCode(errorJson))) {
       consola.debug(
         `Context window exceeded — extracted message: "${errorMessage}"`,
       )
@@ -275,12 +275,20 @@ function forwardUpstreamErrorHeaders(c: Context, response: Response): void {
   }
 }
 
-function getUpstreamErrorCode(value: unknown): string | undefined {
+export function getUpstreamErrorCode(value: unknown): string | undefined {
   if (value === null || typeof value !== "object") return undefined
   const error = (value as Record<string, unknown>).error
   if (error === null || typeof error !== "object") return undefined
   const code = (error as Record<string, unknown>).code
   return typeof code === "string" ? code : undefined
+}
+
+export function isUpstreamPolicyError(code: string | undefined): boolean {
+  return (
+    code === "cyber_policy"
+    || code === "content_filter"
+    || code === "content_policy_violation"
+  )
 }
 
 /**
@@ -328,7 +336,7 @@ export async function forwardOpenAIError(c: Context, error: unknown) {
 
     // Context-window overflow → OpenAI-shaped body carrying the
     // `context_length_exceeded` code clients pattern-match on to compact.
-    if (isContextWindowError(errorMessage, status)) {
+    if (isContextWindowError(errorMessage, errorCode)) {
       return c.json(
         buildOpenAIContextWindowErrorBody(errorMessage),
         400 as ContentfulStatusCode,
@@ -462,27 +470,23 @@ function extractHtmlText(html: string, pattern: RegExp): string | undefined {
  * Detects whether an error message indicates the input exceeds the model's
  * context window.
  */
-export function isContextWindowError(
-  message: string,
-  statusCode?: number,
-): boolean {
-  if (statusCode === 413) {
-    return !isOpaquePayloadParseError(message)
-  }
+export function isContextWindowError(message: string, code?: string): boolean {
+  if (isUpstreamPolicyError(code)) return false
 
   const lower = message.toLowerCase()
   return (
-    lower.includes("exceeds the context window")
+    code === "context_length_exceeded"
+    || code === "model_max_prompt_tokens_exceeded"
+    || lower.includes("prompt is too long")
+    || lower.includes("exceeds the context window")
     || lower.includes("context_length_exceeded")
     || lower.includes("maximum context length")
-    || lower.includes("input exceeds")
-    || lower.includes("exceeds the limit")
     || lower.includes("model_max_prompt_tokens_exceeded")
+    || /\b(?:prompt|input) token count of [\d,]+ exceeds the (?:limit|maximum)\b/i.test(
+      message,
+    )
+    || /\binput exceeds (?:the )?(?:model|context|token)\b/i.test(message)
   )
-}
-
-function isOpaquePayloadParseError(message: string): boolean {
-  return message.trim().toLowerCase() === "failed to parse request"
 }
 
 /**
@@ -546,18 +550,16 @@ export function sendAnthropicInvalidRequestError(
 }
 
 /**
- * Converts a context-window error message into the exact format the real
- * Anthropic API uses: `"prompt is too long: {N} tokens > {M} maximum"`.
- *
- * Claude Code pattern-matches on this format to trigger reactive compaction.
- *
- * @param upstreamMessage - The raw error message from Copilot (used to extract token counts)
- * @param modelLimit - The model's actual max_prompt_tokens limit (used when regex extraction fails)
+ * Keeps genuine counts and the Anthropic compaction prefix. A known model
+ * limit is not evidence of the actual input size; never estimate missing counts.
  */
 export function formatAnthropicContextWindowError(
   upstreamMessage: string,
   modelLimit?: number,
 ): string {
+  const message = upstreamMessage.trim()
+  if (/^prompt is too long\b/i.test(message)) return message
+
   // Try to extract "prompt token count of X exceeds the limit of Y" from Copilot
   const match = upstreamMessage.match(
     /(\d[\d,]*)\s+exceeds\s+the\s+limit\s+of\s+(\d[\d,]*)/i,
@@ -568,11 +570,20 @@ export function formatAnthropicContextWindowError(
     return `prompt is too long: ${actual} tokens > ${limit} maximum`
   }
 
-  // Use the model's actual limit if available, otherwise fall back to defaults
-  const limit = modelLimit ?? 935_000
-  // Estimate actual tokens as ~1.5× the limit (we know it exceeded)
-  const actual = Math.round(limit * 1.5)
-  return `prompt is too long: ${actual} tokens > ${limit} maximum`
+  if (message) return `prompt is too long: ${message}`
+  const knownLimit =
+    (
+      modelLimit !== undefined
+      && Number.isSafeInteger(modelLimit)
+      && modelLimit > 0
+    ) ?
+      ` Model context limit: ${modelLimit} tokens.`
+    : ""
+  return (
+    "prompt is too long: input exceeds the model's context window; "
+    + "the upstream did not provide exact token counts."
+    + knownLimit
+  )
 }
 
 // ─── Responses API (OpenAI/Codex) context-window errors ──────────────────────
@@ -606,12 +617,10 @@ const DEFAULT_CONTEXT_WINDOW_MESSAGE =
  */
 export function contextWindowErrorMessage(upstreamMessage?: string): string {
   const trimmed = upstreamMessage?.trim()
-  if (
-    trimmed
-    && /exceeds the (?:limit|context)|context.?length|maximum context|too long|input exceeds/i.test(
-      trimmed,
-    )
-  ) {
+  // Classification already proved overflow, possibly by code rather than
+  // wording. Do not discard real counts just because the provider phrases
+  // them differently. Opaque parser errors are not token-count evidence.
+  if (trimmed && trimmed.toLowerCase() !== "failed to parse request") {
     return trimmed
   }
   return DEFAULT_CONTEXT_WINDOW_MESSAGE

@@ -52,7 +52,7 @@ export async function fetchWithInactivity(
 }
 
 export async function readResponseBody(
-  response: Response,
+  response: Pick<Response, "body">,
   signal: AbortSignal,
   keepAlive?: () => void,
 ): Promise<string> {

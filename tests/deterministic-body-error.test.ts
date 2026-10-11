@@ -18,14 +18,54 @@ beforeEach(() => {
   fetchMock.mockReset()
 })
 
-function bodyError(message: string): Response {
+function bodyError(message: string, status = 400): Response {
   return new Response(
     JSON.stringify({ error: { message, code: "invalid_request_body" } }),
-    { status: 400, headers: { "content-type": "application/json" } },
+    {
+      status,
+      headers: { "content-type": "application/json", "retry-after": "0" },
+    },
   )
 }
 
 describe("deterministic invalid_request_body errors are NOT retried", () => {
+  test.each([400, 408, 413, 429, 500, 502, 503, 504])(
+    "explicit prompt overflow on HTTP %s is never a transient retry",
+    async (status) => {
+      const message = "prompt is too long: 1886265 tokens > 1000000 maximum"
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(bodyError(message, status)),
+      )
+
+      const error = await createChatCompletions({
+        messages: [{ role: "user", content: "synthetic overflow fixture" }],
+        model: "claude-fable-5.1",
+      }).catch((error: unknown) => error)
+      expect(error).toBeInstanceOf(Error)
+      expect(error).toMatchObject({
+        message: "Failed to create chat completions",
+      })
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test("policy codes take precedence even with an upstream server status", async () => {
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        Response.json(
+          { error: { message: "Blocked by policy.", code: "cyber_policy" } },
+          { status: 502, headers: { "retry-after": "0" } },
+        ),
+      ),
+    )
+    const error = await createChatCompletions({
+      messages: [{ role: "user", content: "synthetic policy fixture" }],
+      model: "gpt-test",
+    }).catch((error: unknown) => error)
+    expect(error).toBeInstanceOf(Error)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   test("assistant prefill error fails immediately without burning retries", async () => {
     fetchMock.mockResolvedValue(
       bodyError(

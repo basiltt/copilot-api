@@ -1,7 +1,17 @@
 import consola from "consola"
 
-import { HTTPError } from "~/lib/error"
+import {
+  extractUpstreamErrorMessage,
+  getUpstreamErrorCode,
+  HTTPError,
+  isContextWindowError,
+  isUpstreamPolicyError,
+} from "~/lib/error"
 import { extractSessionId } from "~/lib/session-id"
+import {
+  createInactivityAbort,
+  readResponseBody,
+} from "~/lib/upstream-lifecycle"
 
 import type {
   AnthropicBrowserStateBlock,
@@ -284,6 +294,7 @@ export interface ImageStrippingResult<T> {
  *   3. On 413: strip ALL images, retry
  *   4. On 413 with no images left: throw CompactionNeededError
  *
+ * Proven context overflows propagate without stripping images, even on 413.
  * Non-413 HTTPErrors and non-HTTP errors propagate immediately.
  */
 export async function fetchWithImageStripping<T>(
@@ -303,7 +314,7 @@ export async function fetchWithImageStripping<T>(
     const response = await fetchFn(proactivelyTrimmed.payload)
     return { response, strippedBase64Chars: 0 }
   } catch (error) {
-    if (!is413(error)) throw error
+    if (!(await isBodySizeError(error))) throw error
   }
 
   // Stage 2: Strip older images, keep the most recent one
@@ -316,7 +327,7 @@ export async function fetchWithImageStripping<T>(
       const response = await fetchFn(stage2.payload)
       return { response, strippedBase64Chars: stage2.strippedBase64Chars }
     } catch (error) {
-      if (!is413(error)) throw error
+      if (!(await isBodySizeError(error))) throw error
     }
   }
 
@@ -331,7 +342,7 @@ export async function fetchWithImageStripping<T>(
       const response = await fetchFn(stage3.payload)
       return { response, strippedBase64Chars: stage3.strippedBase64Chars }
     } catch (error) {
-      if (!is413(error)) throw error
+      if (!(await isBodySizeError(error))) throw error
     }
   }
 
@@ -342,6 +353,40 @@ export async function fetchWithImageStripping<T>(
   throw new CompactionNeededError()
 }
 
-function is413(error: unknown): boolean {
-  return error instanceof HTTPError && error.response.status === 413
+async function isBodySizeError(error: unknown): Promise<boolean> {
+  if (!(error instanceof HTTPError) || error.response.status !== 413)
+    return false
+  const inactivity = createInactivityAbort()
+  let text: string
+  try {
+    inactivity.signal.throwIfAborted()
+    text = await readResponseBody(
+      error.response.clone(),
+      inactivity.signal,
+      inactivity.keepAlive,
+    )
+  } catch (readError) {
+    void error.response.body?.cancel().catch(() => undefined)
+    throw readError
+  } finally {
+    inactivity.clear()
+  }
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = null
+  }
+  const code = getUpstreamErrorCode(body)
+  return (
+    !isUpstreamPolicyError(code)
+    && !isContextWindowError(
+      extractUpstreamErrorMessage(
+        body,
+        text,
+        error.response.headers.get("content-type"),
+      ),
+      code,
+    )
+  )
 }

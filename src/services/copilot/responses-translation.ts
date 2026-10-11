@@ -11,6 +11,7 @@ import {
   HTTPError,
   extractUpstreamErrorMessage,
   isContextWindowError,
+  getUpstreamErrorCode,
 } from "~/lib/error"
 import { repairOrphanedToolCalls } from "~/lib/tool-call-repair"
 import { invalidToolInput, parseToolInput } from "~/routes/messages/tool-input"
@@ -2030,6 +2031,8 @@ async function ccFailureDetails(
     )
     const details =
       isRecord(body) && isRecord(body.error) ? body.error : undefined
+    if (isContextWindowError(message, getUpstreamErrorCode(body)))
+      return { code: "context_length_exceeded", message }
     let code = "upstream_error"
     if (typeof details?.code === "string") code = details.code
     else if (error.message.startsWith("Invalid upstream tool call"))

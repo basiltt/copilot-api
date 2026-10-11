@@ -8,6 +8,7 @@ import consola from "consola"
 import { awaitApproval } from "~/lib/approval"
 import {
   extractUpstreamErrorMessage,
+  getUpstreamErrorCode,
   HTTPError,
   isContextWindowError,
   formatAnthropicContextWindowError,
@@ -192,31 +193,10 @@ export function isRetriableFetchError(error: unknown): error is Error {
   )
 }
 
-const MODELS_WITH_1M_CONTEXT = new Set([
-  "claude-opus-4.6",
-  "claude-opus-4.7",
-  "claude-opus-4.8",
-  "claude-sonnet-4.6",
-  "gemini-3.1-pro-preview",
-  "gemini-3.5-flash",
-  "gpt-5.4",
-  "gpt-5.5",
-])
-const EFFECTIVE_1M_LIMIT = 935_000
-
-/**
- * Looks up the model's max_prompt_tokens limit from cached models.
- * Used to produce accurate "prompt is too long: N tokens > M maximum"
- * errors even when the upstream error doesn't contain token numbers.
- */
 function lookupModelLimit(modelId: string): number | undefined {
-  const known = knownModelMetadata(modelId)
-  if (known) {
-    const model = state.models?.data.find((entry) => entry.id === modelId)
-    return getModelContextWindow(model ?? known)
-  }
-  if (MODELS_WITH_1M_CONTEXT.has(modelId)) return EFFECTIVE_1M_LIMIT
-  const model = state.models?.data.find((m) => m.id === modelId)
+  const model =
+    state.models?.data.find((entry) => entry.id === modelId)
+    ?? knownModelMetadata(modelId)
   return model ? getModelContextWindow(model) : undefined
 }
 
@@ -288,12 +268,8 @@ export async function handleCompletion(c: Context) {
     )
   }
 
-  // NOTE: We intentionally do NOT pre-flight reject requests based on local
-  // token estimation.  Returning an Anthropic-formatted "invalid_request_error"
-  // causes Claude Code to auto-compact and retry in a loop — each retry adds
-  // more context, making the prompt even larger.  Instead we let the request
-  // through to Copilot and rely on forwardError to return the raw Copilot
-  // error JSON (not Anthropic format), which Claude Code won't retry.
+  // Local estimates cannot prove overflow. Only an explicit upstream rejection
+  // is normalized into the client's context-compaction error contract.
 
   // Structured output requests (e.g. title generation) use output_config.format.
   // The Copilot Chat Completions API does not enforce response_format, so the
@@ -1372,28 +1348,20 @@ async function extractContextWindowMessage(
 ): Promise<string | undefined> {
   if (!(error instanceof HTTPError)) return undefined
   try {
-    const cloned = error.response.clone()
-    const text = await cloned.text()
-    consola.debug(
-      `[context-window] Raw upstream error (status=${error.response.status}): ${text.slice(0, 500)}`,
-    )
-    if (isContextWindowError(text)) {
-      // Try to extract the inner message from JSON
-      try {
-        const parsed = JSON.parse(text) as Record<string, unknown>
-        const errObj = parsed.error as Record<string, unknown> | undefined
-        if (typeof errObj?.message === "string") {
-          consola.debug(
-            `[context-window] Extracted inner message: ${errObj.message}`,
-          )
-          return errObj.message
-        }
-      } catch {
-        // not JSON
-      }
-      return text
+    const text = await error.response.clone().text()
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      parsed = null
     }
-    return undefined
+    const message = extractUpstreamErrorMessage(
+      parsed,
+      text,
+      error.response.headers.get("content-type"),
+    )
+    return isContextWindowError(message, getUpstreamErrorCode(parsed)) ? message
+      : undefined
   } catch {
     return undefined
   }
@@ -1941,7 +1909,26 @@ async function pipeStreamToClient(
       if (rawEvent.data === "[DONE]") break
       if (!rawEvent.data) continue
 
-      const chunk = JSON.parse(rawEvent.data) as ChatCompletionChunk
+      const parsed: unknown = JSON.parse(rawEvent.data)
+      if (
+        parsed !== null
+        && typeof parsed === "object"
+        && "error" in parsed
+        && parsed.error
+      ) {
+        throw new HTTPError(
+          "Copilot stream failed",
+          Response.json(parsed, { status: 502 }),
+        )
+      }
+      if (
+        parsed === null
+        || typeof parsed !== "object"
+        || !("choices" in parsed)
+        || !Array.isArray(parsed.choices)
+      )
+        throw new Error("Upstream completion stream omitted its choices array.")
+      const chunk = parsed as ChatCompletionChunk
       if (chunk.choices.length > 0) upstreamStarted = true
       logMissingVisibleOutputFinish(chunk, streamState)
 
@@ -2019,14 +2006,8 @@ async function pipeStreamToClient(
       })
     }
 
-    const errorMessage =
-      error instanceof Error ?
-        error.message
-      : "An unexpected error occurred during streaming."
-    const errorEvent = translateErrorToAnthropicErrorEvent(errorMessage)
-    await stream.writeSSE({
-      event: errorEvent.type,
-      data: JSON.stringify(errorEvent),
+    await emitStreamingError(stream, error, {
+      modelId: requestPayload.model,
     })
   } finally {
     stopKeepalive()
@@ -2376,14 +2357,15 @@ async function emitStreamingError(
   } = {},
 ): Promise<void> {
   if (requestSignal()?.aborted) return
-  const { errorMessage, errorType } = await extractStreamingErrorDetails(error)
+  const { errorMessage, errorType, errorCode } =
+    await extractStreamingErrorDetails(error)
   if (options.warnBufferedFailure)
     consola.warn(
       "Buffered Anthropic stream failed",
       bufferedFailureMetadata(error),
     )
 
-  const contextWindowError = isContextWindowError(errorMessage)
+  const contextWindowError = isContextWindowError(errorMessage, errorCode)
   const effectiveErrorType =
     contextWindowError ? "invalid_request_error" : errorType
   const modelLimit =
@@ -2412,6 +2394,7 @@ async function emitStreamingError(
 async function extractStreamingErrorDetails(error: unknown): Promise<{
   errorMessage: string
   errorType: string
+  errorCode?: string
 }> {
   if (error instanceof HTTPError) {
     const errorType = mapStatusToAnthropicErrorType(error.response.status)
@@ -2431,6 +2414,7 @@ async function extractStreamingErrorDetails(error: unknown): Promise<{
           error.response.headers.get("content-type"),
         ),
         errorType,
+        errorCode: getUpstreamErrorCode(parsed),
       }
     } catch {
       return { errorMessage: error.message, errorType }

@@ -1,7 +1,13 @@
 import consola from "consola"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
-import { HTTPError } from "~/lib/error"
+import {
+  extractUpstreamErrorMessage,
+  getUpstreamErrorCode,
+  HTTPError,
+  isContextWindowError,
+  isUpstreamPolicyError,
+} from "~/lib/error"
 import { abortableDelay, requestSignal } from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
 import {
@@ -167,30 +173,45 @@ function isDeterministicBodyErrorMessage(
   )
 }
 
-async function isRetriableBodyError(
+async function isRetriableUpstreamResponse(
   response: Response,
-  reasoningEffort?: string | null,
+  reasoningEffort: string | null | undefined,
+  inactivity: ReturnType<typeof createInactivityAbort>,
 ): Promise<boolean> {
-  if (response.status !== 400) return false
+  const transientStatus = isRetriableUpstreamStatus(response.status)
+  if (response.status !== 400 && !transientStatus) return false
+  let text: string
   try {
-    const cloned = response.clone()
-    const body = (await cloned.json()) as {
-      error?: { code?: string; message?: string }
-    }
-    if (body.error?.code !== "invalid_request_body") return false
-    // Deterministic request-shape errors (assistant prefill, role ordering,
-    // orphaned tool_result, context-window overflow) cannot be fixed by
-    // retrying the same payload — fail fast instead of looping.
-    if (
-      body.error.message
-      && isDeterministicBodyErrorMessage(body.error.message, reasoningEffort)
-    ) {
-      return false
-    }
-    return true
-  } catch {
-    return false
+    inactivity.signal.throwIfAborted()
+    text = await readResponseBody(
+      response.clone(),
+      inactivity.signal,
+      inactivity.keepAlive,
+    )
+  } catch (error) {
+    void response.body?.cancel().catch(() => undefined)
+    inactivity.clear()
+    throw error
   }
+  let body: unknown
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = null
+  }
+  const message = extractUpstreamErrorMessage(
+    body,
+    text,
+    response.headers.get("content-type"),
+  )
+  const code = getUpstreamErrorCode(body)
+  if (isUpstreamPolicyError(code) || isContextWindowError(message, code))
+    return false
+  return (
+    transientStatus
+    || (code === "invalid_request_body"
+      && !isDeterministicBodyErrorMessage(message, reasoningEffort))
+  )
 }
 
 function getRetryAfterDelayMs(retryAfter: string | null): number | undefined {
@@ -415,9 +436,11 @@ export const createChatCompletions = async (
 
     if (response.ok) break
 
-    const shouldRetry =
-      isRetriableUpstreamStatus(response.status)
-      || (await isRetriableBodyError(response, payload.reasoning_effort))
+    const shouldRetry = await isRetriableUpstreamResponse(
+      response,
+      payload.reasoning_effort,
+      inactivity,
+    )
 
     if (!shouldRetry || attempt === MAX_TRANSIENT_HTTP_RETRIES) {
       inactivity.clear()
