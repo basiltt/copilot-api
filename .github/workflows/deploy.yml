@@ -94,6 +94,7 @@ jobs:
           import json
           import os
           import pathlib
+          import re
           import subprocess
 
           if os.geteuid() != 0:
@@ -118,13 +119,30 @@ jobs:
                   raise RuntimeError(f"{name} is not active")
               if name != "nginx":
                   cwd = pathlib.Path(f"/proc/{unit['MainPID']}/cwd").resolve(strict=True)
-                  release = command("git", "-C", str(cwd), "rev-parse", "HEAD")
+                  arguments = pathlib.Path(
+                      f"/proc/{unit['MainPID']}/cmdline"
+                  ).read_bytes().decode().replace("\0", " ")
+                  pattern = r"/root/projects/copilot-api-releases/([0-9a-f]{40})(?:/|\b)"
+                  releases = set(re.findall(pattern, str(cwd) + "\n" + arguments))
+                  if len(releases) != 1:
+                      raise RuntimeError(f"{name} has no unique running release identity")
+                  release = releases.pop()
                   expected = pathlib.Path("/root/projects/copilot-api-releases") / release
-                  if cwd != expected:
-                      raise RuntimeError(f"{name} is not running from its pinned release")
+                  if command("git", "-C", str(expected), "rev-parse", "HEAD") != release:
+                      raise RuntimeError(f"{name} release directory does not match its commit")
+                  configured = command(
+                      "systemctl", "show", name, "--no-pager",
+                      "--property=ExecStart,WorkingDirectory",
+                  )
+                  pin = pathlib.Path(
+                      f"/etc/systemd/system/{name}.service.d/90-reviewed-release.conf"
+                  ).read_text()
                   unit["release"] = release
-                  unit["tree"] = command("git", "-C", str(cwd), "rev-parse", "HEAD^{tree}")
-                  unit["clean"] = not command("git", "-C", str(cwd), "status", "--porcelain")
+                  unit["cwd_matches_release"] = cwd == expected
+                  unit["configured_release_matches"] = set(re.findall(pattern, configured)) == {release}
+                  unit["pin_matches_release"] = set(re.findall(pattern, pin)) == {release}
+                  unit["tree"] = command("git", "-C", str(expected), "rev-parse", "HEAD^{tree}")
+                  unit["clean"] = not command("git", "-C", str(expected), "status", "--porcelain")
               units[name] = unit
 
           environment_file = pathlib.Path("/root/projects/copilot-api/.env")
