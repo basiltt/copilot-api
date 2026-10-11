@@ -190,6 +190,13 @@ async function isRetriableUpstreamResponse(
     )
   } catch (error) {
     void response.body?.cancel().catch(() => undefined)
+    if (transientStatus && !inactivity.signal.aborted) {
+      consola.warn("Could not read transient upstream error body", {
+        status: response.status,
+      })
+      // Keep the inactivity timer active for the status-based retry.
+      return true
+    }
     inactivity.clear()
     throw error
   }

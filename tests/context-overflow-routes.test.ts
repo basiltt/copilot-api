@@ -6,6 +6,7 @@ import type { State } from "~/lib/state"
 import { knownModelMetadata } from "~/lib/known-models"
 import { state } from "~/lib/state"
 import { server } from "~/server"
+import { createChatCompletions } from "~/services/copilot/create-chat-completions"
 
 const message = "prompt is too long: 1886265 tokens > 1000000 maximum"
 const upstreamError = { message, code: "invalid_request_body" }
@@ -82,6 +83,22 @@ function sse(...frames: Array<Record<string, unknown>>) {
       + "data: [DONE]\n\n",
     { headers: { "content-type": "text/event-stream" } },
   )
+}
+
+function failingErrorBody(status: number) {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.error(
+        Object.assign(new Error("Synthetic error-body connection reset"), {
+          code: "ECONNRESET",
+        }),
+      )
+    },
+  })
+  return new Response(body, {
+    status,
+    headers: { "content-type": "application/json", "retry-after": "0" },
+  })
 }
 
 describe("deterministic overflow route contracts", () => {
@@ -376,4 +393,69 @@ describe("body-size, context metadata, and cancellation boundaries", () => {
       expect(cancelled).toBe(true)
     }, 1000)
   }
+})
+
+describe("transient error-body transport failures", () => {
+  for (const status of [502, 503]) {
+    for (const path of [
+      "/v1/messages",
+      "/v1/chat/completions",
+      "/v1/responses",
+    ]) {
+      test(`${path} retries an unreadable HTTP ${status} body before recovering`, async () => {
+        const reply = "Recovered after a synthetic error-body reset."
+        fetchSpy
+          .mockResolvedValueOnce(failingErrorBody(status))
+          .mockResolvedValueOnce(
+            Response.json({
+              id: "chat-recovered",
+              object: "chat.completion",
+              created: 1,
+              model: "claude-fable-5.1",
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: reply },
+                  finish_reason: "stop",
+                },
+              ],
+              usage: {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+              },
+            }),
+          )
+        const response = await send(
+          path,
+          path === "/v1/responses" ?
+            {
+              model: "claude-fable-5.1",
+              stream: false,
+              input: "Synthetic recovery fixture.",
+            }
+          : messagesPayload(false),
+        )
+        expect(response.status).toBe(200)
+        expect(await response.text()).toContain(reply)
+        expect(fetchSpy).toHaveBeenCalledTimes(2)
+      })
+    }
+  }
+
+  test("unreadable transient bodies cannot exceed the existing attempt budget", async () => {
+    fetchSpy.mockImplementation(
+      Object.assign(() => Promise.resolve(failingErrorBody(502)), {
+        preconnect: globalThis.fetch.preconnect,
+      }),
+    )
+    const error = await createChatCompletions({
+      model: "claude-fable-5.1",
+      messages: [
+        { role: "user", content: "Synthetic exhausted retry fixture." },
+      ],
+    }).catch((error: unknown) => error)
+    expect(error).toMatchObject({ response: { status: 502 } })
+    expect(fetchSpy).toHaveBeenCalledTimes(5)
+  })
 })
