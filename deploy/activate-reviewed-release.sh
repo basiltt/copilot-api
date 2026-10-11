@@ -64,10 +64,12 @@ unchanged_baseline() {
 }
 finish() {
   local result="$1"
-  trap - EXIT INT TERM HUP
+  trap - EXIT
+  trap '' INT TERM HUP PIPE
   if [[ "$successful" == 1 ]]; then return; fi
   if [[ "$result" == 0 ]]; then result=1; fi
   if [[ "$armed" == 1 ]]; then
+    exec 1>&3 2>&3
     # Do not overwrite an unrelated concurrent change while rolling back.
     if [[ "$(digest "$main_pin")" != "$main_hash" ]] \
       && ! cmp -s "$main_pin" "$stage/main.after"; then
@@ -79,7 +81,7 @@ finish() {
       echo "Rollback blocked by an unexpected watchdog pin change." >&2
       exit 1
     fi
-    echo "Activation failed; restoring both exact prior service pins." >&2
+    echo "Activation failed; restoring both exact prior service pins." >&2 || true
     if ! cmp -s "$receipts/main.before" "$main_pin"; then
       atomic_pin "$receipts/main.before" "$main_pin"
     fi
@@ -107,6 +109,7 @@ healthy
 [[ "$(digest "$stage/release.bundle")" == "$bundle_hash" ]]
 [[ ! -e "$release" && ! -e "$receipts" ]]
 install -d -m 700 "$receipts" "$stage/test-home"
+exec 3>>"$receipts/rollback.log"
 cp -a -- "$main_pin" "$receipts/main.before"
 cp -a -- "$watchdog_pin" "$receipts/watchdog.before"
 [[ "$(digest "$receipts/main.before")" == "$main_hash" ]]

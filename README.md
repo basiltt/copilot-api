@@ -1016,7 +1016,8 @@ reviewed overflow fix `2635315` and the previously verified `5665711` baseline.
 It requires `preflight_only=false`, stages a verified bundle in a new release
 directory, and runs frozen installation, type checking, build and tests without
 loading production credentials. Only then does it replace both persistent service
-pins. Activation failure restores their exact backups. Environment and hosting
+pins. Activation failure restores their exact backups, with rollback logging kept
+on the server so an SSH disconnect cannot interrupt restoration. Environment and hosting
 configuration are checked for changes; the legacy checkout is never reset or
 cleaned. Receipts and rollback pins are retained under
 `/root/projects/copilot-api-release-receipts/`.
