@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       activate_reviewed_release:
-        description: Activate reviewed 2635315 over baseline 5665711 only
+        description: Activate reviewed 09f3caf over baseline 2635315 with native Agent constraints
         type: boolean
         default: false
 
@@ -168,6 +168,12 @@ jobs:
           for name, expected in flags.items():
               if process_environment.get(name.encode()) != expected.encode():
                   raise RuntimeError(f"Required production flag is missing or different: {name}")
+          agent_constraints = process_environment.get(b"AGENT_SCHEMA_CONSTRAINTS")
+          if agent_constraints not in (None, b"0", b"1"):
+              raise RuntimeError("The Agent constraints process setting is invalid")
+          flags["AGENT_SCHEMA_CONSTRAINTS"] = (
+              agent_constraints.decode() if agent_constraints is not None else None
+          )
           result = {
               "checked_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "units": units,
@@ -210,9 +216,9 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSHPASS: ${{ secrets.SERVER_PASSWORD }}
-          APPLICATION_SHA: 2635315afb5f0ee526e2b9fe0f0bcdd6c8b20699
-          APPLICATION_TREE: 7524e6a5dccc3fcdc3d2e20851ca1ce872adc43d
-          EXPECTED_LIVE_SHA: 56657114e44d710b8e574d7d36075025fdb33b2f
+          APPLICATION_SHA: 09f3caf795a7e8e9c5350cf2cfef319e3244ef61
+          APPLICATION_TREE: 8137d98b9f2dd0586bd78eff3326d18063de4633
+          EXPECTED_LIVE_SHA: 2635315afb5f0ee526e2b9fe0f0bcdd6c8b20699
         run: |
           set -euo pipefail
           [[ "$SERVER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]

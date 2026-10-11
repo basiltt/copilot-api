@@ -18,8 +18,8 @@ receipts="/root/projects/copilot-api-release-receipts/$(basename "$stage")"
 main_pin="/etc/systemd/system/copilot-api.service.d/90-reviewed-release.conf"
 watchdog_pin="/etc/systemd/system/copilot-api-watchdog.service.d/90-reviewed-release.conf"
 env_file="/root/projects/copilot-api/.env"
-main_hash="e5550e5d9c3463c2eb5a22b1f16594add3ea83c9d3a0058ed8af3940de2b8c93"
-watchdog_hash="7ca73da790ab2bfd8ae4c4a38286ea301fc7b6896e8700320acfeba94afc8b53"
+main_hash="9816e56641f7efd6d279c3e0e9549303217c51f02e5176644a0371e4cc97ee43"
+watchdog_hash="e41b09687e59b47bd4b235e4b2b3abb03e252c3bc61eea9bcabbb1eb893322e8"
 env_hash="085e6d1dc2b7870b77cf1fe16d039664fed254aaabea2c53d5d816041efc89b7"
 armed=0
 successful=0
@@ -49,6 +49,32 @@ matches_running_release() {
   tr '\0' '\n' < "/proc/$(pid copilot-api-watchdog)/cmdline" \
     | grep -Fxq "$target/deploy/token-watchdog.sh"
 }
+verify_process_environment() {
+  [[ "$1" == absent || "$1" == enabled ]] || return 1
+  python3 - "$(pid copilot-api)" "$1" <<'PY'
+import pathlib
+import sys
+
+pid, mode = sys.argv[1:]
+environment = dict(
+    entry.split(b"=", 1)
+    for entry in pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    if b"=" in entry
+)
+for name, expected in {
+    "WEB_SEARCH_PROVIDER": "copilot",
+    "STRUCTURED_OUTPUT_RECOVERY": "1",
+    "WRITE_TOOL_RECOVERY": "1",
+    "TOOL_SEARCH_RECOVERY": "1",
+    "COPILOT_NATIVE_MESSAGES": "1",
+}.items():
+    if environment.get(name.encode()) != expected.encode():
+        raise RuntimeError(f"The deployed process is missing the required flag: {name}")
+expected_agent = b"1" if mode == "enabled" else None
+if environment.get(b"AGENT_SCHEMA_CONSTRAINTS") != expected_agent:
+    raise RuntimeError("The effective AGENT_SCHEMA_CONSTRAINTS flag differs from the required release state")
+PY
+}
 unchanged_baseline() {
   [[ -f "$main_pin" && ! -L "$main_pin" && -f "$watchdog_pin" && ! -L "$watchdog_pin" ]] || return 1
   [[ "$(digest "$main_pin")" == "$main_hash" ]] || return 1
@@ -61,6 +87,7 @@ unchanged_baseline() {
   for unit in copilot-api copilot-api-watchdog nginx; do
     systemctl is-active --quiet "$unit" || return 1
   done
+  verify_process_environment absent
 }
 finish() {
   local result="$1"
@@ -159,8 +186,13 @@ for name in ("main", "watchdog"):
     original = source.read_bytes()
     if old.encode() not in original:
         raise RuntimeError("The original service pin lacks the expected release path")
+    updated = original.replace(old.encode(), new.encode())
+    if name == "main":
+        if b"AGENT_SCHEMA_CONSTRAINTS" in original:
+            raise RuntimeError("The baseline service pin already declares Agent constraints")
+        updated += b"\n[Service]\nEnvironment=AGENT_SCHEMA_CONSTRAINTS=1\n"
     shutil.copy2(source, destination)
-    destination.write_bytes(original.replace(old.encode(), new.encode()))
+    destination.write_bytes(updated)
 PY
 
 unchanged_baseline
@@ -173,6 +205,8 @@ atomic_pin "$stage/watchdog.after" "$watchdog_pin"
 systemctl daemon-reload
 systemctl restart copilot-api
 wait_healthy
+# EnvironmentFile settings take precedence over Environment in a drop-in.
+verify_process_environment enabled
 systemctl start copilot-api-watchdog
 for unit in copilot-api copilot-api-watchdog nginx; do
   systemctl is-active --quiet "$unit"
@@ -194,27 +228,8 @@ cmp -s "$stage/watchdog.after" "$watchdog_pin"
 curl --fail --silent --show-error --max-time 20 --output /dev/null https://candleviewer.com/
 python3 - <<'PY'
 import json
-import pathlib
-import subprocess
 import urllib.request
 
-pid = subprocess.check_output(
-    ["systemctl", "show", "copilot-api", "--property=MainPID", "--value"], text=True,
-).strip()
-environment = dict(
-    entry.split(b"=", 1)
-    for entry in pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    if b"=" in entry
-)
-for name, expected in {
-    "WEB_SEARCH_PROVIDER": "copilot",
-    "STRUCTURED_OUTPUT_RECOVERY": "1",
-    "WRITE_TOOL_RECOVERY": "1",
-    "TOOL_SEARCH_RECOVERY": "1",
-    "COPILOT_NATIVE_MESSAGES": "1",
-}.items():
-    if environment.get(name.encode()) != expected.encode():
-        raise RuntimeError(f"The deployed process is missing the required flag: {name}")
 with urllib.request.urlopen("http://127.0.0.1:3131/v1/models", timeout=20) as response:
     models = json.load(response)
 if not isinstance(models.get("data"), list) or not models["data"]:
