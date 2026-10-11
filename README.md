@@ -999,6 +999,18 @@ bun run lint:all      # lint all files
 bun run knip          # find unused exports/dead code
 ```
 
+### Read-only production preflight
+
+Manually dispatch the **Deploy to Server** workflow with `preflight_only=true`
+to inspect the pinned production release without deploying or restarting services.
+This mode uses the existing repository SSH secrets, verifies the pinned server
+host-key fingerprint, and reports release identities, service state, configuration
+hashes and the enabled recovery flags. It never prints credentials or the complete
+environment.
+
+The default dispatch and pushes to `master` retain the legacy deployment path.
+Do not use that path to activate an isolated, reviewed release.
+
 ## Tips
 
 - **Rate limiting:** `--rate-limit 30` enforces a 30s gap. Add `--wait` to queue instead of reject. Use `--burst-count` and `--burst-window` for sliding-window limits.
