@@ -1011,6 +1011,18 @@ environment.
 The default dispatch and pushes to `master` retain the legacy deployment path.
 Do not use that path to activate an isolated, reviewed release.
 
+The separate `activate_reviewed_release=true` mode is deliberately pinned to the
+reviewed overflow fix `2635315` and the previously verified `5665711` baseline.
+It requires `preflight_only=false`, stages a verified bundle in a new release
+directory, and runs frozen installation, type checking, build and tests without
+loading production credentials. Only then does it replace both persistent service
+pins. Activation failure restores their exact backups. Environment and hosting
+configuration are checked for changes; the legacy checkout is never reset or
+cleaned. Receipts and rollback pins are retained under
+`/root/projects/copilot-api-release-receipts/`.
+This is not a general-purpose deployment selector: changing its release or
+baseline requires a new review.
+
 ## Tips
 
 - **Rate limiting:** `--rate-limit 30` enforces a 30s gap. Add `--wait` to queue instead of reject. Use `--burst-count` and `--burst-window` for sliding-window limits.

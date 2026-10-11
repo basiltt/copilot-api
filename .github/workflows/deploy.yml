@@ -9,10 +9,14 @@ on:
         description: Read-only production preflight without deployment or restarts
         type: boolean
         default: false
+      activate_reviewed_release:
+        description: Activate reviewed 2635315 over baseline 5665711 only
+        type: boolean
+        default: false
 
 jobs:
   deploy:
-    if: github.event_name != 'workflow_dispatch' || !inputs.preflight_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.preflight_only && !inputs.activate_reviewed_release)
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
@@ -55,7 +59,7 @@ jobs:
             systemctl is-active copilot-api-watchdog
 
   preflight:
-    if: github.event_name == 'workflow_dispatch' && inputs.preflight_only
+    if: github.event_name == 'workflow_dispatch' && (inputs.preflight_only || inputs.activate_reviewed_release)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -183,4 +187,83 @@ jobs:
               "bun_version": command("/root/.bun/bin/bun", "--version"),
           }
           print(json.dumps(result, sort_keys=True))
+          PY
+
+  reviewed_release:
+    if: github.event_name == 'workflow_dispatch' && inputs.activate_reviewed_release && !inputs.preflight_only
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    concurrency:
+      group: copilot-api-reviewed-release
+      cancel-in-progress: false
+    steps:
+      - name: Check out deployment controls
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Transfer and activate the verified isolated release
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SSHPASS: ${{ secrets.SERVER_PASSWORD }}
+          APPLICATION_SHA: 2635315afb5f0ee526e2b9fe0f0bcdd6c8b20699
+          APPLICATION_TREE: 7524e6a5dccc3fcdc3d2e20851ca1ce872adc43d
+          EXPECTED_LIVE_SHA: 56657114e44d710b8e574d7d36075025fdb33b2f
+        run: |
+          set -euo pipefail
+          [[ "$SERVER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
+          [[ "$SERVER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          test -n "$SSHPASS"
+          test "$(git rev-parse "$APPLICATION_SHA^{tree}")" = "$APPLICATION_TREE"
+          git merge-base --is-ancestor "$EXPECTED_LIVE_SHA" "$APPLICATION_SHA"
+          git merge-base --is-ancestor "$APPLICATION_SHA" HEAD
+          git update-ref refs/heads/task-reviewed-release "$APPLICATION_SHA"
+          git bundle create "$RUNNER_TEMP/release.bundle" refs/heads/task-reviewed-release
+          git bundle verify "$RUNNER_TEMP/release.bundle"
+          bundle_hash="$(sha256sum "$RUNNER_TEMP/release.bundle" | cut -d ' ' -f 1)"
+          if ! command -v sshpass >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq sshpass
+          fi
+          umask 077
+          known_hosts="$RUNNER_TEMP/copilot-api-known-hosts"
+          trap 'rm -f -- "$known_hosts" "$RUNNER_TEMP/release.bundle"' EXIT
+          ssh-keyscan -T 15 -t ed25519 "$SERVER_HOST" > "$known_hosts"
+          fingerprint="$(ssh-keygen -l -E sha256 -f "$known_hosts" | awk '{print $2}')"
+          test "$fingerprint" = "SHA256:B3uhmfjUir68hcntc1qDf1JOYTwVUALkD4+7c15VHCo"
+          options=(
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$known_hosts"
+            -o ConnectTimeout=15
+            -o PreferredAuthentications=password
+            -o NumberOfPasswordPrompts=1
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=2
+          )
+          remote="$SERVER_USER@$SERVER_HOST"
+          stage="/root/projects/copilot-api-release-staging/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          sshpass -e ssh -T "${options[@]}" "$remote" \
+            "umask 077; test ! -e '$stage' && mkdir -p -m 700 '$stage'"
+          sshpass -e scp "${options[@]}" \
+            "$RUNNER_TEMP/release.bundle" deploy/activate-reviewed-release.sh "$remote:$stage/"
+          sshpass -e ssh -T "${options[@]}" "$remote" \
+            "bash '$stage/activate-reviewed-release.sh' '$APPLICATION_SHA' '$EXPECTED_LIVE_SHA' '$bundle_hash' '$APPLICATION_TREE'"
+          sshpass -e ssh -T "${options[@]}" "$remote" "python3 - '$stage'" <<'PY'
+          import pathlib
+          import re
+          import shutil
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          if not re.fullmatch(
+              r"/root/projects/copilot-api-release-staging/run-[0-9]+-[0-9]+",
+              str(path),
+          ) or path.resolve(strict=True) != path:
+              raise RuntimeError("Refusing cleanup of an unexpected staging path")
+          shutil.rmtree(path)
           PY

@@ -46,6 +46,22 @@ const dialects = [
   "https://json-schema.org/draft/2019-09/schema",
   "https://json-schema.org/draft/2020-12/schema",
 ]
+// Captured from an isolated 2.1.295 safe-mode/plan-mode client; annotations removed.
+const claudeCodeAgentSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    description: { type: "string" },
+    prompt: { type: "string" },
+    subagent_type: { type: "string" },
+    model: { type: "string", enum: ["sonnet", "opus", "haiku", "fable"] },
+    effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] },
+    run_in_background: { type: "boolean" },
+    isolation: { type: "string", enum: ["worktree", "remote"] },
+  },
+  required: ["description", "prompt"],
+  additionalProperties: false,
+}
 let originalState: State
 let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
 let logs: Array<ReturnType<typeof spyOn<typeof consola, "debug">>>
@@ -134,7 +150,7 @@ function input(marker = "fixture") {
 
 function payload(
   transport: Transport,
-  inputSchema = schema(),
+  inputSchema: Record<string, unknown> = schema(),
   name = "Agent",
 ): AnthropicMessagesPayload {
   state.nativeMessages = transport.startsWith("native")
@@ -305,6 +321,33 @@ function toolInputs(text: string, streaming: boolean): Array<unknown> {
 
 describe("Agent schema fidelity and atomic validation", () => {
   for (const transport of transports) {
+    test(`${transport}: captured Claude Code 2.1.295 declaration and operation survive unchanged`, async () => {
+      const request = payload(transport, claudeCodeAgentSchema)
+      const operation = {
+        description: "Inspect a synthetic fixture",
+        prompt: "Inspect this synthetic fixture without changing anything.",
+        subagent_type: "general-purpose",
+        model: "fable",
+        effort: "high",
+        run_in_background: false,
+        isolation: "worktree",
+      }
+      mockReply(transport, completion(request, operation))
+      const response = await send(request)
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(toolInputs(text, request.stream === true)).toEqual([operation])
+      expect(text).toContain("call_agent")
+      expect(text).toContain('"name":"Agent"')
+      expect(bodies[0].model).toBe(request.model)
+      const tool = bodies[0].tools[0]
+      expect(tool.function?.parameters ?? tool.input_schema).toEqual(
+        claudeCodeAgentSchema,
+      )
+      expect(request.tools?.[0].input_schema).toEqual(claudeCodeAgentSchema)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
     for (const dialect of dialects) {
       test(`${transport}, ${dialect}: declaration and valid operation survive unchanged`, async () => {
         const declaration = schema(dialect)
