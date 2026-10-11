@@ -3,6 +3,7 @@ import consola from "consola"
 
 import type { State } from "~/lib/state"
 
+import { HTTPError } from "~/lib/error"
 import { knownModelMetadata } from "~/lib/known-models"
 import { state } from "~/lib/state"
 import { server } from "~/server"
@@ -97,7 +98,14 @@ function failingErrorBody(status: number) {
   })
   return new Response(body, {
     status,
-    headers: { "content-type": "application/json", "retry-after": "0" },
+    headers: {
+      "content-type": "application/json",
+      "content-encoding": "gzip",
+      "content-length": "999",
+      "transfer-encoding": "chunked",
+      "retry-after": "0",
+      "x-github-request-id": "synthetic-upstream-id",
+    },
   })
 }
 
@@ -440,6 +448,54 @@ describe("transient error-body transport failures", () => {
         expect(await response.text()).toContain(reply)
         expect(fetchSpy).toHaveBeenCalledTimes(2)
       })
+
+      for (const stream of [false, true]) {
+        test(`${path}, stream=${stream}: exhausted HTTP ${status} body failures remain protocol errors`, async () => {
+          fetchSpy.mockImplementation(
+            Object.assign(() => Promise.resolve(failingErrorBody(status)), {
+              preconnect: globalThis.fetch.preconnect,
+            }),
+          )
+          const response = await send(
+            path,
+            path === "/v1/responses" ?
+              {
+                model: "claude-fable-5.1",
+                stream,
+                input: "Synthetic exhausted retry fixture.",
+              }
+            : messagesPayload(stream),
+          )
+          expect(response.status).toBe(status)
+          expect(response.headers.get("content-type")).toContain(
+            "application/json",
+          )
+          expect(response.headers.get("retry-after")).toBe("0")
+          const text = await response.text()
+          const body: unknown = JSON.parse(text)
+          expect(body).toMatchObject({
+            error: {
+              message: `Upstream returned HTTP ${status}, but its error response could not be read.`,
+            },
+          })
+          if (path === "/v1/messages") {
+            expect(body).toMatchObject({
+              type: "error",
+              error: { type: "api_error" },
+            })
+          } else {
+            expect(body).toMatchObject({
+              error: { type: "api_error", code: null, param: null },
+            })
+            expect(response.headers.get("x-github-request-id")).toBe(
+              "synthetic-upstream-id",
+            )
+          }
+          expect(text).not.toContain("Body already used")
+          expect(text).not.toContain("Synthetic error-body connection reset")
+          expect(fetchSpy).toHaveBeenCalledTimes(5)
+        })
+      }
     }
   }
 
@@ -457,5 +513,17 @@ describe("transient error-body transport failures", () => {
     }).catch((error: unknown) => error)
     expect(error).toMatchObject({ response: { status: 502 } })
     expect(fetchSpy).toHaveBeenCalledTimes(5)
+    if (!(error instanceof HTTPError))
+      throw new TypeError("Expected an upstream HTTP error")
+    expect(error.response.bodyUsed).toBe(false)
+    expect(error.response.headers.get("content-encoding")).toBeNull()
+    expect(error.response.headers.get("transfer-encoding")).toBeNull()
+    expect(error.response.headers.get("content-length")).not.toBe("999")
+    expect(await error.response.json()).toMatchObject({
+      error: {
+        message:
+          "Upstream returned HTTP 502, but its error response could not be read.",
+      },
+    })
   })
 })

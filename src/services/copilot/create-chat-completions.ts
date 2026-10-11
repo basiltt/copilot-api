@@ -173,13 +173,14 @@ function isDeterministicBodyErrorMessage(
   )
 }
 
-async function isRetriableUpstreamResponse(
+async function getUpstreamRetryDecision(
   response: Response,
   reasoningEffort: string | null | undefined,
   inactivity: ReturnType<typeof createInactivityAbort>,
-): Promise<boolean> {
+): Promise<{ response: Response; shouldRetry: boolean }> {
   const transientStatus = isRetriableUpstreamStatus(response.status)
-  if (response.status !== 400 && !transientStatus) return false
+  if (response.status !== 400 && !transientStatus)
+    return { response, shouldRetry: false }
   let text: string
   try {
     inactivity.signal.throwIfAborted()
@@ -194,8 +195,26 @@ async function isRetriableUpstreamResponse(
       consola.warn("Could not read transient upstream error body", {
         status: response.status,
       })
-      // Keep the inactivity timer active for the status-based retry.
-      return true
+      const errorHeaders = new Headers(response.headers)
+      for (const name of [
+        "content-length",
+        "content-encoding",
+        "transfer-encoding",
+      ])
+        errorHeaders.delete(name)
+      errorHeaders.set("content-type", "application/json")
+      // Retain a readable error if the bounded retry budget is exhausted.
+      return {
+        response: Response.json(
+          {
+            error: {
+              message: `Upstream returned HTTP ${response.status}, but its error response could not be read.`,
+            },
+          },
+          { status: response.status, headers: errorHeaders },
+        ),
+        shouldRetry: true,
+      }
     }
     inactivity.clear()
     throw error
@@ -213,12 +232,14 @@ async function isRetriableUpstreamResponse(
   )
   const code = getUpstreamErrorCode(body)
   if (isUpstreamPolicyError(code) || isContextWindowError(message, code))
-    return false
-  return (
-    transientStatus
-    || (code === "invalid_request_body"
-      && !isDeterministicBodyErrorMessage(message, reasoningEffort))
-  )
+    return { response, shouldRetry: false }
+  return {
+    response,
+    shouldRetry:
+      transientStatus
+      || (code === "invalid_request_body"
+        && !isDeterministicBodyErrorMessage(message, reasoningEffort)),
+  }
 }
 
 function getRetryAfterDelayMs(retryAfter: string | null): number | undefined {
@@ -443,13 +464,14 @@ export const createChatCompletions = async (
 
     if (response.ok) break
 
-    const shouldRetry = await isRetriableUpstreamResponse(
+    const retryDecision = await getUpstreamRetryDecision(
       response,
       payload.reasoning_effort,
       inactivity,
     )
+    response = retryDecision.response
 
-    if (!shouldRetry || attempt === MAX_TRANSIENT_HTTP_RETRIES) {
+    if (!retryDecision.shouldRetry || attempt === MAX_TRANSIENT_HTTP_RETRIES) {
       inactivity.clear()
       throw new HTTPError("Failed to create chat completions", response)
     }
