@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       activate_reviewed_release:
-        description: Activate reviewed 09f3caf over baseline 2635315 with native Agent constraints
+        description: Activate reviewed 0737003 over baseline 09f3caf, preserving native Agent constraints
         type: boolean
         default: false
 
@@ -111,7 +111,9 @@ jobs:
           def digest(path):
               return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 
-          def routing_diagnostics():
+          def routing_diagnostics(main_pid):
+              if type(main_pid) is not int or main_pid <= 0:
+                  raise RuntimeError("Invalid main process for routing diagnostics")
               reasons = {
                   "assistant_block_unsupported", "container", "context_management",
                   "effort_unsupported", "max_tokens_invalid", "mcp_servers",
@@ -125,20 +127,25 @@ jobs:
               }
               result = subprocess.run(
                   ["journalctl", "--unit=copilot-api", "--since=-24h", "--lines=5000",
-                   "--no-pager", "--output=cat"],
+                   "--no-pager", "--output=cat", f"_PID={main_pid}"],
                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
               )
               if result.returncode != 0:
                   raise RuntimeError("Could not read bounded routing diagnostics")
               log = result.stdout[-8 * 1024 * 1024:].decode(errors="replace")
               counts = collections.Counter()
+              routing = collections.Counter()
+              for choice in re.findall(r"nativeRouting['\"]?\s*:\s*['\"]([a-z_]+)['\"]", log):
+                  if choice in {"native_disabled", "model_not_advertised", "request_unsupported"}:
+                      routing[choice] += 1
               for block in re.findall(r"nativeRejectionReasons['\"]?\s*:\s*\[([^\]]{0,2048})\]", log):
                   for reason in re.findall(r"['\"]([a-z_]+)['\"]", block):
                       if reason in reasons:
                           counts[reason] += 1
               return {
-                  "scope": "last 5000 journal entries within 24 hours; latest 8 MiB inspected",
+                  "scope": "current main process; last 5000 journal entries within 24 hours; latest 8 MiB inspected",
                   "agent_constraints_skipped": log.count("Agent schema constraints not applied"),
+                  "native_routing_counts": dict(sorted(routing.items())),
                   "native_rejection_counts": dict(sorted(counts.items())),
                   "buffered_protocol_failures": log.count("Buffered Chat stream protocol failure"),
                   "tool_schema_rejections": log.count("arguments do not match the declared input_schema"),
@@ -228,7 +235,7 @@ jobs:
                   for name in ("copilot-api", "copilot-api-watchdog")
               },
               "bun_version": command("/root/.bun/bin/bun", "--version"),
-              "routing_diagnostics": routing_diagnostics(),
+              "routing_diagnostics": routing_diagnostics(units["copilot-api"]["MainPID"]),
           }
           print(json.dumps(result, sort_keys=True))
           PY
@@ -254,9 +261,9 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSHPASS: ${{ secrets.SERVER_PASSWORD }}
-          APPLICATION_SHA: 09f3caf795a7e8e9c5350cf2cfef319e3244ef61
-          APPLICATION_TREE: 8137d98b9f2dd0586bd78eff3326d18063de4633
-          EXPECTED_LIVE_SHA: 2635315afb5f0ee526e2b9fe0f0bcdd6c8b20699
+          APPLICATION_SHA: 0737003a82b0d57fc0be8f56db2c013e136e2449
+          APPLICATION_TREE: ffdd2e7aaeeef3ce7040919427c9948482af6ba8
+          EXPECTED_LIVE_SHA: 09f3caf795a7e8e9c5350cf2cfef319e3244ef61
         run: |
           set -euo pipefail
           [[ "$SERVER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]

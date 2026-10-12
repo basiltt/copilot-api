@@ -18,8 +18,8 @@ receipts="/root/projects/copilot-api-release-receipts/$(basename "$stage")"
 main_pin="/etc/systemd/system/copilot-api.service.d/90-reviewed-release.conf"
 watchdog_pin="/etc/systemd/system/copilot-api-watchdog.service.d/90-reviewed-release.conf"
 env_file="/root/projects/copilot-api/.env"
-main_hash="9816e56641f7efd6d279c3e0e9549303217c51f02e5176644a0371e4cc97ee43"
-watchdog_hash="e41b09687e59b47bd4b235e4b2b3abb03e252c3bc61eea9bcabbb1eb893322e8"
+main_hash="f4e969177f280866c82d710695940c3be82c3957721f0c7f5ab00de6dd173105"
+watchdog_hash="bf1fb46061ca98c946eb574d7074fd84ea198db1d90911affe4ed6f18e7ca9a8"
 env_hash="085e6d1dc2b7870b77cf1fe16d039664fed254aaabea2c53d5d816041efc89b7"
 armed=0
 successful=0
@@ -87,7 +87,7 @@ unchanged_baseline() {
   for unit in copilot-api copilot-api-watchdog nginx; do
     systemctl is-active --quiet "$unit" || return 1
   done
-  verify_process_environment absent
+  verify_process_environment enabled
 }
 finish() {
   local result="$1"
@@ -188,9 +188,10 @@ for name in ("main", "watchdog"):
         raise RuntimeError("The original service pin lacks the expected release path")
     updated = original.replace(old.encode(), new.encode())
     if name == "main":
-        if b"AGENT_SCHEMA_CONSTRAINTS" in original:
-            raise RuntimeError("The baseline service pin already declares Agent constraints")
-        updated += b"\n[Service]\nEnvironment=AGENT_SCHEMA_CONSTRAINTS=1\n"
+        if original.count(b"AGENT_SCHEMA_CONSTRAINTS") != 1 or (
+            b"\nEnvironment=AGENT_SCHEMA_CONSTRAINTS=1\n" not in original
+        ):
+            raise RuntimeError("The baseline service pin must retain its enabled Agent constraints")
     shutil.copy2(source, destination)
     destination.write_bytes(updated)
 PY
