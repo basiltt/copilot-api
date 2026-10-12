@@ -11,6 +11,7 @@ import type { Model } from "~/services/copilot/get-models"
 
 import { state } from "~/lib/state"
 import { messageRoutes } from "~/routes/messages/route"
+import { compileToolSchema } from "~/routes/messages/tool-input"
 import { createToolNameMapFromAnthropicPayload } from "~/routes/messages/tool-name-mapping"
 import {
   buildNativeMessagesBody,
@@ -897,7 +898,7 @@ describe("native Messages routing and body", () => {
     expect(captured).not.toContain(privateInstruction)
   })
 
-  test("uses refined Workflow schema and rejects unrepresentable history", () => {
+  test("keeps native Workflow declarations unchanged while enforcing selector refinement locally", () => {
     const request = payload()
     request.tools = [
       {
@@ -940,22 +941,19 @@ describe("native Messages routing and body", () => {
         ],
       },
     ]
-    const body = buildNativeMessagesBody(
-      request,
-      createToolNameMapFromAnthropicPayload(request),
-    )
-    expect(body.tools).toMatchObject([
-      {
-        name: "Workflow",
-        input_schema: {
-          anyOf: [
-            { required: ["script"] },
-            { required: ["scriptPath"] },
-            { required: ["runId"] },
-          ],
-        },
-      },
+    const map = createToolNameMapFromAnthropicPayload(request)
+    const body = buildNativeMessagesBody(request, map)
+    expect(body.tools).toEqual(request.tools)
+    const validationSchema = map.inputSchemas?.Workflow
+    if (!validationSchema) throw new Error("Workflow validation schema missing")
+    expect(validationSchema.anyOf).toEqual([
+      { required: ["script"] },
+      { required: ["scriptPath"] },
+      { required: ["runId"] },
     ])
+    const validate = compileToolSchema(validationSchema)
+    expect(validate({})).toBe(false)
+    expect(validate({ runId: "existing" })).toBe(true)
     expect(body.messages).toEqual(request.messages)
 
     request.messages.push({
@@ -997,6 +995,30 @@ describe("native Messages routing and body", () => {
       "native_selected",
     )
   })
+
+  for (const keyword of ["anyOf", "oneOf", "allOf"]) {
+    test(`caller root ${keyword} remains intact on the compatible transport`, () => {
+      const request = payload()
+      request.tools = [
+        {
+          name: "Workflow",
+          input_schema: {
+            type: "object",
+            properties: { script: { type: "string" } },
+            [keyword]: [{ required: ["script"] }],
+          },
+        },
+      ]
+      const original = structuredClone(request)
+      expect(nativeMessagesRejectionReasons(request)).toEqual([
+        "tool_schema_root_composition",
+      ])
+      expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
+        "request_unsupported",
+      )
+      expect(request).toEqual(original)
+    })
+  }
 
   test("preserves two-turn tool IDs, result linkage and thinking signature", () => {
     const request = payload()

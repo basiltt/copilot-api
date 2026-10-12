@@ -72,6 +72,7 @@ export type NativeMessagesRejectionReason =
   | "thinking_signature_missing"
   | "tool_result_content_missing"
   | "tool_result_content_unsupported"
+  | "tool_schema_root_composition"
   | "tool_use_invalid"
   | "typed_tools"
   | "user_block_unsupported"

@@ -745,6 +745,22 @@ prefixes, unsupported placement/content, and beta-specific system-message
 fields retain compatibility routing. This follows the documented
 [system-message placement rules](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages#limitations)
 and was checked against both native Copilot models without executing tools.
+Claude Code 2.1.295 appends such a system turn even to an ordinary tool-enabled
+request. Rejecting that turn forces Chat fallback and skips native Agent
+constraints; disabling experimental betas alone does not remove the turn.
+For this gateway, `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` is still needed
+to avoid the client's unsupported `context_management` request field. This
+client setting also disables other experimental beta features.
+
+Native tool declarations retain the caller's exact `input_schema`. In
+particular, the proxy's additional Workflow selector check remains in local
+response validation rather than being inserted as a top-level `anyOf` on the
+native wire: Copilot rejects that schema shape before generation. Workflow
+calls missing a selector still fail validation, and no executable sibling
+call is released. A caller-supplied root `anyOf`, `oneOf`, or `allOf` is not
+removed or rewritten; the request takes the compatibility path with the
+fixed reason `tool_schema_root_composition`.
+
 Legacy conversation history containing unsigned thinking or other blocks that
 cannot be represented faithfully also stays on the compatible transport; the
 proxy does not forge or discard provider thinking signatures.

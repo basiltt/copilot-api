@@ -156,6 +156,21 @@ function hasTypedTools(tools: Array<AnthropicTool> | undefined): boolean {
   return Boolean(tools?.some((tool) => !("input_schema" in tool)))
 }
 
+function hasRootSchemaComposition(
+  tools: Array<AnthropicTool> | undefined,
+): boolean {
+  return Boolean(
+    tools?.some((tool) => {
+      if (!("input_schema" in tool)) return false
+      const schema = tool.input_schema
+      return (
+        isRecord(schema)
+        && ["anyOf", "oneOf", "allOf"].some((key) => Object.hasOwn(schema, key))
+      )
+    }),
+  )
+}
+
 function nativeToolResultContentRejection(
   value: unknown,
 ): NativeMessagesRejectionReason | undefined {
@@ -330,6 +345,8 @@ export function nativeMessagesRejectionReasons(
   const reasons: Array<NativeMessagesRejectionReason> = []
   const effort = payload.output_config?.effort
   if (hasTypedTools(payload.tools)) reasons.push("typed_tools")
+  if (hasRootSchemaComposition(payload.tools))
+    reasons.push("tool_schema_root_composition")
   if (payload.mcp_servers && payload.mcp_servers.length > 0)
     reasons.push("mcp_servers")
   if (payload.container) reasons.push("container")
@@ -416,7 +433,6 @@ export function buildNativeMessagesBody(
     return {
       ...tool,
       name,
-      input_schema: map.inputSchemas?.[name] ?? tool.input_schema,
     }
   })
   const forcedToolName = payload.tool_choice?.name

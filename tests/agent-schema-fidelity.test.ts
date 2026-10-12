@@ -71,6 +71,20 @@ const claudeCodeAgentSchema = {
   required: ["description", "prompt"],
   additionalProperties: false,
 }
+const claudeCodeWorkflowSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    script: { type: "string", maxLength: 524288 },
+    name: { type: "string" },
+    description: { type: "string" },
+    title: { type: "string" },
+    args: {},
+    scriptPath: { type: "string" },
+    resumeFromRunId: { type: "string", pattern: "^wf_[a-z0-9-]{6,}$" },
+  },
+  additionalProperties: false,
+}
 let originalState: State
 let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
 let logs: Array<ReturnType<typeof spyOn<typeof consola, "debug">>>
@@ -379,6 +393,10 @@ describe("native Agent schema constraints", () => {
       for (const replay of [false, true]) {
         test(`${modelId}, ${transport}, replay=${replay}: mid-conversation system guidance keeps native Agent constraints`, async () => {
           const request = payload(transport, claudeCodeAgentSchema)
+          request.tools?.push({
+            name: "Workflow",
+            input_schema: claudeCodeWorkflowSchema,
+          })
           const selected = state.models?.data[0]
           if (!selected) throw new Error("Missing test model")
           selected.id = modelId
@@ -436,13 +454,76 @@ describe("native Agent schema constraints", () => {
           expect(bodies[0].thinking).toEqual(original.thinking)
           expect(bodies[0].tools[0].strict).toBe(true)
           expect(bodies[0].tools[0].input_schema).toEqual(claudeCodeAgentSchema)
+          expect(bodies[0].tools[1].input_schema).toEqual(
+            claudeCodeWorkflowSchema,
+          )
           expect(request).toEqual(original)
           expect(logs[1]).not.toHaveBeenCalled()
         })
       }
     }
   }
+})
 
+describe("native Workflow and Agent atomic validation", () => {
+  for (const transport of ["native-json", "native-sse"] as const) {
+    for (const missingSelector of [false, true]) {
+      test(`${transport}: native Workflow selector validation remains atomic with Agent (missing=${missingSelector})`, async () => {
+        const request = payload(transport, claudeCodeAgentSchema)
+        request.tools?.push({
+          name: "Workflow",
+          input_schema: claudeCodeWorkflowSchema,
+        })
+        const original = structuredClone(request)
+        state.agentSchemaConstraints = true
+        const selected = state.models?.data[0]
+        if (!selected) throw new Error("Missing test model")
+        selected.capabilities.supports.structured_outputs = true
+        const operation = {
+          description: "Inspect fixture",
+          prompt: "Read-only synthetic analysis.",
+        }
+        const workflowInput = missingSelector ? {} : { name: "synthetic-only" }
+        const result = completion(request, operation)
+        result.choices[0].message.tool_calls?.push({
+          id: "call_workflow",
+          type: "function",
+          function: {
+            name: "Workflow",
+            arguments: JSON.stringify(workflowInput),
+          },
+        })
+        mockReply(transport, result)
+        const response = await send(request)
+        const text = await response.text()
+        expect(response.status).toBe(
+          missingSelector && !request.stream ? 502 : 200,
+        )
+        expect(bodies[0].tools[0].strict).toBe(true)
+        expect(bodies[0].tools[1].input_schema).toEqual(
+          claudeCodeWorkflowSchema,
+        )
+        if (missingSelector) {
+          expect(text).toContain("anyOf at $")
+          expect(text).not.toContain('"type":"tool_use"')
+          expect(text).not.toContain("call_agent")
+          expect(text).not.toContain("call_workflow")
+        } else {
+          expect(toolInputs(text, request.stream === true)).toEqual([
+            operation,
+            workflowInput,
+          ])
+          expect(text).toContain("call_agent")
+          expect(text).toContain("call_workflow")
+        }
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+        expect(request).toEqual(original)
+      })
+    }
+  }
+})
+
+describe("native Agent schema isolation", () => {
   test("concurrent native Agent constraints keep different caller schemas and values isolated", async () => {
     const requests = ["first", "second"].map((marker) =>
       payload("native-json", {

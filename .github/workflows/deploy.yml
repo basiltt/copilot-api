@@ -122,7 +122,8 @@ jobs:
                   "message_role_system_nonprefix", "message_role_tool", "output_format",
                   "redacted_thinking_invalid", "system_block_unsupported", "thinking_invalid",
                   "thinking_signature_missing", "tool_result_content_missing",
-                  "tool_result_content_unsupported", "tool_use_invalid", "typed_tools",
+                  "tool_result_content_unsupported", "tool_schema_root_composition",
+                  "tool_use_invalid", "typed_tools",
                   "user_block_unsupported",
               }
               result = subprocess.run(
