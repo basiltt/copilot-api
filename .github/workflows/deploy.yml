@@ -94,6 +94,7 @@ jobs:
             -o ServerAliveCountMax=2 \
             "$SERVER_USER@$SERVER_HOST" 'python3 -' <<'PY'
           import datetime
+          import collections
           import hashlib
           import json
           import os
@@ -109,6 +110,42 @@ jobs:
 
           def digest(path):
               return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+          def routing_diagnostics():
+              reasons = {
+                  "assistant_block_unsupported", "container", "context_management",
+                  "effort_unsupported", "max_tokens_invalid", "mcp_servers",
+                  "message_content_invalid", "message_nonobject", "message_role_absent",
+                  "message_role_developer", "message_role_other", "message_role_system",
+                  "message_role_system_nonprefix", "message_role_tool", "output_format",
+                  "redacted_thinking_invalid", "system_block_unsupported", "thinking_invalid",
+                  "thinking_signature_missing", "tool_result_content_missing",
+                  "tool_result_content_unsupported", "tool_use_invalid", "typed_tools",
+                  "user_block_unsupported",
+              }
+              result = subprocess.run(
+                  ["journalctl", "--unit=copilot-api", "--since=-24h", "--lines=5000",
+                   "--no-pager", "--output=cat"],
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
+              )
+              if result.returncode != 0:
+                  raise RuntimeError("Could not read bounded routing diagnostics")
+              log = result.stdout[-8 * 1024 * 1024:].decode(errors="replace")
+              counts = collections.Counter()
+              for block in re.findall(r"nativeRejectionReasons['\"]?\s*:\s*\[([^\]]{0,2048})\]", log):
+                  for reason in re.findall(r"['\"]([a-z_]+)['\"]", block):
+                      if reason in reasons:
+                          counts[reason] += 1
+              return {
+                  "scope": "last 5000 journal entries within 24 hours; latest 8 MiB inspected",
+                  "agent_constraints_skipped": log.count("Agent schema constraints not applied"),
+                  "native_rejection_counts": dict(sorted(counts.items())),
+                  "buffered_protocol_failures": log.count("Buffered Chat stream protocol failure"),
+                  "tool_schema_rejections": log.count("arguments do not match the declared input_schema"),
+                  "unsigned_thinking_rejections": log.count("thinking_signature_missing"),
+                  "raw_request_debug_entries_present": "Anthropic request payload:" in log,
+                  "request_or_tool_content_returned": False,
+              }
 
           units = {}
           for name in ("copilot-api", "copilot-api-watchdog", "nginx"):
@@ -191,6 +228,7 @@ jobs:
                   for name in ("copilot-api", "copilot-api-watchdog")
               },
               "bun_version": command("/root/.bun/bin/bun", "--version"),
+              "routing_diagnostics": routing_diagnostics(),
           }
           print(json.dumps(result, sort_keys=True))
           PY
