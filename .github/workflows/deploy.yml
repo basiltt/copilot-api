@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       activate_reviewed_release:
-        description: Activate reviewed 0737003 over baseline 09f3caf, preserving native Agent constraints
+        description: Activate reviewed 56e5a76 over baseline 0737003, preserving native Agent constraints
         type: boolean
         default: false
 
@@ -150,6 +150,7 @@ jobs:
                   "native_rejection_counts": dict(sorted(counts.items())),
                   "buffered_protocol_failures": log.count("Buffered Chat stream protocol failure"),
                   "tool_schema_rejections": log.count("arguments do not match the declared input_schema"),
+                  "native_root_schema_rejections": log.count("input_schema does not support oneOf, allOf, or anyOf at the top level"),
                   "unsigned_thinking_rejections": log.count("thinking_signature_missing"),
                   "raw_request_debug_entries_present": "Anthropic request payload:" in log,
                   "request_or_tool_content_returned": False,
@@ -262,9 +263,9 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSHPASS: ${{ secrets.SERVER_PASSWORD }}
-          APPLICATION_SHA: 0737003a82b0d57fc0be8f56db2c013e136e2449
-          APPLICATION_TREE: ffdd2e7aaeeef3ce7040919427c9948482af6ba8
-          EXPECTED_LIVE_SHA: 09f3caf795a7e8e9c5350cf2cfef319e3244ef61
+          APPLICATION_SHA: 56e5a7646db84b44b803eb845afa7979c75c3ff5
+          APPLICATION_TREE: ad8232ed782a0456f3aa230e3e8c7aff8667bd22
+          EXPECTED_LIVE_SHA: 0737003a82b0d57fc0be8f56db2c013e136e2449
         run: |
           set -euo pipefail
           [[ "$SERVER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
