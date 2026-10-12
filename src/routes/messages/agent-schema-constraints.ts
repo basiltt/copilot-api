@@ -1,5 +1,6 @@
 import consola from "consola"
 
+import type { NativeMessagesCompatibilityResult } from "~/services/copilot/create-native-messages-completion"
 import type { Model } from "~/services/copilot/get-models"
 
 import { state } from "~/lib/state"
@@ -62,8 +63,19 @@ export function usesAgentSchemaConstraints(
   )
 }
 
-export function logSkippedAgentSchemaConstraints(reason: SkipReason): void {
-  consola.warn("Agent schema constraints not applied", { reason })
+export function logSkippedAgentSchemaConstraints(
+  reason: SkipReason,
+  compatibility?: NativeMessagesCompatibilityResult,
+): void {
+  consola.warn("Agent schema constraints not applied", {
+    reason,
+    ...(compatibility ?
+      {
+        nativeRouting: compatibility.routing,
+        nativeRejectionReasons: compatibility.rejectionReasons,
+      }
+    : {}),
+  })
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

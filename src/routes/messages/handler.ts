@@ -1662,7 +1662,7 @@ function evaluateNativeRouting(
     result.routing !== "native_selected"
     && usesAgentSchemaConstraints(payload)
   )
-    logSkippedAgentSchemaConstraints("native_unavailable")
+    logSkippedAgentSchemaConstraints("native_unavailable", result)
   return result
 }
 

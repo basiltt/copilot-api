@@ -611,7 +611,17 @@ they retain normal validation rather than an implicit schema downgrade.
 
 The Chat compatibility path is **not** assumed to enforce `function.strict`.
 If native transport is unavailable, automatic constraints are skipped and
-reported. Native compilation, policy, or protocol failures are surfaced without
+reported with `nativeRouting` and the complete fixed-enum
+`nativeRejectionReasons`. `native_disabled` and `model_not_advertised` identify
+configuration or catalog gating; `request_unsupported` identifies request
+features such as `thinking_signature_missing`, `typed_tools`, or
+`message_role_system_nonprefix`. These diagnostics never include request
+content, tool arguments, schemas, or signatures. The warning means the Chat
+compatibility path still validates generated tool input but cannot promise
+native constrained generation; it does not by itself mean the request failed.
+A logged `stream 200` only confirms that the SSE response was opened, not that
+the final completion succeeded.
+Native compilation, policy, or protocol failures are surfaced without
 retrying unconstrained. All completed calls still undergo full original-schema
 validation before any sibling action is released. Refusal, truncation,
 cancellation, call identity, and provider thinking signatures keep their
@@ -724,6 +734,17 @@ limit. Unsupported request constructs are routed to the existing compatible
 transport before any native request is made. Once a native request is issued,
 HTTP, policy, and protocol errors are returned without retrying through a
 different endpoint.
+Fable 5.1 and Opus 5.5 also keep supported mid-conversation `system` messages
+on native transport: a nonempty text-only system-message group must follow a
+user turn and precede an assistant turn or end the history. Consecutive system
+messages, text-block cache controls, and the surrounding conversation are
+forwarded unchanged. The proxy does not move these instructions into the
+top-level system prompt, because that would change when they apply and can
+invalidate later thinking signatures. Other models, leading system-role
+prefixes, unsupported placement/content, and beta-specific system-message
+fields retain compatibility routing. This follows the documented
+[system-message placement rules](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages#limitations)
+and was checked against both native Copilot models without executing tools.
 Legacy conversation history containing unsigned thinking or other blocks that
 cannot be represented faithfully also stays on the compatible transport; the
 proxy does not forge or discard provider thinking signatures.

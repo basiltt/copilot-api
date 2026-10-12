@@ -27,6 +27,9 @@ type Transport =
 
 interface WireRequest {
   model: string
+  messages: Array<unknown>
+  system?: AnthropicMessagesPayload["system"]
+  thinking?: AnthropicMessagesPayload["thinking"]
   output_config?: { effort?: string }
   tools: Array<{
     name?: string
@@ -366,6 +369,75 @@ describe("native Agent schema constraints", () => {
           expect(bodies[0].model).toBe(modelId)
           expect(request).toEqual(original)
           expect(fetchSpy).toHaveBeenCalledTimes(1)
+        })
+      }
+    }
+  }
+
+  for (const modelId of ["claude-fable-5.1", "claude-opus-5.5"]) {
+    for (const transport of ["native-json", "native-sse"] as const) {
+      for (const replay of [false, true]) {
+        test(`${modelId}, ${transport}, replay=${replay}: mid-conversation system guidance keeps native Agent constraints`, async () => {
+          const request = payload(transport, claudeCodeAgentSchema)
+          const selected = state.models?.data[0]
+          if (!selected) throw new Error("Missing test model")
+          selected.id = modelId
+          selected.capabilities.supports.structured_outputs = true
+          request.model = modelId
+          state.agentSchemaConstraints = true
+          request.thinking = { type: "adaptive" }
+          request.system = "Synthetic initial guidance, unchanged."
+          request.messages.push(
+            { role: "system", content: "Synthetic new guidance, unchanged." },
+            {
+              role: "system",
+              content: [
+                {
+                  type: "text",
+                  text: "Keep the same caller permissions.",
+                  cache_control: { type: "ephemeral" },
+                },
+              ],
+            },
+          )
+          if (replay) {
+            request.messages.push(
+              {
+                role: "assistant",
+                content: [
+                  {
+                    type: "thinking",
+                    thinking: "fixture",
+                    signature: "unchanged-signature",
+                  },
+                  { type: "text", text: "Ready." },
+                ],
+              },
+              { role: "user", content: "Continue the synthetic task." },
+            )
+          }
+          const original = structuredClone(request)
+          const operation = {
+            description: "Inspect a synthetic fixture",
+            prompt: "Read-only synthetic analysis.",
+          }
+          mockReply(transport, completion(request, operation))
+          const response = await send(request)
+          expect(response.status).toBe(200)
+          expect(
+            toolInputs(await response.text(), request.stream === true),
+          ).toEqual([operation])
+          expect(fetchSpy).toHaveBeenCalledTimes(1)
+          expect(fetchSpy.mock.calls[0]?.[0]).toBe(
+            "https://api.githubcopilot.com/v1/messages",
+          )
+          expect(bodies[0].messages).toEqual(original.messages)
+          expect(bodies[0].system).toEqual(original.system)
+          expect(bodies[0].thinking).toEqual(original.thinking)
+          expect(bodies[0].tools[0].strict).toBe(true)
+          expect(bodies[0].tools[0].input_schema).toEqual(claudeCodeAgentSchema)
+          expect(request).toEqual(original)
+          expect(logs[1]).not.toHaveBeenCalled()
         })
       }
     }

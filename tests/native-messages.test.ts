@@ -688,6 +688,97 @@ describe("native Messages routing and body", () => {
     ).toEqual(["message_role_system", "message_role_system_nonprefix"])
   })
 
+  for (const modelId of [
+    "claude-fable-5.1",
+    "claude-fable-5-1",
+    "claude-opus-5.5",
+    "claude-opus-5-5",
+  ]) {
+    test(`${modelId}: documented text system-message placement is native-compatible`, () => {
+      const request = {
+        ...payload(),
+        model: modelId,
+        messages: [
+          { role: "user", content: "Synthetic task." },
+          { role: "system", content: "Synthetic later guidance." },
+        ],
+      } satisfies AnthropicMessagesPayload
+      expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
+        "native_selected",
+      )
+      expect(nativeMessagesRejectionReasons(request)).toEqual([])
+    })
+  }
+
+  test("native system-message support never moves instructions or drops unsupported semantics", () => {
+    const request = { ...payload(), model: "claude-fable-5.1" }
+    const user = { role: "user", content: "Synthetic task." }
+    const system = { role: "system", content: "Synthetic instruction." }
+    const assistant = { role: "assistant", content: "Synthetic reply." }
+    const unsupportedHistories = [
+      [system, user],
+      [user, system, user],
+      [user, assistant, system],
+      [user, { ...system, clear_at: "next_user_message" }],
+      [user, { ...system, output_config: { effort: "low" } }],
+      [
+        user,
+        {
+          ...system,
+          content: [{ type: "tool_removal", tool: { name: "Write" } }],
+        },
+      ],
+      [user, { ...system, content: [{ type: "text", text: 42 }] }],
+      [user, { ...system, content: [] }],
+      [user, { ...system, content: "" }],
+    ]
+    for (const messages of unsupportedHistories) {
+      const candidate = { ...request, messages } as AnthropicMessagesPayload
+      const original = structuredClone(candidate)
+      expect(nativeMessagesCompatibility(candidate, ["/v1/messages"])).toBe(
+        "request_unsupported",
+      )
+      expect(nativeMessagesRejectionReasons(candidate)).toContain(
+        "message_role_system",
+      )
+      expect(candidate).toEqual(original)
+    }
+    for (const modelId of ["claude-sonnet-5", "unverified-native-model"]) {
+      expect(
+        nativeMessagesCompatibility(
+          {
+            ...request,
+            model: modelId,
+            messages: [user, system],
+          } as AnthropicMessagesPayload,
+          ["/v1/messages"],
+        ),
+      ).toBe("request_unsupported")
+    }
+  })
+
+  test("native system-message support preserves unsigned-thinking rejection", () => {
+    const request = {
+      ...payload(),
+      model: "claude-fable-5.1",
+      messages: [
+        { role: "user", content: "Synthetic task." },
+        { role: "system", content: "Synthetic later guidance." },
+        {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "Unsigned legacy state." }],
+        },
+        { role: "user", content: "Continue." },
+      ],
+    } satisfies AnthropicMessagesPayload
+    expect(nativeMessagesRejectionReasons(request)).toEqual([
+      "thinking_signature_missing",
+    ])
+    expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
+      "request_unsupported",
+    )
+  })
+
   test("keeps empty tool results eligible but distinguishes absent and unsupported content", () => {
     const request = payload()
     request.messages = [
@@ -1154,8 +1245,9 @@ describe("native Agent constraint safety", () => {
   test("an incompatible request remains compatible without a false strict-generation guarantee", async () => {
     const request = agentPayload()
     request.messages = [
-      { role: "system", content: "Synthetic legacy history." },
       ...request.messages,
+      { role: "system", content: "Synthetic legacy history." },
+      { role: "user", content: "Continue." },
     ]
     queue(chatCompletion())
     const response = await send(request)
@@ -1166,8 +1258,76 @@ describe("native Agent constraint safety", () => {
     expect(tools[0].function.strict).toBeUndefined()
     expect(logs[1]).toHaveBeenCalledWith(
       "Agent schema constraints not applied",
-      { reason: "native_unavailable" },
+      {
+        reason: "native_unavailable",
+        nativeRouting: "request_unsupported",
+        nativeRejectionReasons: [
+          "message_role_system",
+          "message_role_system_nonprefix",
+        ],
+      },
     )
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  for (const routing of ["native_disabled", "model_not_advertised"] as const) {
+    test(`skipped Agent constraints identify ${routing} without inventing a request defect`, async () => {
+      const request = agentPayload()
+      if (routing === "native_disabled") state.nativeMessages = false
+      else
+        state.models = { object: "list", data: [model(["/chat/completions"])] }
+      queue(chatCompletion())
+      const response = await send(request)
+      expect(response.status).toBe(200)
+      await response.text()
+      expect(logs[1]).toHaveBeenCalledWith(
+        "Agent schema constraints not applied",
+        {
+          reason: "native_unavailable",
+          nativeRouting: routing,
+          nativeRejectionReasons: [],
+        },
+      )
+      expect(urls).toEqual(["https://api.githubcopilot.com/chat/completions"])
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+  }
+
+  test("skipped Agent constraints report every history blocker without private values", async () => {
+    const privateValue = "private-routing-fixture-never-log"
+    const request = agentPayload()
+    request.messages = [
+      { role: "user", content: privateValue },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: privateValue },
+          { type: "text", text: privateValue },
+        ],
+      },
+      { role: "system", content: privateValue },
+      { role: "user", content: privateValue },
+    ]
+    const original = structuredClone(request)
+    queue(chatCompletion())
+    const response = await send(request)
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(logs[1]).toHaveBeenCalledWith(
+      "Agent schema constraints not applied",
+      {
+        reason: "native_unavailable",
+        nativeRouting: "request_unsupported",
+        nativeRejectionReasons: [
+          "thinking_signature_missing",
+          "message_role_system",
+          "message_role_system_nonprefix",
+        ],
+      },
+    )
+    expect(JSON.stringify(logs[1].mock.calls)).not.toContain(privateValue)
+    expect(request).toEqual(original)
+    expect(urls).toEqual(["https://api.githubcopilot.com/chat/completions"])
     expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 })

@@ -18,6 +18,7 @@ import type {
 
 import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
+import { canonicalizeModelId } from "~/lib/model-resolver"
 import { requestSignal } from "~/lib/request-lifecycle"
 import { state } from "~/lib/state"
 import {
@@ -52,6 +53,10 @@ const NATIVE_TOOL_RESULT_BLOCK_TYPES = new Set([
   "image",
   "document",
   "tool_reference",
+])
+const NATIVE_SYSTEM_MESSAGE_MODELS = new Set([
+  "claude-fable-5-1",
+  "claude-opus-5-5",
 ])
 
 export type NativeMessagesCompatibility =
@@ -98,6 +103,53 @@ function invalidNativeRequest(message: string): never {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function isPlainTextSystemMessage(message: Record<string, unknown>): boolean {
+  if (!Object.keys(message).every((key) => key === "role" || key === "content"))
+    return false
+  const content = message.content
+  if (typeof content === "string") return content.length > 0
+  return (
+    Array.isArray(content)
+    && content.length > 0
+    && content.every(
+      (block) =>
+        isRecord(block)
+        && block.type === "text"
+        && typeof block.text === "string"
+        && block.text.length > 0,
+    )
+  )
+}
+
+function supportedNativeSystemMessages(
+  payload: AnthropicMessagesPayload,
+): Set<unknown> {
+  const supported = new Set<unknown>()
+  if (!NATIVE_SYSTEM_MESSAGE_MODELS.has(canonicalizeModelId(payload.model)))
+    return supported
+  let precedingRole: unknown
+  let group: Array<Record<string, unknown>> = []
+  // Consecutive system messages share the placement rule as one group.
+  for (let index = 0; index <= payload.messages.length; index++) {
+    const candidate: unknown = payload.messages[index]
+    const role = isRecord(candidate) ? candidate.role : undefined
+    if (isRecord(candidate) && role === "system") {
+      group.push(candidate)
+      continue
+    }
+    if (
+      precedingRole === "user"
+      && (role === "assistant" || index === payload.messages.length)
+      && group.every((message) => isPlainTextSystemMessage(message))
+    ) {
+      for (const message of group) supported.add(message)
+    }
+    group = []
+    precedingRole = role
+  }
+  return supported
 }
 
 function hasTypedTools(tools: Array<AnthropicTool> | undefined): boolean {
@@ -210,6 +262,7 @@ function nativeMessageContentRejections(
     reasons.add("message_content_invalid")
     return [...reasons]
   }
+  const supportedSystemMessages = supportedNativeSystemMessages(payload)
   let sawNonSystemMessage = false
   for (const candidateMessage of payload.messages as Array<unknown>) {
     if (!isRecord(candidateMessage)) {
@@ -217,6 +270,7 @@ function nativeMessageContentRejections(
       sawNonSystemMessage = true
       continue
     }
+    if (supportedSystemMessages.has(candidateMessage)) continue
     if (
       candidateMessage.role !== "user"
       && candidateMessage.role !== "assistant"
@@ -342,6 +396,7 @@ export function buildNativeMessagesBody(
   map: ToolNameMap,
 ): Record<string, unknown> {
   const messages = payload.messages.map((message) => {
+    if (message.role === "system") return message
     if (!Array.isArray(message.content)) return message
     if (message.role === "assistant") {
       return {
