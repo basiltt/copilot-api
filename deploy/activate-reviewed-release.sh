@@ -134,6 +134,44 @@ flock --nonblock 9
 unchanged_baseline
 healthy
 [[ "$(digest "$stage/release.bundle")" == "$bundle_hash" ]]
+# Preserve only the known unactivated preparation from the failed dependency download.
+if [[ "$candidate" == cf1b5ab630dc839314950a37ff495d2172e67fc7 && -e "$release" ]]; then
+  python3 - "$release" \
+    /root/projects/copilot-api-release-staging/run-38565267023-1 \
+    /root/projects/copilot-api-release-receipts/run-38565267023-1 \
+    "$candidate" "$expected_tree" "$main_hash" "$watchdog_hash" <<'PY'
+import hashlib
+import pathlib
+import subprocess
+import sys
+
+release, stage, receipts = map(pathlib.Path, sys.argv[1:4])
+candidate, expected_tree, main_hash, watchdog_hash = sys.argv[4:]
+for directory in (release, stage, receipts):
+    if not directory.is_dir() or directory.resolve(strict=True) != directory:
+        raise RuntimeError("Failed preparation paths must be existing canonical directories")
+for marker in (receipts / "result.txt", receipts / "tests.log", stage / "main.after", stage / "watchdog.after"):
+    if marker.exists() or marker.is_symlink():
+        raise RuntimeError("Refusing to move a release that advanced beyond dependency preparation")
+for name, expected in (("main.before", main_hash), ("watchdog.before", watchdog_hash)):
+    source = receipts / name
+    if source.is_symlink() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+        raise RuntimeError("Failed preparation does not match the unchanged live pins")
+for arguments, expected in (
+    (("rev-parse", "HEAD"), candidate),
+    (("rev-parse", "HEAD^{tree}"), expected_tree),
+    (("status", "--porcelain"), ""),
+):
+    actual = subprocess.check_output(["git", "-C", str(release), *arguments], text=True).strip()
+    if actual != expected:
+        raise RuntimeError("The inactive preparation changed; refusing to move it")
+destination = stage / "unactivated-release"
+if destination.exists() or destination.is_symlink():
+    raise RuntimeError("The failed preparation was already quarantined")
+release.rename(destination)
+print("Preserved the verified unactivated preparation; retrying with a fresh isolated install.")
+PY
+fi
 [[ ! -e "$release" && ! -e "$receipts" ]]
 install -d -m 700 "$receipts" "$stage/test-home"
 exec 3>>"$receipts/rollback.log"
