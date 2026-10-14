@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       activate_reviewed_release:
-        description: Activate reviewed 56e5a76 over baseline 0737003, preserving native Agent constraints
+        description: Activate reviewed 33344d1 over baseline 56e5a76, preserving proxy settings
         type: boolean
         default: false
 
@@ -283,9 +283,9 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSHPASS: ${{ secrets.SERVER_PASSWORD }}
-          APPLICATION_SHA: 56e5a7646db84b44b803eb845afa7979c75c3ff5
-          APPLICATION_TREE: ad8232ed782a0456f3aa230e3e8c7aff8667bd22
-          EXPECTED_LIVE_SHA: 0737003a82b0d57fc0be8f56db2c013e136e2449
+          APPLICATION_SHA: 33344d129a2e114787e9887991638231e6083a98
+          APPLICATION_TREE: 9a96a58e59a45d17cd19e757b756be5fd7cdf4db
+          EXPECTED_LIVE_SHA: 56e5a7646db84b44b803eb845afa7979c75c3ff5
         run: |
           set -euo pipefail
           [[ "$SERVER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
