@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       activate_reviewed_release:
-        description: Activate reviewed 33344d1 over baseline 56e5a76, preserving proxy settings
+        description: Activate reviewed cf1b5ab over baseline 33344d1, preserving proxy settings
         type: boolean
         default: false
 
@@ -167,6 +167,7 @@ jobs:
                   "native_routing_counts": dict(sorted(routing.items())),
                   "native_rejection_counts": dict(sorted(counts.items())),
                   "buffered_protocol_failures": log.count("Buffered Chat stream protocol failure"),
+                  "native_malformed_tool_inputs": log.count("Native Messages completed with malformed tool input"),
                   "tool_schema_rejections": log.count("arguments do not match the declared input_schema"),
                   "toolsearch_regeneration_outcomes": dict(sorted(recovery_outcomes.items())),
                   "toolsearch_regeneration_rejection_reasons": dict(sorted(recovery_reasons.items())),
@@ -283,9 +284,9 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSHPASS: ${{ secrets.SERVER_PASSWORD }}
-          APPLICATION_SHA: 33344d129a2e114787e9887991638231e6083a98
-          APPLICATION_TREE: 9a96a58e59a45d17cd19e757b756be5fd7cdf4db
-          EXPECTED_LIVE_SHA: 56e5a7646db84b44b803eb845afa7979c75c3ff5
+          APPLICATION_SHA: cf1b5ab630dc839314950a37ff495d2172e67fc7
+          APPLICATION_TREE: da2484e5d9de5884572048c5fb7b00ce759a0934
+          EXPECTED_LIVE_SHA: 33344d129a2e114787e9887991638231e6083a98
         run: |
           set -euo pipefail
           [[ "$SERVER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
