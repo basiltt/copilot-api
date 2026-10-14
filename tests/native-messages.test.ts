@@ -121,7 +121,12 @@ type NativeBlock =
 
 function nativeSSE(
   blocks: Array<NativeBlock>,
-  stopReason: "end_turn" | "max_tokens" | "tool_use" | "refusal" = "end_turn",
+  stopReason:
+    | "end_turn"
+    | "max_tokens"
+    | "model_context_window_exceeded"
+    | "tool_use"
+    | "refusal" = "end_turn",
   usage: {
     input_tokens?: number
     cache_read_input_tokens?: number
@@ -312,6 +317,39 @@ function textNativeEvents(
     },
     { type: "message_stop" },
   ]
+}
+
+function toolNativeEvents(
+  input: Record<string, unknown>,
+  fragments: Array<string>,
+): Array<Record<string, unknown>> {
+  const events = textNativeEvents()
+  events.splice(
+    1,
+    3,
+    {
+      type: "content_block_start",
+      index: 0,
+      content_block: {
+        type: "tool_use",
+        id: "call_native",
+        name: "Probe",
+        input,
+      },
+    },
+    ...fragments.map((partialJson) => ({
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: partialJson },
+    })),
+    { type: "content_block_stop", index: 0 },
+  )
+  events[events.length - 2] = {
+    type: "message_delta",
+    delta: { stop_reason: "tool_use", stop_sequence: null },
+    usage: { output_tokens: 2 },
+  }
+  return events
 }
 
 function queue(...responses: Array<Response>): void {
@@ -1103,6 +1141,251 @@ describe("native Messages routing and body", () => {
     expect(JSON.stringify(body.messages)).not.toContain(longName)
     expect(JSON.stringify(body.messages)).toContain(alias)
   })
+})
+
+describe("native empty tool-input deltas", () => {
+  for (const stream of [false, true]) {
+    test(`preserves a real no-input tool and signed thinking (stream=${stream})`, async () => {
+      const request = payload(stream)
+      request.tools = [
+        {
+          name: "CronList",
+          input_schema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      ]
+      queue(
+        nativeSSE(
+          [
+            {
+              type: "thinking",
+              thinking: "List scheduled tasks.",
+              signature: "sig_no_input",
+            },
+            {
+              type: "tool_use",
+              id: "call_no_input",
+              name: "CronList",
+              inputJson: "",
+            },
+          ],
+          "tool_use",
+        ),
+      )
+
+      const response = await send(request)
+      const output = await response.text()
+      expect(response.status).toBe(200)
+      expect(output).not.toContain('"type":"error"')
+      expect(output).toContain('"stop_reason":"tool_use"')
+      expect(output).toContain("sig_no_input")
+      expect(output).toContain("call_no_input")
+      if (stream) {
+        expect(output.match(/event: message_stop/g)).toHaveLength(1)
+        expect(output).toContain('"partial_json":"{}"')
+      } else {
+        expect(JSON.parse(output)).toMatchObject({
+          content: [
+            { type: "thinking", signature: "sig_no_input" },
+            {
+              type: "tool_use",
+              id: "call_no_input",
+              name: "CronList",
+              input: {},
+            },
+          ],
+        })
+      }
+      expect(bodies[0].tools).toEqual(request.tools)
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+      expect(urls[0]).toEndWith("/v1/messages")
+    })
+
+    test.each([
+      { initial: {}, fragments: [], expected: {} },
+      { initial: {}, fragments: ["", ""], expected: {} },
+      {
+        initial: { value: "retained" },
+        fragments: [""],
+        expected: { value: "retained" },
+      },
+      {
+        initial: {},
+        fragments: ["", '{"value":', '"retained"}', ""],
+        expected: { value: "retained" },
+      },
+    ])(
+      `empty fragments never replace provider input (stream=${stream}, fragments=$fragments)`,
+      async ({ initial, fragments, expected }) => {
+        const request = payload(stream)
+        request.tools = [
+          {
+            name: "Probe",
+            input_schema: {
+              type: "object",
+              properties: { value: { type: "string" } },
+              additionalProperties: false,
+            },
+          },
+        ]
+        queue(eventStreamResponse(toolNativeEvents(initial, fragments)))
+
+        const response = await send(request)
+        const output = await response.text()
+        expect(response.status).toBe(200)
+        expect(output).not.toContain('"type":"error"')
+        expect(output).toContain('"stop_reason":"tool_use"')
+        expect(output).toContain('"id":"call_native"')
+        if (stream) {
+          expect(output).toContain(
+            `"partial_json":${JSON.stringify(JSON.stringify(expected))}`,
+          )
+          expect(output.match(/event: message_stop/g)).toHaveLength(1)
+        } else {
+          expect(JSON.parse(output)).toMatchObject({
+            content: [{ type: "tool_use", name: "Probe", input: expected }],
+          })
+        }
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      },
+    )
+
+    test(`empty fragments do not bypass required arguments or release siblings (stream=${stream})`, async () => {
+      const request = payload(stream)
+      request.tools = [
+        {
+          name: "EmptyProbe",
+          input_schema: { type: "object", additionalProperties: false },
+        },
+        {
+          name: "RequiredProbe",
+          input_schema: {
+            type: "object",
+            properties: {
+              value: { type: "string", default: "never-inserted" },
+            },
+            required: ["value"],
+            additionalProperties: false,
+          },
+        },
+      ]
+      queue(
+        nativeSSE(
+          [
+            {
+              type: "tool_use",
+              id: "valid_sibling",
+              name: "EmptyProbe",
+              inputJson: "",
+            },
+            {
+              type: "tool_use",
+              id: "invalid_required",
+              name: "RequiredProbe",
+              inputJson: "",
+            },
+          ],
+          "tool_use",
+        ),
+      )
+
+      const response = await send(request)
+      const output = await response.text()
+      expect(response.status).toBe(stream ? 200 : 502)
+      expect(output).toContain("required at $")
+      expect(output).not.toContain('"type":"tool_use"')
+      expect(output).not.toContain("valid_sibling")
+      expect(output).not.toContain("never-inserted")
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test.each([" \t\n", "{", "null", "[]", '"text"', "0"])(
+      `nonempty malformed or non-object fragments remain errors (stream=${stream}, input=%j)`,
+      async (inputJson) => {
+        const request = payload(stream)
+        request.tools = [{ name: "Probe", input_schema: { type: "object" } }]
+        queue(eventStreamResponse(toolNativeEvents({}, ["", inputJson, ""])))
+        const response = await send(request)
+        const output = await response.text()
+        expect(response.status).toBe(stream ? 200 : 502)
+        expect(output).toContain(
+          "Native Messages upstream returned an invalid response.",
+        )
+        expect(output).not.toContain('"type":"tool_use"')
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      },
+    )
+
+    test(`empty fragments cannot hide mixed input representations (stream=${stream})`, async () => {
+      const request = payload(stream)
+      request.tools = [{ name: "Probe", input_schema: { type: "object" } }]
+      queue(
+        eventStreamResponse(
+          toolNativeEvents({ value: "original" }, ["", '{"value":"changed"}']),
+        ),
+      )
+      const response = await send(request)
+      const output = await response.text()
+      expect(response.status).toBe(stream ? 200 : 502)
+      expect(output).toContain(
+        "Native Messages upstream returned an invalid response.",
+      )
+      expect(output).not.toContain('"type":"tool_use"')
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test.each([
+      "refusal",
+      "max_tokens",
+      "model_context_window_exceeded",
+    ] as const)(
+      `empty fragments do not change %s precedence (stream=${stream})`,
+      async (reason) => {
+        const request = payload(stream)
+        request.tools = [{ name: "Probe", input_schema: { type: "object" } }]
+        queue(
+          nativeSSE(
+            [
+              {
+                type: "tool_use",
+                id: "call_stopped",
+                name: "Probe",
+                inputJson: "",
+              },
+            ],
+            reason,
+          ),
+        )
+        const response = await send(request)
+        const output = await response.text()
+        expect(response.status).toBe(200)
+        expect(output).toContain(
+          `"stop_reason":"${reason === "refusal" ? "refusal" : "max_tokens"}"`,
+        )
+        expect(output).not.toContain('"stop_reason":"tool_use"')
+        expect(output).not.toContain('"type":"tool_use"')
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      },
+    )
+
+    test(`empty input still requires terminal message_stop (stream=${stream})`, async () => {
+      const request = payload(stream)
+      request.tools = [{ name: "Probe", input_schema: { type: "object" } }]
+      queue(eventStreamResponse(toolNativeEvents({}, [""]).slice(0, -1)))
+      const response = await send(request)
+      const output = await response.text()
+      expect(response.status).toBe(stream ? 200 : 502)
+      expect(output).toContain(
+        "Native Messages upstream returned an invalid response.",
+      )
+      expect(output).not.toContain('"type":"tool_use"')
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    })
+  }
 })
 
 describe("native Agent constraint safety", () => {

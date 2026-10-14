@@ -805,6 +805,19 @@ Schema recovery fails explicitly if either the original or regenerated native
 turn contains signed thinking, because replaying a context-bound signature
 with changed tool arguments is not safe.
 
+Empty `input_json_delta.partial_json` fragments are no-ops: they do not replace
+the explicit `content_block_start.input` object or any accumulated JSON. Copilot
+uses `input: {}` followed only by an empty fragment for parameterless tools such
+as Claude Code's `CronList`. Parsing that fragment as a JSON document incorrectly
+caused `Native Messages completed with malformed tool input` (HTTP 502 for JSON
+clients, an error event for SSE clients). This framing was reproduced with real
+Opus 5.5 and Fable 5.1 responses and agrees with
+[Anthropic's SDK empty-buffer handling](https://github.com/anthropics/anthropic-sdk-typescript/blob/2979ed5cef4b2f059b95af23e08728c01e588f86/src/internal/message-stream-utils.ts).
+The original input still must pass the caller's schema; required arguments are
+not invented, and malformed nonempty JSON, non-object input, incompatible input
+representations, and incomplete turns still fail. Refusal and truncation
+handling are unchanged.
+
 The catalog's advertised output limit describes the accepted request contract,
 not proof that every model/endpoint combination will produce that many tokens.
 This option does not increase budgets, retry truncated output, or claim to

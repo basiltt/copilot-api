@@ -758,7 +758,8 @@ class NativeStreamCollector {
         && typeof event.delta.partial_json === "string"
       ) {
         if (
-          current.arguments === undefined
+          event.delta.partial_json.length > 0
+          && !current.arguments
           && Object.keys(current.block.input as Record<string, unknown>).length
             > 0
         )
@@ -844,26 +845,30 @@ class NativeStreamCollector {
     )
       invalidNativeResponse("Native Messages stream ended incompletely")
 
+    const truncatedOrRefused =
+      this.stopReason === "max_tokens"
+      || this.stopReason === "model_context_window_exceeded"
+      || this.stopReason === "refusal"
     const rawToolArguments = new Map<number, string>()
     let toolIndex = 0
     const content = [...this.blocks.values()].map((entry) => {
       if (entry.block.type !== "tool_use") return entry.block
       const startInput = entry.block.input as Record<string, unknown>
-      const argumentsJson = entry.arguments ?? JSON.stringify(startInput)
+      // Empty deltas add no input; do not normalize an unfinished call's raw bytes.
+      const argumentsJson =
+        entry.arguments === "" && !truncatedOrRefused ?
+          JSON.stringify(startInput)
+        : (entry.arguments ?? JSON.stringify(startInput))
       rawToolArguments.set(toolIndex, argumentsJson)
       toolIndex++
-      if (entry.arguments === undefined) return entry.block
+      if (!entry.arguments) return entry.block
       try {
         const input: unknown = JSON.parse(entry.arguments)
         if (!isRecord(input))
           throw new TypeError("Tool input must be an object")
         return { ...entry.block, input }
       } catch {
-        if (
-          this.stopReason !== "max_tokens"
-          && this.stopReason !== "model_context_window_exceeded"
-          && this.stopReason !== "refusal"
-        )
+        if (!truncatedOrRefused)
           invalidNativeResponse(
             "Native Messages completed with malformed tool input",
           )
