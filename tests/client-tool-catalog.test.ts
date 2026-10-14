@@ -1,7 +1,10 @@
 /* eslint-disable max-lines-per-function */
 import { describe, expect, test } from "bun:test"
 
+import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
+
 import { expandClientTool } from "~/routes/messages/client-tool-catalog"
+import { translateToOpenAI } from "~/routes/messages/non-stream-translation"
 import {
   compileToolSchema,
   parseToolInput,
@@ -11,6 +14,66 @@ import {
   createToolNameMapFromAnthropicPayload,
   toAnthropicToolIdentity,
 } from "~/routes/messages/tool-name-mapping"
+import { validateAnthropicPayload } from "~/routes/messages/validate-payload"
+import { buildNativeMessagesBody } from "~/services/copilot/create-native-messages-completion"
+
+describe("caller-defined Claude Code tools", () => {
+  test.each([
+    "Read",
+    "Monitor",
+    "ListAgents",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "WaitForMcpServers",
+    "PowerShell",
+    "FutureClientTool",
+  ])(
+    "%s retains the caller schema without a built-in-name allowlist",
+    (name) => {
+      const inputSchema = {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        properties: {
+          file_path: { type: "string" },
+          allow_large: { type: "boolean" },
+        },
+        required: ["file_path"],
+        additionalProperties: false,
+      }
+      const request: AnthropicMessagesPayload = {
+        model: "claude-fable-5.1",
+        max_tokens: 256,
+        messages: [{ role: "user", content: "Synthetic declaration fixture." }],
+        tools: [{ name, input_schema: inputSchema }],
+      }
+      const original = structuredClone(request)
+      expect(validateAnthropicPayload(request)).toBeUndefined()
+      const map = createToolNameMapFromAnthropicPayload(request)
+      expect(translateToOpenAI(request, map).tools).toEqual([
+        {
+          type: "function",
+          function: { name, description: undefined, parameters: inputSchema },
+        },
+      ])
+      expect(buildNativeMessagesBody(request, map).tools).toEqual(request.tools)
+      expect(
+        parseToolInput(
+          '{"file_path":"synthetic.txt","allow_large":true}',
+          name,
+          inputSchema,
+        ),
+      ).toEqual({ file_path: "synthetic.txt", allow_large: true })
+      expect(() =>
+        parseToolInput(
+          '{"file_path":"synthetic.txt","unknown":true}',
+          name,
+          inputSchema,
+        ),
+      ).toThrow()
+      expect(request).toEqual(original)
+    },
+  )
+})
 
 describe("current typed client schemas", () => {
   test("browser modifier chords and legacy computer actions match the client contract", () => {

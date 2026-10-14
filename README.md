@@ -561,6 +561,26 @@ tool retain strict validation without regeneration.
 | Anthropic web fetch, code execution, advisor, hosted tool search, remote `mcp_toolset` | Explicit unsupported-capability error. Passing a schema cannot provision Anthropic's sandbox, remote executor, or advisor. |
 | Programmatic `allowed_callers`, container, remote `mcp_servers`, context-management execution | Explicit unsupported-capability error; use direct, client-managed tools/state. |
 
+Claude Code custom tools are not limited to a built-in-name allowlist. New
+client-executed tools such as `Monitor`, `ListAgents`, `ReportFindings`,
+`ScheduleWakeup`, `WaitForMcpServers`, and `PowerShell` use the schema supplied
+on each request; their availability and execution remain the client's
+responsibility. Conditional tools that depend on external services still need
+those services. They are distinct from Anthropic's hosted typed executors above.
+
+As of October 14, 2026, isolated official Claude Code **2.1.295** and **2.1.299**
+captures have identical `ToolSearch` functional schemas: `query` is a string,
+`max_results` is a number, **both are required**, and extra properties are
+forbidden. The captured tool names are unchanged; the `Read` schema gains the
+optional boolean `allow_large` introduced in
+[2.1.296](https://github.com/anthropics/claude-code/releases/tag/v2.1.296).
+That field is already forwarded and validated from the caller's schema; no
+proxy tool-catalog update or hard-coded ToolSearch parameter defaults are needed.
+These captures are not a claim that every conditional tool is enabled in every
+client configuration. See the current
+[Claude Code tool reference](https://code.claude.com/docs/en/tools-reference)
+and [gateway protocol](https://code.claude.com/docs/en/llm-gateway-protocol).
+
 Tool argument JSON must be an object conforming to the declared schema. A genuine
 parameterless `{}` remains valid. Empty bytes, malformed/truncated JSON,
 non-objects, and unrecovered schema-invalid output produce explicit upstream
@@ -817,6 +837,17 @@ invents tool references or results, or calls a discovered tool. Malformed or
 truncated JSON, refusals, policy errors, mixed tool calls, duplicate or
 previously acknowledged call IDs, changed or reordered existing values, and a
 second invalid result fail without another attempt.
+
+The same-model check recognizes the proxy's existing separator aliases, such
+as `claude-opus-5-5` and `claude-opus-5.5`, without accepting another model,
+minor version, or release-date suffix. The original response model and call
+identities are retained. Rejected repair turns report a fixed, value-free
+reason such as `additional_output`, `refusal`, `no_calls`, `finish_reason`,
+`tool_identity`, `call_count`, or `model_identity`; the outcome log records
+the same reason without tool arguments, IDs, model values, or response text.
+`required at $` means a required root property was omitted, not that the proxy
+lacks a tool. The former combined rejection message cannot identify which
+repair check failed or which required property was missing.
 
 Eligible JSON and SSE requests are buffered through the one-shot output-tool
 transport so invalid discovery arguments are never partially emitted. While

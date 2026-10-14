@@ -136,6 +136,24 @@ jobs:
               log = result.stdout[-8 * 1024 * 1024:].decode(errors="replace")
               counts = collections.Counter()
               routing = collections.Counter()
+              recovery_outcomes = collections.Counter()
+              recovery_reasons = collections.Counter()
+              outcome_names = {
+                  "canceled", "policy_or_transport", "schema_invalid",
+                  "shape_rejected", "timed_out", "validated",
+              }
+              recovery_reason_names = {
+                  "choice_count", "finish_reason", "additional_output", "refusal",
+                  "no_calls", "tool_identity", "missing_id", "duplicate_id",
+                  "call_count", "model_identity", "signed_thinking", "arguments_changed",
+              }
+              for block in re.findall(r"ToolSearch argument regeneration outcome\s*\{([^}]{0,512})\}", log):
+                  outcome = re.search(r"outcome['\"]?\s*:\s*['\"]([a-z_]+)['\"]", block)
+                  reason = re.search(r"reason['\"]?\s*:\s*['\"]([a-z_]+)['\"]", block)
+                  if outcome and outcome[1] in outcome_names:
+                      recovery_outcomes[outcome[1]] += 1
+                  if reason and reason[1] in recovery_reason_names:
+                      recovery_reasons[reason[1]] += 1
               for choice in re.findall(r"nativeRouting['\"]?\s*:\s*['\"]([a-z_]+)['\"]", log):
                   if choice in {"native_disabled", "model_not_advertised", "request_unsupported"}:
                       routing[choice] += 1
@@ -150,6 +168,8 @@ jobs:
                   "native_rejection_counts": dict(sorted(counts.items())),
                   "buffered_protocol_failures": log.count("Buffered Chat stream protocol failure"),
                   "tool_schema_rejections": log.count("arguments do not match the declared input_schema"),
+                  "toolsearch_regeneration_outcomes": dict(sorted(recovery_outcomes.items())),
+                  "toolsearch_regeneration_rejection_reasons": dict(sorted(recovery_reasons.items())),
                   "native_root_schema_rejections": log.count("input_schema does not support oneOf, allOf, or anyOf at the top level"),
                   "unsigned_thinking_rejections": log.count("thinking_signature_missing"),
                   "raw_request_debug_entries_present": "Anthropic request payload:" in log,

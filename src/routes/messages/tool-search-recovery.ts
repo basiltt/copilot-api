@@ -7,6 +7,7 @@ import type {
 } from "~/services/copilot/create-chat-completions"
 
 import { HTTPError } from "~/lib/error"
+import { canonicalizeModelId } from "~/lib/model-resolver"
 import { state } from "~/lib/state"
 import { hasNativeMessagesThinking } from "~/services/copilot/create-native-messages-completion"
 
@@ -52,7 +53,39 @@ interface RegenerationContext extends RecoveryOptions {
   original: ToolSchemaMismatchError
 }
 
-class ToolSearchRecoveryError extends HTTPError {}
+type TurnRejectionReason =
+  | "choice_count"
+  | "finish_reason"
+  | "additional_output"
+  | "refusal"
+  | "no_calls"
+  | "tool_identity"
+  | "missing_id"
+  | "duplicate_id"
+
+type RegenerationRejectionReason =
+  | TurnRejectionReason
+  | "call_count"
+  | "model_identity"
+  | "signed_thinking"
+  | "arguments_changed"
+
+type ToolSearchTurn =
+  | { valid: true; calls: Array<ToolCall> }
+  | { valid: false; reason: TurnRejectionReason }
+
+class ToolSearchRecoveryError extends HTTPError {
+  readonly reason?: RegenerationRejectionReason
+
+  constructor(
+    message: string,
+    response: Response,
+    reason?: RegenerationRejectionReason,
+  ) {
+    super(message, response)
+    this.reason = reason
+  }
+}
 
 type RegenerationOutcome =
   | "canceled"
@@ -99,24 +132,25 @@ function toolSearchCalls(
   response: ChatCompletionResponse,
   name: string,
   allowText: boolean,
-): Array<ToolCall> | undefined {
-  if (response.choices.length !== 1) return undefined
+): ToolSearchTurn {
+  if (response.choices.length !== 1)
+    return { valid: false, reason: "choice_count" }
   const choice = response.choices[0]
   if (choice.finish_reason !== "tool_calls" && choice.finish_reason !== "stop")
-    return undefined
-  if (
-    (!allowText && choice.message.content?.trim())
-    || typeof choice.message.refusal === "string"
-  )
-    return undefined
+    return { valid: false, reason: "finish_reason" }
+  if (typeof choice.message.refusal === "string")
+    return { valid: false, reason: "refusal" }
+  if (!allowText && choice.message.content?.trim())
+    return { valid: false, reason: "additional_output" }
   const calls = choice.message.tool_calls
-  if (
-    !calls?.length
-    || calls.some((call) => call.function.name !== name || !call.id)
-    || new Set(calls.map((call) => call.id)).size !== calls.length
-  )
-    return undefined
-  return calls
+  if (!calls?.length) return { valid: false, reason: "no_calls" }
+  if (calls.some((call) => call.function.name !== name))
+    return { valid: false, reason: "tool_identity" }
+  if (calls.some((call) => !call.id))
+    return { valid: false, reason: "missing_id" }
+  if (new Set(calls.map((call) => call.id)).size !== calls.length)
+    return { valid: false, reason: "duplicate_id" }
+  return { valid: true, calls }
 }
 
 function parseCandidate(raw: string): Record<string, unknown> | undefined {
@@ -156,9 +190,13 @@ function eligibleToolSearch(
   const tools = toolSearchTools(payload)
   if (tools.length !== 1) return undefined
   const name = toOpenAIToolName("ToolSearch", map)
-  const calls = toolSearchCalls(response, name, true)
-  if (!calls || calls.some((call) => payloadContainsCallId(payload, call.id)))
+  const turn = toolSearchCalls(response, name, true)
+  if (
+    !turn.valid
+    || turn.calls.some((call) => payloadContainsCallId(payload, call.id))
+  )
     return undefined
+  const calls = turn.calls
   const candidates = calls.map((call) =>
     parseCandidate(call.function.arguments),
   )
@@ -264,14 +302,16 @@ export function isToolSearchSchemaMismatch(
 function failedRecovery(
   original: ToolSchemaMismatchError,
   outcome: string,
+  reason?: RegenerationRejectionReason,
 ): HTTPError {
-  const message = `${original.message} ToolSearch argument regeneration ${outcome}; no further automatic attempt was made.`
+  const message = `${original.message} ToolSearch argument regeneration ${outcome}${reason ? ` (reason: ${reason})` : ""}; no further automatic attempt was made.`
   return new ToolSearchRecoveryError(
     message,
     Response.json(
       { type: "error", error: { type: "api_error", message } },
       { status: 502 },
     ),
+    reason,
   )
 }
 
@@ -316,16 +356,13 @@ function preservesCandidate(
   )
 }
 
-function logRegenerationOutcome(
-  outcome: RegenerationOutcome,
-  callCount: number,
-  startedAt: number,
-): void {
-  consola.info("ToolSearch argument regeneration outcome", {
-    outcome,
-    callCount,
-    elapsedMs: Math.max(0, Date.now() - startedAt),
-  })
+function sameModelIdentity(original: unknown, repaired: unknown): boolean {
+  return (
+    typeof original === "string"
+    && typeof repaired === "string"
+    && original.trim().length > 0
+    && canonicalizeModelId(original) === canonicalizeModelId(repaired)
+  )
 }
 
 // eslint-disable-next-line max-lines-per-function -- One deadline and terminal outcome must cover the complete atomic batch.
@@ -342,10 +379,22 @@ async function regenerateToolSearch({
     throw failedRecovery(
       original,
       "cannot safely combine regenerated output with signed native thinking",
+      "signed_thinking",
     )
   }
   downstream.throwIfAborted()
   const startedAt = Date.now()
+  const logOutcome = (
+    outcome: RegenerationOutcome,
+    reason?: RegenerationRejectionReason,
+  ) => {
+    consola.info("ToolSearch argument regeneration outcome", {
+      outcome,
+      callCount: eligible.calls.length,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      ...(reason ? { reason } : {}),
+    })
+  }
   const controller = new AbortController()
   const timeout = setTimeout(
     () =>
@@ -373,17 +422,30 @@ async function regenerateToolSearch({
       throw failedRecovery(
         original,
         "regeneration returned context-bound signed native thinking",
+        "signed_thinking",
       )
     }
-    const repairedCalls = toolSearchCalls(repaired, repairName, false)
-    if (
-      !repairedCalls
-      || repairedCalls.length !== eligible.calls.length
-      || repaired.model !== response.model
-    ) {
+    const repairedTurn = toolSearchCalls(repaired, repairName, false)
+    if (!repairedTurn.valid) {
       throw failedRecovery(
         original,
-        "returned a different identity, incomplete turn, refusal, or additional output",
+        "returned an invalid repair turn",
+        repairedTurn.reason,
+      )
+    }
+    const repairedCalls = repairedTurn.calls
+    if (repairedCalls.length !== eligible.calls.length) {
+      throw failedRecovery(
+        original,
+        "returned a different number of discovery calls",
+        "call_count",
+      )
+    }
+    if (!sameModelIdentity(response.model, repaired.model)) {
+      throw failedRecovery(
+        original,
+        "returned a different model identity",
+        "model_identity",
       )
     }
     for (const [index, repairedCall] of repairedCalls.entries()) {
@@ -393,7 +455,11 @@ async function regenerateToolSearch({
         eligible.tool.input_schema,
       )
       if (!preservesCandidate(eligible.calls[index].candidate, repairedInput)) {
-        throw failedRecovery(original, "changed an existing argument")
+        throw failedRecovery(
+          original,
+          "changed an existing argument",
+          "arguments_changed",
+        )
       }
     }
     signal.throwIfAborted()
@@ -419,45 +485,37 @@ async function regenerateToolSearch({
       },
       map,
     )
-    logRegenerationOutcome("validated", eligible.calls.length, startedAt)
+    logOutcome("validated")
     return translated
   } catch (error) {
     if (downstream.aborted) {
-      logRegenerationOutcome("canceled", eligible.calls.length, startedAt)
+      logOutcome("canceled")
       throw downstream.reason
     }
     if (controller.signal.aborted) {
-      logRegenerationOutcome("timed_out", eligible.calls.length, startedAt)
+      logOutcome("timed_out")
       throw failedRecovery(original, "timed out after 20 seconds")
     }
     if (error instanceof ToolSchemaMismatchError) {
-      logRegenerationOutcome("schema_invalid", eligible.calls.length, startedAt)
+      logOutcome("schema_invalid")
       throw failedRecovery(original, "still failed the unchanged schema")
     }
     if (error instanceof HTTPError && !received) {
-      logRegenerationOutcome(
-        "policy_or_transport",
-        eligible.calls.length,
-        startedAt,
-      )
+      logOutcome("policy_or_transport")
       throw error
     }
     if (error instanceof ToolSearchRecoveryError) {
-      logRegenerationOutcome("shape_rejected", eligible.calls.length, startedAt)
+      logOutcome("shape_rejected", error.reason)
       throw error
     }
     if (error instanceof HTTPError) {
-      logRegenerationOutcome("shape_rejected", eligible.calls.length, startedAt)
+      logOutcome("shape_rejected")
       throw failedRecovery(
         original,
         "returned invalid arguments after regeneration",
       )
     }
-    logRegenerationOutcome(
-      "policy_or_transport",
-      eligible.calls.length,
-      startedAt,
-    )
+    logOutcome("policy_or_transport")
     throw failedRecovery(
       original,
       "failed before valid arguments were received",

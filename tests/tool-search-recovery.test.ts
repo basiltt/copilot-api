@@ -46,6 +46,18 @@ const schema = {
   additionalProperties: false,
 }
 
+// Functional schema captured from official Claude Code 2.1.295 and 2.1.299.
+const currentClientSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    query: { type: "string" },
+    max_results: { type: "number" },
+  },
+  required: ["query", "max_results"],
+  additionalProperties: false,
+}
+
 function payload(
   stream = false,
   inputSchema: Record<string, unknown> = schema,
@@ -210,6 +222,157 @@ afterEach(() => {
 
 // eslint-disable-next-line max-lines-per-function -- Request fixtures exercise the complete eligibility and regeneration contract together.
 describe("bounded ToolSearch argument recovery", () => {
+  for (const stream of [false, true]) {
+    test.each([
+      {
+        model: "claude-fable-5.1",
+        originalModel: "claude-fable-5-1",
+        repairModel: "claude-fable-5.1",
+      },
+      {
+        model: "claude-fable-5.1",
+        originalModel: "claude-fable-5.1",
+        repairModel: "claude-fable-5-1",
+      },
+      {
+        model: "claude-opus-5.5",
+        originalModel: "claude-opus-5-5",
+        repairModel: "claude-opus-5.5",
+      },
+      {
+        model: "claude-opus-5.5",
+        originalModel: "claude-opus-5.5",
+        repairModel: "claude-opus-5-5",
+      },
+    ])(
+      `retains same-model separator aliases with the actual client schema (stream=${stream}, original=$originalModel, repair=$repairModel)`,
+      async ({ model, originalModel, repairModel }) => {
+        const request = payload(stream, currentClientSchema)
+        request.model = model
+        const metadata = state.models?.data[0]
+        if (!metadata) throw new Error("Expected model")
+        metadata.id = model
+        metadata.supported_endpoints = ["/chat/completions"]
+        metadata.capabilities.supports.streaming = true
+        state.models = { object: "list", data: [metadata] }
+        queue(
+          completion('{"query":"select:Read"}', { model: originalModel }),
+          completion('{"query":"select:Read","max_results":1}', {
+            id: "search_repair",
+            model: repairModel,
+          }),
+        )
+
+        const response = await send(request)
+        const output = await response.text()
+        expect(response.status).toBe(200)
+        expect(output).not.toContain('"type":"error"')
+        expect(output).toContain('"id":"search_original"')
+        expect(output).not.toContain("search_repair")
+        expect(output).toContain(`"model":"${originalModel}"`)
+        expect(output).toContain("select:Read")
+        if (stream) {
+          expect(output.match(/event: message_stop/g)).toHaveLength(1)
+          expect(output).toContain(String.raw`\"max_results\":1`)
+        } else {
+          expect(JSON.parse(output)).toMatchObject({
+            content: [
+              {
+                type: "tool_use",
+                id: "search_original",
+                name: "ToolSearch",
+                input: { query: "select:Read", max_results: 1 },
+              },
+            ],
+          })
+        }
+        expect(fetchSpy).toHaveBeenCalledTimes(2)
+        expect(bodies[1].model).toBe(model)
+        expect(bodies[1].tools?.[0].function.parameters).toEqual(
+          currentClientSchema,
+        )
+      },
+    )
+  }
+
+  test.each([
+    "",
+    "claude-fable-5.0",
+    "claude-fable-5.2",
+    "claude-fable-5-1-20261014",
+    "claude-opus-5.5",
+  ])("does not accept a different model or version: %s", async (model) => {
+    queue(
+      completion('{"query":"select:Read"}'),
+      completion('{"query":"select:Read","max_results":1}', { model }),
+    )
+    const response = await send(payload(false, currentClientSchema))
+    expect(response.status).toBe(502)
+    const output = await response.text()
+    expect(output).toContain("reason: model_identity")
+    expect(output).not.toContain('"type":"tool_use"')
+    expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  test.each([
+    "choice_count",
+    "finish_reason",
+    "additional_output",
+    "refusal",
+    "no_calls",
+    "tool_identity",
+    "missing_id",
+    "duplicate_id",
+    "call_count",
+    "model_identity",
+    "arguments_changed",
+  ])(
+    "identifies %s without logging private output or arguments",
+    // eslint-disable-next-line complexity -- Exercise each rejection with an independently malformed reply.
+    async (reason) => {
+      const model = state.models?.data[0]
+      if (!model) throw new Error("Expected model")
+      model.capabilities.supports.streaming = false
+      const secret = "PRIVATE_DISCOVERY_QUERY"
+      const repair = repaired(JSON.stringify({ query: secret, max_results: 1 }))
+      const choice = repair.choices[0]
+      const call = choice.message.tool_calls?.[0]
+      if (!call) throw new Error("Expected ToolSearch call")
+      call.id = "PRIVATE_REPAIR_ID"
+      if (reason === "choice_count")
+        repair.choices.push({ ...choice, index: 1 })
+      if (reason === "finish_reason") choice.finish_reason = "length"
+      if (reason === "additional_output")
+        choice.message.content = "PRIVATE_PROSE"
+      if (reason === "refusal") choice.message.refusal = "PRIVATE_REFUSAL"
+      if (reason === "no_calls") choice.message.tool_calls = []
+      if (reason === "tool_identity") call.function.name = "PRIVATE_TOOL"
+      if (reason === "missing_id") call.id = ""
+      if (reason === "duplicate_id")
+        choice.message.tool_calls?.push({ ...call })
+      if (reason === "call_count")
+        choice.message.tool_calls?.push({ ...call, id: "PRIVATE_SECOND_ID" })
+      if (reason === "model_identity") repair.model = "PRIVATE_MODEL"
+      if (reason === "arguments_changed")
+        call.function.arguments =
+          '{"query":"PRIVATE_CHANGED_QUERY","max_results":1}'
+      queue(completion(JSON.stringify({ query: secret })), repair)
+
+      const response = await send(payload(false, currentClientSchema))
+      expect(response.status).toBe(502)
+      const output = await response.text()
+      expect(output).toContain(`reason: ${reason}`)
+      expect(output).toContain("no further automatic attempt")
+      expect(output).not.toContain("PRIVATE_")
+      expect(output).not.toContain('"type":"tool_use"')
+      const captured = JSON.stringify(logs.flatMap((log) => log.mock.calls))
+      expect(captured).toContain('"outcome":"shape_rejected"')
+      expect(captured).toContain(`"reason":"${reason}"`)
+      expect(captured).not.toContain("PRIVATE_")
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
+    },
+  )
+
   test("repairs against the exact schema while preserving ID, supplied limits, text, and usage", async () => {
     const request = payload()
     request.tools?.push(
