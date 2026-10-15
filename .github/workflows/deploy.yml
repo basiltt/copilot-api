@@ -153,7 +153,20 @@ jobs:
               buffered_reason_names = {
                   "initial_generation_deadline", "timeout", "aborted", "connection_reset",
                   "connection_refused", "connection_closed", "connection_failed", "dns_error",
-                  "unclassified_error", "http_error", "non_error", "failure",
+                  "unclassified_error", "non_error", "failure",
+                  "rate_limited", "server_error", "client_error", "unexpected_status",
+                  "invalid_stream", "ambiguous_tool_name", "changed_response_id",
+                  "changed_response_model", "changed_system_fingerprint",
+                  "changed_tool_call_identity", "changed_tool_name", "data_after_terminal",
+                  "incomplete_response", "incomplete_tool_identity", "invalid_assistant_role",
+                  "invalid_choice", "invalid_choice_delta", "invalid_choices",
+                  "invalid_chunk_object", "invalid_completion_usage", "invalid_delta",
+                  "invalid_finish_reason", "invalid_integer", "invalid_prompt_usage",
+                  "invalid_reasoning_delta", "invalid_response_created", "invalid_response_id",
+                  "invalid_response_model", "invalid_tool_call", "invalid_tool_call_deltas",
+                  "invalid_tool_function", "invalid_usage", "malformed_json", "missing_done",
+                  "missing_terminal_choice", "non_object_event", "unsupported_tool_call_type",
+                  "wire_limit",
               }
               for block in re.findall(r"Buffered Anthropic stream failed\s*\{([^}]{0,512})\}", log):
                   kind = re.search(r"kind['\"]?\s*:\s*['\"]([a-z_]+)['\"]", block)
