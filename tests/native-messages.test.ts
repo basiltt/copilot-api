@@ -127,11 +127,12 @@ function nativeSSE(
     | "model_context_window_exceeded"
     | "tool_use"
     | "refusal" = "end_turn",
-  usage: {
+  options: {
     input_tokens?: number
     cache_read_input_tokens?: number
     cache_creation_input_tokens?: number
     output_tokens?: number
+    modelId?: string
   } = {},
 ): Response {
   const events: Array<Record<string, unknown>> = [
@@ -142,17 +143,17 @@ function nativeSSE(
         type: "message",
         role: "assistant",
         content: [],
-        model: "claude-sonnet-5",
+        model: options.modelId ?? "claude-sonnet-5",
         stop_reason: null,
         stop_sequence: null,
         usage: {
-          input_tokens: usage.input_tokens ?? 17,
+          input_tokens: options.input_tokens ?? 17,
           output_tokens: 0,
-          ...(usage.cache_read_input_tokens !== undefined ?
-            { cache_read_input_tokens: usage.cache_read_input_tokens }
+          ...(options.cache_read_input_tokens !== undefined ?
+            { cache_read_input_tokens: options.cache_read_input_tokens }
           : {}),
-          ...(usage.cache_creation_input_tokens !== undefined ?
-            { cache_creation_input_tokens: usage.cache_creation_input_tokens }
+          ...(options.cache_creation_input_tokens !== undefined ?
+            { cache_creation_input_tokens: options.cache_creation_input_tokens }
           : {}),
         },
       },
@@ -237,7 +238,7 @@ function nativeSSE(
     {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: usage.output_tokens ?? 5 },
+      usage: { output_tokens: options.output_tokens ?? 5 },
     },
     { type: "message_stop" },
   )
@@ -732,6 +733,8 @@ describe("native Messages routing and body", () => {
     "claude-fable-5-1",
     "claude-opus-5.5",
     "claude-opus-5-5",
+    "claude-sonnet-5.5",
+    "claude-sonnet-5-5",
   ]) {
     test(`${modelId}: documented text system-message placement is native-compatible`, () => {
       const request = {
@@ -749,74 +752,80 @@ describe("native Messages routing and body", () => {
     })
   }
 
-  test("native system-message support never moves instructions or drops unsupported semantics", () => {
-    const request = { ...payload(), model: "claude-fable-5.1" }
-    const user = { role: "user", content: "Synthetic task." }
-    const system = { role: "system", content: "Synthetic instruction." }
-    const assistant = { role: "assistant", content: "Synthetic reply." }
-    const unsupportedHistories = [
-      [system, user],
-      [user, system, user],
-      [user, assistant, system],
-      [user, { ...system, clear_at: "next_user_message" }],
-      [user, { ...system, output_config: { effort: "low" } }],
-      [
-        user,
-        {
-          ...system,
-          content: [{ type: "tool_removal", tool: { name: "Write" } }],
-        },
-      ],
-      [user, { ...system, content: [{ type: "text", text: 42 }] }],
-      [user, { ...system, content: [] }],
-      [user, { ...system, content: "" }],
-    ]
-    for (const messages of unsupportedHistories) {
-      const candidate = { ...request, messages } as AnthropicMessagesPayload
-      const original = structuredClone(candidate)
-      expect(nativeMessagesCompatibility(candidate, ["/v1/messages"])).toBe(
+  test.each(["claude-fable-5.1", "claude-sonnet-5.5"])(
+    "%s: native system-message support never moves instructions or drops unsupported semantics",
+    (modelId) => {
+      const request = { ...payload(), model: modelId }
+      const user = { role: "user", content: "Synthetic task." }
+      const system = { role: "system", content: "Synthetic instruction." }
+      const assistant = { role: "assistant", content: "Synthetic reply." }
+      const unsupportedHistories = [
+        [system, user],
+        [user, system, user],
+        [user, assistant, system],
+        [user, { ...system, clear_at: "next_user_message" }],
+        [user, { ...system, output_config: { effort: "low" } }],
+        [
+          user,
+          {
+            ...system,
+            content: [{ type: "tool_removal", tool: { name: "Write" } }],
+          },
+        ],
+        [user, { ...system, content: [{ type: "text", text: 42 }] }],
+        [user, { ...system, content: [] }],
+        [user, { ...system, content: "" }],
+      ]
+      for (const messages of unsupportedHistories) {
+        const candidate = { ...request, messages } as AnthropicMessagesPayload
+        const original = structuredClone(candidate)
+        expect(nativeMessagesCompatibility(candidate, ["/v1/messages"])).toBe(
+          "request_unsupported",
+        )
+        expect(nativeMessagesRejectionReasons(candidate)).toContain(
+          "message_role_system",
+        )
+        expect(candidate).toEqual(original)
+      }
+      for (const modelId of ["claude-sonnet-5", "unverified-native-model"]) {
+        expect(
+          nativeMessagesCompatibility(
+            {
+              ...request,
+              model: modelId,
+              messages: [user, system],
+            } as AnthropicMessagesPayload,
+            ["/v1/messages"],
+          ),
+        ).toBe("request_unsupported")
+      }
+    },
+  )
+
+  test.each(["claude-fable-5.1", "claude-sonnet-5.5"])(
+    "%s: native system-message support preserves unsigned-thinking rejection",
+    (modelId) => {
+      const request = {
+        ...payload(),
+        model: modelId,
+        messages: [
+          { role: "user", content: "Synthetic task." },
+          { role: "system", content: "Synthetic later guidance." },
+          {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "Unsigned legacy state." }],
+          },
+          { role: "user", content: "Continue." },
+        ],
+      } satisfies AnthropicMessagesPayload
+      expect(nativeMessagesRejectionReasons(request)).toEqual([
+        "thinking_signature_missing",
+      ])
+      expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
         "request_unsupported",
       )
-      expect(nativeMessagesRejectionReasons(candidate)).toContain(
-        "message_role_system",
-      )
-      expect(candidate).toEqual(original)
-    }
-    for (const modelId of ["claude-sonnet-5", "unverified-native-model"]) {
-      expect(
-        nativeMessagesCompatibility(
-          {
-            ...request,
-            model: modelId,
-            messages: [user, system],
-          } as AnthropicMessagesPayload,
-          ["/v1/messages"],
-        ),
-      ).toBe("request_unsupported")
-    }
-  })
-
-  test("native system-message support preserves unsigned-thinking rejection", () => {
-    const request = {
-      ...payload(),
-      model: "claude-fable-5.1",
-      messages: [
-        { role: "user", content: "Synthetic task." },
-        { role: "system", content: "Synthetic later guidance." },
-        {
-          role: "assistant",
-          content: [{ type: "thinking", thinking: "Unsigned legacy state." }],
-        },
-        { role: "user", content: "Continue." },
-      ],
-    } satisfies AnthropicMessagesPayload
-    expect(nativeMessagesRejectionReasons(request)).toEqual([
-      "thinking_signature_missing",
-    ])
-    expect(nativeMessagesCompatibility(request, ["/v1/messages"])).toBe(
-      "request_unsupported",
-    )
-  })
+    },
+  )
 
   test("keeps empty tool results eligible but distinguishes absent and unsupported content", () => {
     const request = payload()
@@ -1141,6 +1150,118 @@ describe("native Messages routing and body", () => {
     expect(JSON.stringify(body.messages)).not.toContain(longName)
     expect(JSON.stringify(body.messages)).toContain(alias)
   })
+})
+
+describe("Sonnet 5.5 native system-message routing", () => {
+  for (const stream of [false, true]) {
+    test.each([
+      "claude-sonnet-5.5",
+      "claude-sonnet-5-5",
+      "claude-sonnet-5-5[1m]",
+    ])(
+      `preserves instructions and constrained Agent calls (stream=${stream}, model=%s)`,
+      async (modelId) => {
+        const request = agentPayload(stream)
+        const selected = state.models?.data[0]
+        if (!selected) throw new Error("Missing test model")
+        selected.id = "claude-sonnet-5.5"
+        request.model = modelId
+        request.thinking = { type: "adaptive" }
+        request.system = "Synthetic top-level instruction."
+        request.messages = [
+          { role: "user", content: "Synthetic first turn." },
+          {
+            role: "system",
+            content: "Synthetic mid-conversation instruction.",
+          },
+          {
+            role: "system",
+            content: [
+              {
+                type: "text",
+                text: "Synthetic cached instruction.",
+                cache_control: { type: "ephemeral" },
+              },
+            ],
+          },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "thinking",
+                thinking: "Synthetic prior thinking.",
+                signature: "sig_prior",
+              },
+              { type: "text", text: "Synthetic prior response." },
+            ],
+          },
+          { role: "user", content: "Propose the read-only task." },
+          { role: "system", content: "Synthetic trailing instruction." },
+        ]
+        const original = structuredClone(request)
+        const input = {
+          description: "Inspect fixture",
+          prompt: "Read-only synthetic task.",
+        }
+        queue(
+          nativeSSE(
+            [
+              {
+                type: "thinking",
+                thinking: "Synthetic current thinking.",
+                signature: "sig_current",
+              },
+              {
+                type: "tool_use",
+                id: "call_agent_sonnet",
+                name: "Agent",
+                inputJson: JSON.stringify(input),
+              },
+            ],
+            "tool_use",
+            { modelId: selected.id },
+          ),
+        )
+
+        const response = await send(request)
+        const output = await response.text()
+        expect(response.status).toBe(200)
+        expect(output).not.toContain('"type":"error"')
+        expect(output).toContain('"model":"claude-sonnet-5.5"')
+        expect(output).toContain('"stop_reason":"tool_use"')
+        expect(output).toContain("call_agent_sonnet")
+        expect(output).toContain("sig_current")
+        if (stream) {
+          expect(output.match(/event: message_stop/g)).toHaveLength(1)
+          expect(output).toContain(
+            `"partial_json":${JSON.stringify(JSON.stringify(input))}`,
+          )
+        } else {
+          expect(JSON.parse(output)).toMatchObject({
+            content: [
+              { type: "thinking", signature: "sig_current" },
+              {
+                type: "tool_use",
+                id: "call_agent_sonnet",
+                name: "Agent",
+                input,
+              },
+            ],
+          })
+        }
+        expect(urls).toEqual(["https://api.githubcopilot.com/v1/messages"])
+        expect(bodies[0].model).toBe(selected.id)
+        expect(bodies[0].system).toBe(original.system)
+        expect(bodies[0].messages).toEqual(original.messages)
+        expect(bodies[0].tools).toEqual(
+          original.tools?.map((tool) => ({ ...tool, strict: true })),
+        )
+        expect(request).toEqual(original)
+        expect(logs[1]).not.toHaveBeenCalled()
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      },
+    )
+  }
 })
 
 describe("native empty tool-input deltas", () => {

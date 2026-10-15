@@ -765,8 +765,8 @@ limit. Unsupported request constructs are routed to the existing compatible
 transport before any native request is made. Once a native request is issued,
 HTTP, policy, and protocol errors are returned without retrying through a
 different endpoint.
-Fable 5.1 and Opus 5.5 also keep supported mid-conversation `system` messages
-on native transport: a nonempty text-only system-message group must follow a
+Fable 5.1, Opus 5.5, and Sonnet 5.5 also keep supported mid-conversation `system`
+messages on native transport: a nonempty text-only system-message group must follow a
 user turn and precede an assistant turn or end the history. Consecutive system
 messages, text-block cache controls, and the surrounding conversation are
 forwarded unchanged. The proxy does not move these instructions into the
@@ -775,7 +775,9 @@ invalidate later thinking signatures. Other models, leading system-role
 prefixes, unsupported placement/content, and beta-specific system-message
 fields retain compatibility routing. This follows the documented
 [system-message placement rules](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages#limitations)
-and was checked against both native Copilot models without executing tools.
+and was checked against all three native Copilot models without executing tools.
+Sonnet 5 remains on compatibility transport for these messages; Sonnet 5.5
+support does not relax the placement, content, or thinking-signature checks.
 Claude Code 2.1.295 appends such a system turn even to an ordinary tool-enabled
 request. Rejecting that turn forces Chat fallback and skips native Agent
 constraints; disabling experimental betas alone does not remove the turn.

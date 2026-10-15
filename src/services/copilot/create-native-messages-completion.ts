@@ -57,6 +57,7 @@ const NATIVE_TOOL_RESULT_BLOCK_TYPES = new Set([
 const NATIVE_SYSTEM_MESSAGE_MODELS = new Set([
   "claude-fable-5-1",
   "claude-opus-5-5",
+  "claude-sonnet-5-5",
 ])
 
 export type NativeMessagesCompatibility =
