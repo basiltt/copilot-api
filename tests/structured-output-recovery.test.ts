@@ -783,6 +783,260 @@ function captureDeadline() {
   }
 }
 
+function captureInitialDeadline() {
+  let expire: (() => void) | undefined
+  timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: Array<unknown>) => void,
+    delay?: number,
+    ...args: Array<unknown>
+  ) => {
+    if (delay === 300_000 && !expire) expire = () => callback()
+    return originalSetTimeout(callback, delay, ...args)
+  }) as typeof setTimeout)
+  return () => {
+    if (!expire) throw new Error("Initial deadline was not installed")
+    expire()
+  }
+}
+
+describe("initial completion deadlines and failure diagnostics", () => {
+  for (const native of [false, true]) {
+    for (const stream of [false, true]) {
+      test.each(["headers", "body"])(
+        `identifies the initial 300s deadline without retrying (native=${native}, stream=${stream}, stage=%s)`,
+        async (stage) => {
+          const expire = captureInitialDeadline()
+          state.nativeMessages = native
+          const model = state.models?.data[0]
+          if (!model) throw new Error("Expected model")
+          if (native) model.supported_endpoints?.push("/v1/messages")
+          let started: (() => void) | undefined
+          const ready = new Promise<void>((resolve) => {
+            started = resolve
+          })
+          let upstreamSignal: AbortSignal | undefined
+          let bodyCanceled = false
+          fetchSpy.mockImplementation(
+            Object.assign(
+              (_url: string | URL | Request, init?: RequestInit) => {
+                upstreamSignal = init?.signal ?? undefined
+                if (stage === "headers") {
+                  started?.()
+                  return new Promise<Response>((_resolve, reject) => {
+                    upstreamSignal?.addEventListener(
+                      "abort",
+                      () =>
+                        reject(
+                          new Error("Transport replaced the abort reason"),
+                        ),
+                      { once: true },
+                    )
+                  })
+                }
+                return Promise.resolve(
+                  new Response(
+                    new ReadableStream({
+                      pull() {
+                        started?.()
+                      },
+                      cancel() {
+                        bodyCanceled = true
+                      },
+                    }),
+                    {
+                      headers: {
+                        "content-type":
+                          native || stream ? "text/event-stream" : (
+                            "application/json"
+                          ),
+                      },
+                    },
+                  ),
+                )
+              },
+              { preconnect: globalThis.fetch.preconnect },
+            ),
+          )
+
+          const pending = send(payload(stream))
+          await ready
+          expire()
+          const response = await pending
+          const output = await response.text()
+          const upstreamURL = fetchSpy.mock.calls[0]?.[0]
+          if (typeof upstreamURL !== "string")
+            throw new Error("Expected upstream URL string")
+          expect(new URL(upstreamURL).pathname).toBe(
+            native ? "/v1/messages" : "/chat/completions",
+          )
+          expect(response.status).toBe(stream ? 200 : 504)
+          expect(output).toContain(
+            "Initial output generation timed out after 300 seconds",
+          )
+          expect(output).not.toContain('"type":"tool_use"')
+          expect(output).not.toContain("message_stop")
+          expect(upstreamSignal?.aborted).toBe(true)
+          if (stage === "body") expect(bodyCanceled).toBe(true)
+          if (stream) {
+            expect(logs[1]).toHaveBeenCalledWith(
+              "Buffered Anthropic stream failed",
+              expect.objectContaining({
+                kind: "timeout",
+                reason: "initial_generation_deadline",
+                logicalStatus: 504,
+                timeoutMs: 300_000,
+              }),
+            )
+            expect(logs[1].mock.calls.at(-1)?.[1]).toHaveProperty(
+              "elapsedMs",
+              expect.any(Number),
+            )
+          }
+          expect(fetchSpy).toHaveBeenCalledTimes(1)
+        },
+      )
+    }
+  }
+
+  test.each([
+    {
+      error: Object.assign(new Error("PRIVATE_NETWORK_DETAIL"), {
+        code: "ECONNRESET",
+      }),
+      kind: "transport",
+      reason: "connection_reset",
+    },
+    {
+      error: new TypeError("PRIVATE_FETCH_DETAIL", {
+        cause: Object.assign(new Error("PRIVATE_SOCKET_DETAIL"), {
+          code: "UND_ERR_CONNECT_TIMEOUT",
+        }),
+      }),
+      kind: "transport",
+      reason: "timeout",
+    },
+    {
+      error: Object.assign(new Error("PRIVATE_TIMEOUT_DETAIL"), {
+        name: "TimeoutError",
+      }),
+      kind: "transport",
+      reason: "timeout",
+    },
+    {
+      error: Object.assign(new Error("PRIVATE_ABORT_DETAIL"), {
+        name: "AbortError",
+      }),
+      kind: "transport",
+      reason: "aborted",
+    },
+    {
+      error: new Error("PRIVATE_APPLICATION_DETAIL"),
+      kind: "unexpected",
+      reason: "unclassified_error",
+    },
+    {
+      error: Object.assign(new Error("PRIVATE_UNKNOWN_CODE_DETAIL"), {
+        code: "PRIVATE_UNKNOWN_CODE",
+      }),
+      kind: "unexpected",
+      reason: "unclassified_error",
+    },
+  ])(
+    "classifies buffered failures without inventing a transport cause ($reason)",
+    async ({ error, kind, reason }) => {
+      fetchSpy.mockRejectedValueOnce(error)
+      const response = await send(payload(true))
+      const output = await response.text()
+      expect(response.status).toBe(200)
+      expect(output).toContain('"type":"error"')
+      expect(output).not.toContain('"type":"tool_use"')
+      expect(output).not.toContain("message_stop")
+      expect(logs[1]).toHaveBeenCalledWith(
+        "Buffered Anthropic stream failed",
+        expect.objectContaining({
+          kind,
+          reason,
+          logicalStatus: null,
+        }),
+      )
+      expect(logs[1].mock.calls.at(-1)?.[1]).toHaveProperty(
+        "elapsedMs",
+        expect.any(Number),
+      )
+      const captured = JSON.stringify(logs[1].mock.calls)
+      expect(captured).not.toContain("PRIVATE_")
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    },
+  )
+})
+
+describe("initial completion cancellation and policy precedence", () => {
+  test.each([false, true])(
+    "client cancellation takes priority over a coincident initial deadline (stream=%s)",
+    async (stream) => {
+      const expire = captureInitialDeadline()
+      let started: (() => void) | undefined
+      const ready = new Promise<void>((resolve) => {
+        started = resolve
+      })
+      let upstreamSignal: AbortSignal | undefined
+      fetchSpy.mockImplementation(
+        Object.assign(
+          (_url: string | URL | Request, init?: RequestInit) => {
+            upstreamSignal = init?.signal ?? undefined
+            started?.()
+            return new Promise<Response>((_resolve, reject) => {
+              upstreamSignal?.addEventListener(
+                "abort",
+                () => reject(new Error("Transport replaced the abort reason")),
+                { once: true },
+              )
+            })
+          },
+          { preconnect: globalThis.fetch.preconnect },
+        ),
+      )
+      const controller = new AbortController()
+      const pending = send(payload(stream), controller.signal)
+      await ready
+      controller.abort(new Error("Client disconnected"))
+      expire()
+      const response = await pending
+      expect(response.status).toBe(stream ? 200 : 499)
+      expect(await response.text()).toBe("")
+      expect(upstreamSignal?.aborted).toBe(true)
+      expect(logs[1]).not.toHaveBeenCalled()
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test("an explicit upstream policy failure is not replaced by a coincident deadline", async () => {
+    const expire = captureInitialDeadline()
+    fetchSpy.mockImplementationOnce(
+      Object.assign(
+        () => {
+          expire()
+          return Promise.resolve(
+            Response.json(
+              { error: { type: "permission_error", message: "Policy denied" } },
+              { status: 403 },
+            ),
+          )
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      ),
+    )
+    const output = await (await send(payload(true))).text()
+    expect(output).toContain("Policy denied")
+    expect(output).not.toContain("timed out")
+    expect(logs[1]).toHaveBeenCalledWith(
+      "Buffered Anthropic stream failed",
+      expect.objectContaining({ kind: "upstream_http", logicalStatus: 403 }),
+    )
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe("hard recovery deadline and disconnect cancellation", () => {
   test.each(["headers", "body"])(
     "20s deadline aborts the actual request during %s",

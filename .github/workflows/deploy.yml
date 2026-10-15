@@ -136,6 +136,8 @@ jobs:
               log = result.stdout[-8 * 1024 * 1024:].decode(errors="replace")
               counts = collections.Counter()
               routing = collections.Counter()
+              buffered_kinds = collections.Counter()
+              buffered_reasons = collections.Counter()
               recovery_outcomes = collections.Counter()
               recovery_reasons = collections.Counter()
               outcome_names = {
@@ -147,6 +149,19 @@ jobs:
                   "no_calls", "tool_identity", "missing_id", "duplicate_id",
                   "call_count", "model_identity", "signed_thinking", "arguments_changed",
               }
+              buffered_kind_names = {"protocol", "transport", "upstream_http", "timeout", "unexpected"}
+              buffered_reason_names = {
+                  "initial_generation_deadline", "timeout", "aborted", "connection_reset",
+                  "connection_refused", "connection_closed", "connection_failed", "dns_error",
+                  "unclassified_error", "http_error", "non_error", "failure",
+              }
+              for block in re.findall(r"Buffered Anthropic stream failed\s*\{([^}]{0,512})\}", log):
+                  kind = re.search(r"kind['\"]?\s*:\s*['\"]([a-z_]+)['\"]", block)
+                  reason = re.search(r"reason['\"]?\s*:\s*['\"]([a-z_]+)['\"]", block)
+                  if kind and kind[1] in buffered_kind_names:
+                      buffered_kinds[kind[1]] += 1
+                  if reason and reason[1] in buffered_reason_names:
+                      buffered_reasons[reason[1]] += 1
               for block in re.findall(r"ToolSearch argument regeneration outcome\s*\{([^}]{0,512})\}", log):
                   outcome = re.search(r"outcome['\"]?\s*:\s*['\"]([a-z_]+)['\"]", block)
                   reason = re.search(r"reason['\"]?\s*:\s*['\"]([a-z_]+)['\"]", block)
@@ -167,6 +182,9 @@ jobs:
                   "native_routing_counts": dict(sorted(routing.items())),
                   "native_rejection_counts": dict(sorted(counts.items())),
                   "buffered_protocol_failures": log.count("Buffered Chat stream protocol failure"),
+                  "buffered_stream_failures": log.count("Buffered Anthropic stream failed"),
+                  "buffered_stream_failure_kinds": dict(sorted(buffered_kinds.items())),
+                  "buffered_stream_failure_reasons": dict(sorted(buffered_reasons.items())),
                   "native_malformed_tool_inputs": log.count("Native Messages completed with malformed tool input"),
                   "tool_schema_rejections": log.count("arguments do not match the declared input_schema"),
                   "toolsearch_regeneration_outcomes": dict(sorted(recovery_outcomes.items())),

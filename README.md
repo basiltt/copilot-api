@@ -641,6 +641,17 @@ compatibility path still validates generated tool input but cannot promise
 native constrained generation; it does not by itself mean the request failed.
 A logged `stream 200` only confirms that the SSE response was opened, not that
 the final completion succeeded.
+
+Repeated `thinking_signature_missing` warnings usually mean the client keeps
+replaying the same unsigned thinking from compatibility-mode history. A proxy
+restart does not change that client-held history. Start a fresh conversation
+with a plain-text summary, or restore the original, unmodified signed blocks if
+available. Sharing the proxy with a separate GPT client does not merge their
+histories. Do not add fake signatures, silently remove thinking, or turn off
+local tool validation to silence the warning.
+[Anthropic's thinking troubleshooting guide](https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting)
+describes why replayed thinking must preserve its original signature.
+
 Native compilation, policy, or protocol failures are surfaced without
 retrying unconstrained. All completed calls still undergo full original-schema
 validation before any sibling action is released. Refusal, truncation,
@@ -911,6 +922,19 @@ call and 20 seconds of additional wall time**, including response-body reading.
 It bypasses ordinary transport/image/empty-response retries. The deadline does
 not reset on traffic, and client disconnects abort transport/body consumption
 and stop keepalives. Valid output incurs no extra model call.
+
+If the initial five-minute deadline expires, JSON requests receive HTTP 504;
+an already-open SSE response receives an explicit `error` event, not a tool
+block or success terminal. The `Buffered Anthropic stream failed` warning records
+`kind: timeout`, `reason: initial_generation_deadline`, `logicalStatus: 504`,
+`timeoutMs: 300000`, and `elapsedMs`. This is the existing overall deadline, not
+a new retry or an inactivity timeout. Known transport failures are classified
+using fixed error names/codes, including bounded nested causes. Unrecognized
+exceptions are `unexpected / unclassified_error`, not assumed network failures.
+Diagnostics contain no exception text, tool arguments, or thinking signatures.
+Older `transport / failure` warnings are ambiguous; a roughly five-minute
+cadence alone cannot prove their cause. HTTP 200 does not override a later
+[SSE error](https://platform.claude.com/docs/en/api/errors).
 
 Schema failures report at most five validation keywords and masked structural
 depths. Property names, schema paths, enum/const values, raw AJV errors, and

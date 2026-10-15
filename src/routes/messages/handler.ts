@@ -113,6 +113,7 @@ import {
 // enterprise firewalls) and Claude Code's stream inactivity detector
 // (~45s).  10 seconds gives comfortable headroom for both.
 const PING_INTERVAL_MS = 10_000
+const INITIAL_OUTPUT_TIMEOUT_MS = 300_000
 
 /**
  * Sends recurring Anthropic ping events until the caller stops the keepalive.
@@ -417,6 +418,7 @@ async function handleServerSearch(
     signal,
     payload.stream === true,
   )
+  const startedAt = performance.now()
   const run = () =>
     runServerWebSearch(payload, limit, (request) =>
       fetchNonStreamingAnthropicResponse(
@@ -439,6 +441,7 @@ async function handleServerSearch(
           await emitStreamingError(stream, error, {
             modelId: payload.model,
             warnBufferedFailure: true,
+            startedAt,
           })
       } finally {
         stopKeepalive()
@@ -483,6 +486,7 @@ async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
     payload.stream === true,
   )
   if (!recovery) throw new Error("Expected enabled output recovery")
+  const startedAt = performance.now()
   const run = () =>
     fetchNonStreamingAnthropicResponse(
       { ...payload, stream: false },
@@ -505,6 +509,7 @@ async function handleOutputTool(c: Context, payload: AnthropicMessagesPayload) {
           await emitStreamingError(stream, error, {
             modelId: payload.model,
             warnBufferedFailure: true,
+            startedAt,
           })
       } finally {
         stopKeepalive()
@@ -1055,6 +1060,32 @@ interface NonStreamingRecoveryOptions {
   writeAllowed: boolean
 }
 
+class InitialOutputTimeoutError extends HTTPError {
+  constructor() {
+    const message = "Initial output generation timed out after 300 seconds."
+    super(
+      message,
+      Response.json(
+        { type: "error", error: { type: "api_error", message } },
+        { status: 504 },
+      ),
+    )
+  }
+}
+
+function initialOutputFailure(
+  error: unknown,
+  initial: AbortSignal,
+  recovery?: NonStreamingRecoveryOptions,
+): unknown {
+  const downstream = recovery?.signal
+  if (downstream?.aborted) return downstream.reason
+  // Fetch implementations may replace our abort reason with a generic error.
+  // Explicit upstream HTTP/policy errors must retain their status and details.
+  if (initial.aborted && !(error instanceof HTTPError)) return initial.reason
+  return error
+}
+
 function outputRecoveryOptions(
   payload: AnthropicMessagesPayload,
   signal: AbortSignal,
@@ -1100,8 +1131,8 @@ async function fetchNonStreamingAnthropicResponse(
   const timer =
     outputRecovery ?
       setTimeout(
-        () => initial.abort(new Error("Initial output generation timed out")),
-        300_000,
+        () => initial.abort(new InitialOutputTimeoutError()),
+        INITIAL_OUTPUT_TIMEOUT_MS,
       )
     : undefined
   const signal =
@@ -1118,6 +1149,8 @@ async function fetchNonStreamingAnthropicResponse(
         return outputRecovery.complete(prepared, signal)
       return fetchCopilotResponse(prepared)
     }, anthropicPayload)
+  } catch (error) {
+    throw initialOutputFailure(error, initial.signal, outputRecovery)
   } finally {
     clearTimeout(timer)
   }
@@ -2322,17 +2355,57 @@ function upstreamFailureReason(status: number): string {
   return "unexpected_status"
 }
 
-function transportFailureReason(error: Error): string {
-  if (error.name === "TimeoutError") return "timeout"
-  if (error.name === "AbortError") return "aborted"
-  return "failure"
+const TRANSPORT_FAILURE_REASONS = new Map([
+  ["ECONNRESET", "connection_reset"],
+  ["ConnectionReset", "connection_reset"],
+  ["ECONNREFUSED", "connection_refused"],
+  ["ConnectionRefused", "connection_refused"],
+  ["EPIPE", "connection_closed"],
+  ["ConnectionClosed", "connection_closed"],
+  ["UND_ERR_SOCKET", "connection_closed"],
+  ["FailedToOpenSocket", "connection_failed"],
+  ["ENOTFOUND", "dns_error"],
+  ["EAI_AGAIN", "dns_error"],
+  ["ETIMEDOUT", "timeout"],
+  ["UND_ERR_CONNECT_TIMEOUT", "timeout"],
+  ["UND_ERR_HEADERS_TIMEOUT", "timeout"],
+  ["UND_ERR_BODY_TIMEOUT", "timeout"],
+])
+
+function transportFailureReason(error: Error): string | undefined {
+  let current: unknown = error
+  for (let depth = 0; depth < 3; depth++) {
+    if (!current || typeof current !== "object") break
+    const name = "name" in current ? current.name : undefined
+    if (name === "TimeoutError") return "timeout"
+    if (name === "AbortError") return "aborted"
+    const code = "code" in current ? current.code : undefined
+    for (const value of [code, name]) {
+      const reason =
+        typeof value === "string" ?
+          TRANSPORT_FAILURE_REASONS.get(value)
+        : undefined
+      if (reason) return reason
+    }
+    current = "cause" in current ? current.cause : undefined
+  }
+  return undefined
 }
 
 function bufferedFailureMetadata(error: unknown): {
-  kind: "protocol" | "transport" | "upstream_http" | "unexpected"
+  kind: "protocol" | "transport" | "upstream_http" | "timeout" | "unexpected"
   reason: string
   logicalStatus: number | null
+  timeoutMs?: number
 } {
+  if (error instanceof InitialOutputTimeoutError) {
+    return {
+      kind: "timeout",
+      reason: "initial_generation_deadline",
+      logicalStatus: 504,
+      timeoutMs: INITIAL_OUTPUT_TIMEOUT_MS,
+    }
+  }
   if (error instanceof HTTPError) {
     const logicalStatus = error.response.status
     if (error instanceof ChatCompletionStreamProtocolError)
@@ -2355,9 +2428,10 @@ function bufferedFailureMetadata(error: unknown): {
     }
   }
   if (error instanceof Error) {
+    const reason = transportFailureReason(error)
     return {
-      kind: "transport",
-      reason: transportFailureReason(error),
+      kind: reason ? "transport" : "unexpected",
+      reason: reason ?? "unclassified_error",
       logicalStatus: null,
     }
   }
@@ -2379,16 +2453,24 @@ async function emitStreamingError(
   options: {
     modelId?: string
     warnBufferedFailure?: boolean
+    startedAt?: number
   } = {},
 ): Promise<void> {
   if (requestSignal()?.aborted) return
   const { errorMessage, errorType, errorCode } =
     await extractStreamingErrorDetails(error)
   if (options.warnBufferedFailure)
-    consola.warn(
-      "Buffered Anthropic stream failed",
-      bufferedFailureMetadata(error),
-    )
+    consola.warn("Buffered Anthropic stream failed", {
+      ...bufferedFailureMetadata(error),
+      ...(options.startedAt !== undefined ?
+        {
+          elapsedMs: Math.max(
+            0,
+            Math.round(performance.now() - options.startedAt),
+          ),
+        }
+      : {}),
+    })
 
   const contextWindowError = isContextWindowError(errorMessage, errorCode)
   const effectiveErrorType =
