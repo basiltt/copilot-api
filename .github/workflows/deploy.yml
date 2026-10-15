@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       activate_reviewed_release:
-        description: Activate reviewed 2bfc34e over baseline 4a04538, preserving proxy settings
+        description: Activate reviewed 6a0cd58 over baseline 2bfc34e, preserving proxy settings
         type: boolean
         default: false
 
@@ -315,9 +315,9 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSHPASS: ${{ secrets.SERVER_PASSWORD }}
-          APPLICATION_SHA: 2bfc34e01abff98372527415f4fdc1d8b622a3b5
-          APPLICATION_TREE: e42e807feef6f0bc0c48d0ab01a33f4004c4d24e
-          EXPECTED_LIVE_SHA: 4a04538dc3dfe8287c206e4698c4e51be0b3eb70
+          APPLICATION_SHA: 6a0cd58c24f4e66e10566214f5ccfcec5add8d46
+          APPLICATION_TREE: 49966d96edaddaa4a79c22ddc158214ba93ce234
+          EXPECTED_LIVE_SHA: 2bfc34e01abff98372527415f4fdc1d8b622a3b5
         run: |
           set -euo pipefail
           [[ "$SERVER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]
